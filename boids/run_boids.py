@@ -11,11 +11,12 @@ from spektral.data import DisjointLoader
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
 
-from boids.evaluate_boids import evaluate
-from boids.forward import forward
+from .evaluate_boids import evaluate
+from .forward import forward
 from models.gnn_ca_simple_boids import GNNCASimpleBoids
 from modules.boids import make_dataset
 from modules.callbacks import ComplexityCallback
+
 
 # tf.config.run_functions_eagerly(True)
 physical_devices = tf.config.list_physical_devices("GPU")
@@ -42,7 +43,7 @@ def run(data_tr, data_va, data_te):
     history = model.fit(
         loader_tr.load(),
         steps_per_epoch=loader_tr.steps_per_epoch,
-        epochs=1000000,
+        epochs=1,
         validation_data=loader_va.load(),
         validation_steps=loader_va.steps_per_epoch,
         callbacks=[
@@ -57,7 +58,6 @@ def run(data_tr, data_va, data_te):
     results_te = model.evaluate(loader_te.load(), steps=loader_te.steps_per_epoch)
 
     return history, results_te, model
-
 
 ####################################################################################
 # Configuration
@@ -116,7 +116,7 @@ data_te = make_dataset(
 
 history, results_te, model = run(data_tr, data_va, data_te)
 print(f"Test loss: {results_te}")
-model.save("best_model")
+model.save("gnca_model", save_format="tf")
 joblib.dump(history.history, "history.pkl")
 
 ####################################################################################
