@@ -2,6 +2,7 @@
 Trains the GNCA to imitate the Boids GCA.
 """
 import argparse
+import os
 
 import joblib
 import matplotlib.pyplot as plt
@@ -104,17 +105,31 @@ with open("config.txt", "w") as f:
 ####################################################################################
 # Training
 ####################################################################################
-data_tr = make_dataset(
-    args.tr_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=-1
-)
-data_va = make_dataset(
-    args.va_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=-1
-)
-data_te = make_dataset(
-    args.te_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=-1
-)
+# Create a unique filename based on your hyperparameters
+cache_name = f"cache_b{args.n_boids}_t{args.trajectory_len}_tr{args.tr_set_size}.pkl"
 
+if os.path.exists(cache_name):
+    print(f"\n>>> Loading cached dataset: {cache_name}")
+    data_tr, data_va, data_te = joblib.load(cache_name)
+else:
+    print(f"\n>>> Generating new dataset (n_jobs=8)...")
+    # Restricting n_jobs to 8 to prevent CPU thrashing
+    data_tr = make_dataset(
+        args.tr_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=8
+    )
+    data_va = make_dataset(
+        args.va_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=8
+    )
+    data_te = make_dataset(
+        args.te_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=8
+    )
+    
+    print(f">>> Saving dataset to cache: {cache_name}")
+    joblib.dump((data_tr, data_va, data_te), cache_name)
+
+# Run the training process
 history, results_te, model = run(data_tr, data_va, data_te)
+
 print(f"Test loss: {results_te}")
 model.save("best_model")
 joblib.dump(history.history, "history.pkl")
