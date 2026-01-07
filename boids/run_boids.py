@@ -140,7 +140,7 @@ joblib.dump(history.history, "history.pkl")
 trajectory_len = 1000
 n_boids = 100
 init_blob = False
-evaluate(model, forward, trajectory_len, n_boids, init_blob=init_blob)
+#evaluate(model, forward, trajectory_len, n_boids, init_blob=init_blob)
 
 ####################################################################################
 # Plot SampEn and Correlation Dimension
