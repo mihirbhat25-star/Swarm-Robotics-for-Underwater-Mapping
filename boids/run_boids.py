@@ -12,11 +12,11 @@ from spektral.data import DisjointLoader
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
 
-from boids.evaluate_boids import evaluate
+# from boids.evaluate_boids import evaluate
 from boids.forward import forward
 from models.gnn_ca_simple_boids import GNNCASimpleBoids
 from modules.boids import make_dataset
-from modules.callbacks import ComplexityCallback
+# from modules.callbacks import ComplexityCallback
 
 # tf.config.run_functions_eagerly(True)
 physical_devices = tf.config.list_physical_devices("GPU")
@@ -51,7 +51,7 @@ def run(data_tr, data_va, data_te):
                 patience=args.es_patience, restore_best_weights=True, verbose=1
             ),
             ReduceLROnPlateau(patience=args.lr_patience, min_delta=1e-8, verbose=1),
-            ComplexityCallback(test_every=args.test_complexity_every),
+            # ComplexityCallback(test_every=args.test_complexity_every),
         ],
     )
 
