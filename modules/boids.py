@@ -48,7 +48,7 @@ class Boids:
         self.show = show
         self.figure = None
 
-    def update_boids(self, positions, velocities, return_accel=False):
+    def update_boids(self, positions, velocities, goal_position, return_accel=False):
         accelerations = np.zeros_like(velocities)
 
         if self.wrap:
@@ -60,6 +60,7 @@ class Boids:
         accelerations += self.get_separation(neighbors, positions)
         accelerations += self.get_alignment(neighbors, velocities) / 8
         accelerations += self.get_cohesion(neighbors, positions) / 100
+        accelerations += self.get_goal(neighbors, positions, goal_position) / 105
 
         velocities_new = velocities + accelerations * self.dt
         if self.limits:
@@ -75,7 +76,7 @@ class Boids:
 
         # Plot if needed
         if self.show:
-            self.plot(positions)
+            self.plot(positions, goal_position)
 
         return (positions, velocities, neighbors) + (
             (accelerations,) if return_accel else ()
@@ -83,6 +84,7 @@ class Boids:
 
     def generate_trajectory(self, steps, init=None, return_accel=False):
         if init is None:
+            goal_position = self.set_goal()[0] # shape (2,)
             positions, velocities, neighbors = self.get_random_init(self.n_boids)
         else:
             assert (
@@ -98,7 +100,7 @@ class Boids:
         if return_accel:
             history["accelerations"] = []
         for _ in range(steps):
-            output = self.update_boids(positions, velocities, return_accel=return_accel)
+            output = self.update_boids(positions, velocities, goal_position, return_accel=return_accel)
             positions, velocities, neighbors = output[:3]
             history["positions"].append(positions)
             history["velocities"].append(velocities)
@@ -165,6 +167,30 @@ class Boids:
         Get the steering component to align the positions of neighbors
         """
         return self.get_alignment(neighbors, positions)
+    
+    def set_goal(self):
+        goal_position = np.random.uniform(self.borders[0], self.borders[2], size=(1,2))
+        return goal_position
+    
+    def get_goal(self, neighbors, positions, goal_position):
+        
+        """
+        Get the steering component to move towards a goal position.
+        """
+        neighbor_mask = neighbors.toarray()
+        steering = np.zeros_like(positions)
+        for i in range(self.n_boids):
+            neighbor_indices = np.where(neighbor_mask[i] == 1)[0]
+            if len(neighbor_indices) == 0:
+                continue
+            # For each neighbor, compute distance to goal and direction vector
+            neighbor_positions = positions[neighbor_indices]
+            group_positions = np.vstack([neighbor_positions, positions[i]])
+            centroid = np.mean(group_positions, axis=0)
+            goal_vec = goal_position - centroid  # (num_neighbors, 2)
+            steering[i] = goal_vec
+        steering = self.clamp(steering)
+        return steering
 
     def enforce_limits(self, velocities_old, velocities_new):
         # Update velocities
@@ -197,8 +223,8 @@ class Boids:
         Clamp a given force (steering) to the maximum value allowed (to make things
         more stable)
         """
-        # to_clamp = np.linalg.norm(force, axis=-1) > self.max_force
-        # force[to_clamp] = scale(force[to_clamp], lenght=self.max_force)
+        to_clamp = np.linalg.norm(force, axis=-1) > self.max_force
+        force[to_clamp] = scale(force[to_clamp], lenght=self.max_force)
 
         return force
 
@@ -220,7 +246,7 @@ class Boids:
 
         return positions, velocities, neighbors
 
-    def plot(self, positions, **kwargs):
+    def plot(self, positions, goal_position, **kwargs):
         if self.figure is None:
             plt.ion()
             self.figure = plt.figure()
@@ -233,6 +259,10 @@ class Boids:
                 lw=0.5,
                 **kwargs
             )
+            goal_marker, = axes.plot([], [], 'r*', markersize=15, label='Goal')
+            goal_marker.set_data(goal_position[0], goal_position[1])
+            axes.legend()
+            axes.set_title(f"Boids Evolution with Goal at ({goal_position[0]:.2f}, {goal_position[1]:.2f})")
             # anim = animation.FuncAnimation(figure, animate, frames=50, interval=1)
             plt.show()
         self.scatter.set_offsets(positions)
