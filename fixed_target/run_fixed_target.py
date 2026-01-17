@@ -9,7 +9,7 @@ import numpy as np
 import tensorflow as tf
 import tensorflow.keras.backend as K
 from scipy.ndimage import gaussian_filter1d
-from spektral.layers.ops import sp_matrix_to_sp_tensor
+from spektral.utils import sp_matrix_to_sp_tensor
 from spektral.transforms import NormalizeSphere
 from tensorflow.keras.losses import MeanSquaredError
 from tensorflow.keras.optimizers import Adam
@@ -114,7 +114,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch_size", default=8, type=int, help="Size of the mini-batches"
     )
-    parser.add_argument("--epochs", default=100000, type=int, help="Training epochs")
+    parser.add_argument("--epochs", default=1, type=int, help="Training epochs")
     parser.add_argument(
         "--batches_in_epoch", default=10, type=int, help="Batches in an epoch"
     )
@@ -146,7 +146,7 @@ if __name__ == "__main__":
         help="How often to reset one state in cache",
     )
     parser.add_argument(
-        "--outdir", default="results", type=str, help="Where to save output"
+        "--outdir", default="results_fixed_target", type=str, help="Where to save output"
     )
     args = parser.parse_args()
 

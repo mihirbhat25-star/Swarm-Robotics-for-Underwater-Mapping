@@ -20,6 +20,7 @@ from modules.boids import make_dataset
 # RESTORED: Import Callback
 from modules.callbacks import ComplexityCallback
 
+
 # tf.config.run_functions_eagerly(True)
 physical_devices = tf.config.list_physical_devices("GPU")
 if len(physical_devices) > 0:
@@ -61,7 +62,6 @@ def run(data_tr, data_va, data_te):
     results_te = model.evaluate(loader_te.load(), steps=loader_te.steps_per_epoch)
 
     return history, results_te, model
-
 
 ####################################################################################
 # Configuration
@@ -134,7 +134,7 @@ else:
 history, results_te, model = run(data_tr, data_va, data_te)
 
 print(f"Test loss: {results_te}")
-model.save("best_model")
+model.save("gnca_model", save_format="tf")
 joblib.dump(history.history, "history.pkl")
 
 ####################################################################################

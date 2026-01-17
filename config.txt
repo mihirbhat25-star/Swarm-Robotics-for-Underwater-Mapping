@@ -1,0 +1,11 @@
+lr=0.001
+batch_size=30
+es_patience=20
+lr_patience=10
+lr_red_factor=0.1
+n_boids=100
+trajectory_len=300
+tr_set_size=300
+va_set_size=30
+te_set_size=30
+test_complexity_every=-1
