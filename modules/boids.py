@@ -37,7 +37,7 @@ class Boids:
         self.wrap = wrap
         self.limits = limits
 
-        self.borders = canvas_scale * np.array([-1, -1, 1, 1])  # Hard borders of canvas
+        self.borders = canvas_scale * np.array([-1, -1, 3, 3])  # Hard borders of canvas
         self.center = (self.borders[2:] + self.borders[:2]) / 2  # Center of the canvas
 
         # Soft boundary inside which boids are pushed towards the center to avoid
@@ -60,7 +60,7 @@ class Boids:
         accelerations += self.get_separation(neighbors, positions)
         accelerations += self.get_alignment(neighbors, velocities) / 8
         accelerations += self.get_cohesion(neighbors, positions) / 100
-        accelerations += self.get_goal(neighbors, positions, goal_position) / 105
+        accelerations += self.get_goal(neighbors, positions, goal_position) / 110
 
         velocities_new = velocities + accelerations * self.dt
         if self.limits:
@@ -84,6 +84,8 @@ class Boids:
 
     def generate_trajectory(self, steps, init=None, return_accel=False):
         if init is None:
+
+            # Randomly set a goal position within the borders
             goal_position = self.set_goal()[0] # shape (2,)
             positions, velocities, neighbors = self.get_random_init(self.n_boids)
         else:
@@ -169,7 +171,12 @@ class Boids:
         return self.get_alignment(neighbors, positions)
     
     def set_goal(self):
-        goal_position = np.random.uniform(self.borders[0], self.borders[2], size=(1,2))
+
+        # Randomly set a goal position within the borders
+        # goal_position = np.random.uniform(self.borders[0], self.borders[2], size=(1,2))
+
+        # Manually set fixed position within [1.5, 2.5] ^2
+        goal_position = np.array([[2.0, 2.0]])
         return goal_position
     
     def get_goal(self, neighbors, positions, goal_position):
@@ -233,12 +240,7 @@ class Boids:
         Get a random initial position and velocity for each boid
         :param n_boids: int, number of boids
         """
-        positions = np.stack(
-            [
-                np.random.uniform(*self.boundaries[::2], n_boids),
-                np.random.uniform(*self.boundaries[1::2], n_boids),
-            ]
-        ).T
+        positions = np.random.uniform(-1, 1, (n_boids, 2))
         velocities = to_cartesian(
             np.random.uniform(-1, 1, (n_boids, 2)) * self.max_speed
         )
@@ -293,10 +295,8 @@ def to_cartesian(polar_coords):
     y = rho * np.sin(phi)
     return np.stack((x, y), -1)
 
-
 def scale(x, lenght=1.0):
     return lenght * x / np.linalg.norm(x, axis=-1, keepdims=True)
-
 
 def history_to_samples(history, accel=False):
     inputs = np.concatenate((history["positions"], history["velocities"]), axis=-1)
