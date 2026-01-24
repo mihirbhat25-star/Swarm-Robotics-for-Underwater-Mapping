@@ -111,25 +111,17 @@ with open("config.txt", "w") as f:
 ####################################################################################
 # Training
 ####################################################################################
-cache_name = f"cache_b{args.n_boids}_t{args.trajectory_len}_tr{args.tr_set_size}.pkl"
 
-if os.path.exists(cache_name):
-    print(f"\n>>> Loading cached dataset: {cache_name}")
-    data_tr, data_va, data_te = joblib.load(cache_name)
-else:
-    print(f"\n>>> Generating new dataset (n_jobs=8)...")
-    data_tr = make_dataset(
-        args.tr_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=8
-    )
-    data_va = make_dataset(
-        args.va_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=8
-    )
-    data_te = make_dataset(
-        args.te_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=8
-    )
-    
-    print(f">>> Saving dataset to cache: {cache_name}")
-    joblib.dump((data_tr, data_va, data_te), cache_name)
+print(f"\n>>> Generating dataset (n_jobs=8)...")
+data_tr = make_dataset(
+    args.tr_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=8
+)
+data_va = make_dataset(
+    args.va_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=8
+)
+data_te = make_dataset(
+    args.te_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=8
+)
 
 history, results_te, model = run(data_tr, data_va, data_te)
 
