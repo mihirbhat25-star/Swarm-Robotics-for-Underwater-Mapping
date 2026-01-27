@@ -17,4 +17,4 @@ boids = Boids(
     wrap=False,  # If True, wrap around instead of avoiding boundary
     show=True,  # Show an animated plot of the boids everytime update_boids is called
 )
-boids.generate_trajectory(1000)
+boids.generate_trajectory(2500)  # Generate a trajectory with 2500 time steps

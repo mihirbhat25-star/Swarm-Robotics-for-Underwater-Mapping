@@ -60,7 +60,7 @@ class Boids:
         accelerations += self.get_separation(neighbors, positions)
         accelerations += self.get_alignment(neighbors, velocities) / 8
         accelerations += self.get_cohesion(neighbors, positions) / 100
-        accelerations += self.get_goal(neighbors, positions, goal_position) / 110
+        accelerations += self.get_goal(neighbors, positions, goal_position) / 125
 
         velocities_new = velocities + accelerations * self.dt
         if self.limits:
@@ -177,6 +177,7 @@ class Boids:
 
         # Manually set fixed position within [1.5, 2.5] ^2
         goal_position = np.array([[2.0, 2.0]])
+
         return goal_position
     
     def get_goal(self, neighbors, positions, goal_position):
