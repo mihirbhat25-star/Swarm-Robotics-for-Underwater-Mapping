@@ -12,13 +12,11 @@ from tensorflow.keras.models import load_model
 
 from modules.boids import make_dataset
 
-
 @tf.function(experimental_relax_shapes=True)
 def forward(model, x, a, i, training=None):
     """Computes one forward pass of the GNCA"""
     x_pred = model((x, a, i[:, None]), training=training)
     return x_pred
-
 
 def avg_measure(trajectory, measure_fn, n_boids=None, coord=0, **kwargs):
     n_boids_total = trajectory.shape[-2]
@@ -29,7 +27,6 @@ def avg_measure(trajectory, measure_fn, n_boids=None, coord=0, **kwargs):
     mn, std = np.mean(measures), np.std(measures)
     print(f"{measure_fn.__name__} {mn} +- {std}")
     return np.array(measures)
-
 
 def evaluate(model, forward, trajectory_len, n_boids, init_blob=False):
     np.random.seed(0)
@@ -218,7 +215,6 @@ def evaluate_complexity(
     print(f"Corr. dim. GNCA: {measures_mean[3]} +- {measures_std[3]}")
 
     return measures_mean, measures_std
-
 
 if __name__ == "__main__":
     trajectory_len = 1000

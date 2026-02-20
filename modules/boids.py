@@ -37,18 +37,22 @@ class Boids:
         self.wrap = wrap
         self.limits = limits
 
-        self.borders = canvas_scale * np.array([-1, -1, 3, 3])  # Hard borders of canvas
+        self.borders = canvas_scale * np.array([-10, -10, 10, 10])  # Hard borders of canvas
         self.center = (self.borders[2:] + self.borders[:2]) / 2  # Center of the canvas
+        self.goal_positions = np.array([[7.0, -7.0], [7.0, 7.0], [0.0, 0.0]])  # Set multiple goals in a triangular fashion at (7, -7), (7, 7) and (0, 0)
+        self.current_goal = 0
+        self.reached_goal = False  # Flag to track if boids have reached the current goal
+        self.loiter_timer = 0  # Timer to track how long boids have been loitering at the current goal
+        self.goals_completed = 0  # Counter to track how many goals have been completed
 
-        # Soft boundary inside which boids are pushed towards the center to avoid
-        # leaving the canvas
+        # Soft boundary inside which boids are pushed towards the center to avoid leaving the canvas
         self.boundary_margins = self.borders * boundary_size_pctg
         self.boundaries = self.borders - self.boundary_margins
 
         self.show = show
         self.figure = None
 
-    def update_boids(self, positions, velocities, goal_position, return_accel=False):
+    def update_boids(self, positions, velocities, return_accel=False):
         accelerations = np.zeros_like(velocities)
 
         if self.wrap:
@@ -60,7 +64,7 @@ class Boids:
         accelerations += self.get_separation(neighbors, positions)
         accelerations += self.get_alignment(neighbors, velocities) / 8
         accelerations += self.get_cohesion(neighbors, positions) / 100
-        accelerations += self.get_goal(neighbors, positions, goal_position) / 125
+        accelerations += self.get_goal(neighbors, positions) / 125
 
         velocities_new = velocities + accelerations * self.dt
         if self.limits:
@@ -76,23 +80,22 @@ class Boids:
 
         # Plot if needed
         if self.show:
-            self.plot(positions, goal_position)
+            self.plot(positions)
 
         return (positions, velocities, neighbors) + (
             (accelerations,) if return_accel else ()
         )
 
-    def generate_trajectory(self, steps, init=None, return_accel=False):
-        if init is None:
-
-            # Randomly set a goal position within the borders
-            goal_position = self.set_goal()[0] # shape (2,)
+    def generate_trajectory(self, random_init=None, fixed_init=True, return_accel=False):
+        if random_init is None and fixed_init:
+            positions, velocities, neighbors = self.set_fixed_init(self.n_boids)
+        elif random_init is not None:
             positions, velocities, neighbors = self.get_random_init(self.n_boids)
         else:
             assert (
-                len(init) == 2
-            ), "Expected init to have lenght 2 (positions, velocities)"
-            positions, velocities = init
+                len(random_init) == 2
+            ), "Expected random_init to have length 2 (positions, velocities)"
+            positions, velocities = random_init
             neighbors = self.get_neighbors(positions)
         history = {
             "positions": [positions],
@@ -101,14 +104,17 @@ class Boids:
         }
         if return_accel:
             history["accelerations"] = []
-        for _ in range(steps):
-            output = self.update_boids(positions, velocities, goal_position, return_accel=return_accel)
+        while True:
+            output = self.update_boids(positions, velocities, return_accel=return_accel)
             positions, velocities, neighbors = output[:3]
             history["positions"].append(positions)
             history["velocities"].append(velocities)
             history["neighbors"].append(neighbors)
             if return_accel:
                 history["accelerations"].append(output[3])
+            self.update_goal(positions)
+            if self.check_termination():
+                break
 
         history["positions"] = np.array(history["positions"])
         history["velocities"] = np.array(history["velocities"])
@@ -176,11 +182,11 @@ class Boids:
         # goal_position = np.random.uniform(self.borders[0], self.borders[2], size=(1,2))
 
         # Manually set fixed position within [1.5, 2.5] ^2
-        goal_position = np.array([[2.0, 2.0]])
+        # goal_position = np.array([[2.0, 2.0]])
 
-        return goal_position
+        pass  
     
-    def get_goal(self, neighbors, positions, goal_position):
+    def get_goal(self, neighbors, positions):
         
         """
         Get the steering component to move towards a goal position.
@@ -195,10 +201,43 @@ class Boids:
             neighbor_positions = positions[neighbor_indices]
             group_positions = np.vstack([neighbor_positions, positions[i]])
             centroid = np.mean(group_positions, axis=0)
-            goal_vec = goal_position - centroid  # (num_neighbors, 2)
+            goal_vec = self.goal_positions[self.current_goal] - centroid  # (num_neighbors, 2)
             steering[i] = goal_vec
         steering = self.clamp(steering)
         return steering
+    
+    def update_goal(self, positions):
+        """
+        Update the goal position after boids reach it and loiter for 500 steps.
+        """
+        # Fetch current positions of boids and compute distance to goal
+        goal_vec = self.goal_positions - positions[:, None, :]  # (num_boids, num_goals, 2)
+        goal_dist = np.linalg.norm(goal_vec, axis=-1)  # (num_boids, num_goals)
+        # If average distance to goal is less than 0.5, start loitering timer
+        if np.mean(goal_dist[:, self.current_goal]) < 0.5 and not self.reached_goal:
+            self.reached_goal = True
+
+        if self.reached_goal:
+            self.loiter_timer += 1
+            # print(f"Loitering at goal for {self.loiter_timer} steps.")
+
+        # If loitering timer is equal to 500, switch to next goal in triangular fashion
+        if self.loiter_timer == 500:
+            self.current_goal = (self.current_goal + 1) % len(self.goal_positions)
+            self.loiter_timer = 0
+            self.goals_completed += 1
+            self.reached_goal = False
+
+    def check_termination(self):
+        """
+        Terminate the trajectory if boids finish loitering at all goals for 500 steps.
+        """
+        
+        if self.goals_completed == 3:  # Assuming 3 goals and 500 steps of loitering each
+            # print("Termination condition met: Boids have loitered at all goals for 500 steps.")
+            return True
+        else:
+            return False
 
     def enforce_limits(self, velocities_old, velocities_new):
         # Update velocities
@@ -248,8 +287,21 @@ class Boids:
         neighbors = self.get_neighbors(positions)
 
         return positions, velocities, neighbors
+    
+    def set_fixed_init(self, n_boids):
+        """
+        Set a fixed initial position of (-7, -7).
+        :param n_boids: int, number of boids
+        """
+        positions = np.full((n_boids, 2), -7.0) + 0.001 * np.random.rand(n_boids, 2)
+        velocities = to_cartesian(
+            np.random.uniform(-1, 1, (n_boids, 2)) * self.max_speed
+        )
+        neighbors = self.get_neighbors(positions)
 
-    def plot(self, positions, goal_position, **kwargs):
+        return positions, velocities, neighbors
+
+    def plot(self, positions, **kwargs):
         if self.figure is None:
             plt.ion()
             self.figure = plt.figure()
@@ -262,17 +314,20 @@ class Boids:
                 lw=0.5,
                 **kwargs
             )
-            goal_marker, = axes.plot([], [], 'r*', markersize=15, label='Goal')
-            goal_marker.set_data(goal_position[0], goal_position[1])
+            self.goal_marker, = axes.plot([], [], 'r*', markersize=15, label='Goal')
             axes.legend()
-            axes.set_title(f"Boids Evolution with Goal at ({goal_position[0]:.2f}, {goal_position[1]:.2f})")
-            # anim = animation.FuncAnimation(figure, animate, frames=50, interval=1)
+            axes.set_title(
+                f"Boids Evolution with Goal"
+            )
             plt.show()
+        # Always update the goal marker position
+        self.goal_marker.set_data(
+            [self.goal_positions[self.current_goal][0]],
+            [self.goal_positions[self.current_goal][1]]
+        )
         self.scatter.set_offsets(positions)
         self.figure.canvas.draw()
         self.figure.canvas.flush_events()
-
-
 class BoidsDataset(Dataset):
     def __init__(self, dataset):
         super().__init__()
@@ -281,13 +336,11 @@ class BoidsDataset(Dataset):
     def read(self):
         return []
 
-
 def to_polar(cartesian_coords):
     x, y = cartesian_coords.T
     rho = np.sqrt(x ** 2 + y ** 2)
     phi = np.arctan2(y, x) * 180 / np.pi
     return np.stack((rho, phi), -1)
-
 
 def to_cartesian(polar_coords):
     rho, phi = polar_coords.T
@@ -309,14 +362,16 @@ def history_to_samples(history, accel=False):
 
     return [(x, a, y) for x, a, y in zip(inputs[:-1], neighbors[:-1], targets)]
 
-
-def make_dataset(reps, steps, return_boids=False, accel=False, **kwargs):
-    init = kwargs.pop("init", None)
+def make_dataset(reps, random_init=None, fixed_init=True, return_boids=False, accel=False, **kwargs):
     n_jobs = kwargs.pop("n_jobs", 1)
     boids = Boids(**kwargs)
 
     histories = Parallel(n_jobs=n_jobs)(
-        delayed(boids.generate_trajectory)(steps, init=init, return_accel=accel)
+        delayed(boids.generate_trajectory)(
+            random_init=random_init,
+            fixed_init=fixed_init,
+            return_accel=accel
+        )
         for _ in tqdm(range(reps))
     )
 

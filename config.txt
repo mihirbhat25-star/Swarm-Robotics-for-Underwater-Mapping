@@ -1,5 +1,6 @@
 lr=0.001
-batch_size=30
+batch_size=128
+epochs=1000
 es_patience=20
 lr_patience=10
 lr_red_factor=0.1

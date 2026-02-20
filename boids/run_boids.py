@@ -104,14 +104,12 @@ parser.add_argument(
     type=int,
     help="How often to test for complexity (-1 for never)",
 )
-args = parser.parse_args()
-with open("config.txt", "w") as f:
-    f.writelines([f"{k}={v}\n" for k, v, in vars(args).items()])
 
 ####################################################################################
 # Training
 ####################################################################################
 
+args = parser.parse_args()
 print(f"\n>>> Generating dataset (n_jobs=8)...")
 data_tr = make_dataset(
     args.tr_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=8
