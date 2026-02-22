@@ -20,7 +20,6 @@ from modules.boids import make_dataset
 # RESTORED: Import Callback
 from modules.callbacks import ComplexityCallback
 
-
 # tf.config.run_functions_eagerly(True)
 physical_devices = tf.config.list_physical_devices("GPU")
 if len(physical_devices) > 0:
@@ -28,6 +27,7 @@ if len(physical_devices) > 0:
 
 
 def run(data_tr, data_va, data_te):
+
     model = GNNCASimpleBoids(
         activation="linear",
         batch_norm=False,
@@ -75,7 +75,7 @@ parser.add_argument(
     "--epochs", default=1000, type=int, help="Number of training epochs"
 )
 parser.add_argument(
-    "--es_patience", default=20, type=int, help="Patience for early stopping"
+    "--es_patience", default=200, type=int, help="Patience for early stopping"
 )
 parser.add_argument(
     "--lr_patience", default=10, type=int, help="Patience for LR annealing"
@@ -110,15 +110,15 @@ parser.add_argument(
 ####################################################################################
 
 args = parser.parse_args()
-print(f"\n>>> Generating dataset (n_jobs=8)...")
+print(f"\n>>> Generating dataset (n_jobs=1)...")
 data_tr = make_dataset(
-    args.tr_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=8
+    args.tr_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=1
 )
 data_va = make_dataset(
-    args.va_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=8
+    args.va_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=1
 )
 data_te = make_dataset(
-    args.te_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=8
+    args.te_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=1
 )
 
 history, results_te, model = run(data_tr, data_va, data_te)

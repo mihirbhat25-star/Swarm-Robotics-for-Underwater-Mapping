@@ -5,7 +5,7 @@ from matplotlib import pyplot as plt
 from spektral import utils
 from spektral.data import Dataset, Graph
 from tqdm import tqdm
-
+import tensorflow as tf
 
 class Boids:
     def __init__(
@@ -86,10 +86,10 @@ class Boids:
             (accelerations,) if return_accel else ()
         )
 
-    def generate_trajectory(self, random_init=None, fixed_init=True, return_accel=False):
-        if random_init is None and fixed_init:
+    def generate_trajectory(self, random_init=False, fixed_init=True, return_accel=False):
+        if random_init is False and fixed_init:
             positions, velocities, neighbors = self.set_fixed_init(self.n_boids)
-        elif random_init is not None:
+        elif random_init is True:
             positions, velocities, neighbors = self.get_random_init(self.n_boids)
         else:
             assert (
@@ -208,7 +208,7 @@ class Boids:
     
     def update_goal(self, positions):
         """
-        Update the goal position after boids reach it and loiter for 500 steps.
+        Update the goal position after boids reach it and loiter for 50 steps.
         """
         # Fetch current positions of boids and compute distance to goal
         goal_vec = self.goal_positions - positions[:, None, :]  # (num_boids, num_goals, 2)
@@ -217,12 +217,12 @@ class Boids:
         if np.mean(goal_dist[:, self.current_goal]) < 0.5 and not self.reached_goal:
             self.reached_goal = True
 
-        if self.reached_goal:
+        if self.reached_goal and np.mean(goal_dist[:, self.current_goal]) < 0.5:
             self.loiter_timer += 1
             # print(f"Loitering at goal for {self.loiter_timer} steps.")
 
-        # If loitering timer is equal to 500, switch to next goal in triangular fashion
-        if self.loiter_timer == 500:
+        # If loitering timer is equal to 50, switch to next goal in triangular fashion
+        if self.loiter_timer == 50:
             self.current_goal = (self.current_goal + 1) % len(self.goal_positions)
             self.loiter_timer = 0
             self.goals_completed += 1
@@ -230,11 +230,11 @@ class Boids:
 
     def check_termination(self):
         """
-        Terminate the trajectory if boids finish loitering at all goals for 500 steps.
+        Terminate the trajectory if boids finish loitering at all goals for 50 steps.
         """
         
-        if self.goals_completed == 3:  # Assuming 3 goals and 500 steps of loitering each
-            # print("Termination condition met: Boids have loitered at all goals for 500 steps.")
+        if self.goals_completed == 3:  # Assuming 3 goals and 50 steps of loitering each
+            # print("Termination condition met: Boids have loitered at all goals for 50 steps.")
             return True
         else:
             return False
@@ -277,15 +277,20 @@ class Boids:
 
     def get_random_init(self, n_boids):
         """
-        Get a random initial position and velocity for each boid
-        :param n_boids: int, number of boids
+        Spawns boids in a tight clump at a random location on the canvas.
         """
-        positions = np.random.uniform(-1, 1, (n_boids, 2))
-        velocities = to_cartesian(
-            np.random.uniform(-1, 1, (n_boids, 2)) * self.max_speed
-        )
+        # 1. Pick a random 'center' for the flock (between -7 and 7)
+        center = np.random.uniform(-7, 7, (1, 2))
+        
+        # 2. Spawn boids in a small clump (0.5 radius) around that center
+        positions = center + np.random.uniform(-0.5, 0.5, (n_boids, 2))
+        
+        # 3. Give them a random shared initial direction + small individual jitter
+        shared_velocity = np.random.uniform(-0.01, 0.01, (1, 2))
+        jitter = np.random.uniform(-0.001, 0.001, (n_boids, 2))
+        velocities = shared_velocity + jitter
+        
         neighbors = self.get_neighbors(positions)
-
         return positions, velocities, neighbors
     
     def set_fixed_init(self, n_boids):
@@ -294,9 +299,11 @@ class Boids:
         :param n_boids: int, number of boids
         """
         positions = np.full((n_boids, 2), -7.0) + 0.001 * np.random.rand(n_boids, 2)
-        velocities = to_cartesian(
-            np.random.uniform(-1, 1, (n_boids, 2)) * self.max_speed
-        )
+        # Set all boids to have the same initial velocity
+        # Example: all boids move right at max_speed
+        direction = np.array([1.0, 0.0])  # unit vector to the right
+        velocity = direction * self.max_speed
+        velocities = np.tile(velocity, (n_boids, 1))
         neighbors = self.get_neighbors(positions)
 
         return positions, velocities, neighbors
@@ -362,27 +369,35 @@ def history_to_samples(history, accel=False):
 
     return [(x, a, y) for x, a, y in zip(inputs[:-1], neighbors[:-1], targets)]
 
-def make_dataset(reps, random_init=None, fixed_init=True, return_boids=False, accel=False, **kwargs):
+def make_dataset(reps, trajectory_len=None, random_init=False, fixed_init=True, return_boids=False, accel=False, **kwargs):
+    # 1. Clean up kwargs so Boids() doesn't crash
     n_jobs = kwargs.pop("n_jobs", 1)
-    boids = Boids(**kwargs)
+    # If evaluate() passes 'init', we'll use it as our random_init data
+    init_data = kwargs.pop("init", None) 
+    
+    # Use the passed init_data if it exists, otherwise use the random_init flag
+    active_random_init = init_data if init_data is not None else random_init
 
-    histories = Parallel(n_jobs=n_jobs)(
-        delayed(boids.generate_trajectory)(
-            random_init=random_init,
+    boids = Boids(**kwargs)
+    all_graphs = []
+
+    print(f">>> Generating {reps} trajectories with random_init={random_init}...")
+    
+    for i in tqdm(range(reps)):
+        # 2. Generate trajectory using the 'init' data from evaluate
+        history = boids.generate_trajectory(
+            random_init=False,
             fixed_init=fixed_init,
             return_accel=accel
         )
-        for _ in tqdm(range(reps))
-    )
+        
+        samples = history_to_samples(history, accel=accel)
+        
+        for x, a, y in samples:
+            all_graphs.append(Graph(x=x, a=a, y=y))
+            
+        del history
+        del samples
 
-    samples = []
-    for history in histories:
-        samples.extend(history_to_samples(history, accel=accel))
-
-    graphs = [Graph(x=x, a=a, y=y) for x, a, y in samples]
-    dataset = BoidsDataset(graphs)
-
-    if return_boids:
-        return dataset, boids
-    else:
-        return dataset
+    dataset = BoidsDataset(all_graphs)
+    return (dataset, boids) if return_boids else dataset

@@ -1,16 +1,25 @@
 import tensorflow as tf
 from spektral.layers import EdgeConv
 
-
 class SimpleEdgeConv(EdgeConv):
-    """
-    An extension of EdgeConv that concatenates the difference and the norm of the
-    difference to compute the messages.
-    """
+    def propagate(self, x, a, e=None, **kwargs):
+        # We bypass Spektral's 'message' and 'get_kwargs' logic entirely.
+        # 'a' is the SparseTensor. We get indices directly from it.
+        indices = tf.transpose(a.indices)
+        i = indices[0] # Source
+        j = indices[1] # Target
 
-    def message(self, x, **kwargs):
-        # Updated for Spektral 1.0.6 naming convention
-        x_i = self.get_i(x) 
-        x_j = self.get_j(x)
-        norm = tf.linalg.norm(x_i - x_j, axis=-1, keepdims=True)
-        return self.mlp(tf.concat((-(x_j - x_i), norm), axis=-1))
+        x_i = tf.gather(x, i)
+        x_j = tf.gather(x, j)
+
+        # Boids logic
+        diff = x_j - x_i
+        dist = tf.linalg.norm(diff, axis=-1, keepdims=True) + 1e-6
+        
+        # Calculate messages
+        messages = self.mlp(tf.concat([diff, dist], axis=-1))
+
+        # Aggregate (sum messages for each target node j)
+        out = tf.math.unsorted_segment_sum(messages, j, tf.shape(x)[0])
+        
+        return out
