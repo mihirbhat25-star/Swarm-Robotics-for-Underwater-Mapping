@@ -3,13 +3,13 @@ Evaluates the trained GNCA by comparing it to the true Boids GCA.
 """
 
 import matplotlib.pyplot as plt
+from matplotlib.animation import FFMpegWriter
 import nolds
 import numpy as np
 import tensorflow as tf
 from spektral.data import DisjointLoader
 from spektral.layers import ops
 from tensorflow.keras.models import load_model
-
 from modules.boids import make_dataset
 
 @tf.function(experimental_relax_shapes=True)
@@ -150,34 +150,32 @@ def evaluate(model, forward, trajectory_len, n_boids, init_blob=False):
 
     plt.show()
 
-    from matplotlib.animation import FFMpegWriter
-
     # 1. Setup the figure and writer
-    fig, ax = plt.subplots(figsize=(7, 7))
-    writer = FFMpegWriter(fps=20)
-    goals = boids_te.goal_positions
+    # fig, ax = plt.subplots(figsize=(7, 7))
+    # writer = FFMpegWriter(fps=20)
+    # goals = boids_te.goal_positions
 
-    print("🎬 Saving GNCA flight to gnca_boids.mp4...")
+    # print("🎬 Saving GNCA flight to gnca_boids.mp4...")
 
-    with writer.saving(fig, "gnca_boids.mp4", dpi=100):
-        for i in range(len(boid_trajectory_auto)):
-            ax.clear()
+    # with writer.saving(fig, "gnca_boids.mp4", dpi=100):
+    #     for i in range(len(boid_trajectory_auto)):
+    #         ax.clear()
             
-            # Pull positions (Latitude/Longitude)
-            pos = boid_trajectory_auto[i][:, :2]
+    #         # Pull positions (Latitude/Longitude)
+    #         pos = boid_trajectory_auto[i][:, :2]
             
-            # Draw everything
-            ax.scatter(goals[:, 0], goals[:, 1], c='red', marker='*', s=150)
-            ax.scatter(pos[:, 0], pos[:, 1], c='lime', s=20, edgecolors='k')
+    #         # Draw everything
+    #         ax.scatter(goals[:, 0], goals[:, 1], c='red', marker='*', s=150)
+    #         ax.scatter(pos[:, 0], pos[:, 1], c='lime', s=20, edgecolors='k')
             
-            # Keep the view consistent
-            ax.set_xlim(boids_te.borders[0], boids_te.borders[2])
-            ax.set_ylim(boids_te.borders[1], boids_te.borders[3])
-            ax.set_title(f"Step {i}")
+    #         # Keep the view consistent
+    #         ax.set_xlim(boids_te.borders[0], boids_te.borders[2])
+    #         ax.set_ylim(boids_te.borders[1], boids_te.borders[3])
+    #         ax.set_title(f"Step {i}")
             
-            writer.grab_frame()
+    #         writer.grab_frame()
 
-print("✅ Done! Check your workspace folder for gnca_boids.mp4")
+# print("✅ Done! Check your workspace folder for gnca_boids.mp4")
 
 def evaluate_complexity(model, forward, te_set_size, trajectory_len, n_boids, init_blob=False):
     """

@@ -112,14 +112,18 @@ parser.add_argument(
 args = parser.parse_args()
 print(f"\n>>> Generating dataset (n_jobs=1)...")
 data_tr = make_dataset(
-    args.tr_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=1
+    args.tr_set_size, random_init=True, fixed_init=False, trajectory_len=args.trajectory_len, n_boids=args.n_boids, n_jobs=1
 )
 data_va = make_dataset(
-    args.va_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=1
+    args.va_set_size, random_init=True, fixed_init=False, trajectory_len=args.trajectory_len, n_boids=args.n_boids, n_jobs=1
 )
 data_te = make_dataset(
-    args.te_set_size, args.trajectory_len, n_boids=args.n_boids, n_jobs=1
+    args.te_set_size, random_init=True, fixed_init=False, trajectory_len=args.trajectory_len, n_boids=args.n_boids, n_jobs=1
 )
+
+print("Train dataset size:", len(data_tr))
+print("Validation dataset size:", len(data_va))
+print("Test dataset size:", len(data_te))
 
 history, results_te, model = run(data_tr, data_va, data_te)
 

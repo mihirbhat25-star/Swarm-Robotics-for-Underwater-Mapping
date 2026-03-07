@@ -6,6 +6,7 @@ from spektral import utils
 from spektral.data import Dataset, Graph
 from tqdm import tqdm
 import tensorflow as tf
+import time
 
 class Boids:
     def __init__(
@@ -42,7 +43,6 @@ class Boids:
         self.goal_positions = np.array([[7.0, -7.0], [7.0, 7.0], [0.0, 0.0]])  # Set multiple goals in a triangular fashion at (7, -7), (7, 7) and (0, 0)
         self.current_goal = 0
         self.reached_goal = False  # Flag to track if boids have reached the current goal
-        self.loiter_timer = 0  # Timer to track how long boids have been loitering at the current goal
         self.goals_completed = 0  # Counter to track how many goals have been completed
 
         # Soft boundary inside which boids are pushed towards the center to avoid leaving the canvas
@@ -64,7 +64,7 @@ class Boids:
         accelerations += self.get_separation(neighbors, positions)
         accelerations += self.get_alignment(neighbors, velocities) / 8
         accelerations += self.get_cohesion(neighbors, positions) / 100
-        accelerations += self.get_goal(neighbors, positions) / 125
+        accelerations += self.get_goal(neighbors, positions) / 25
 
         velocities_new = velocities + accelerations * self.dt
         if self.limits:
@@ -75,6 +75,7 @@ class Boids:
         # Update positions
         positions = positions + velocities * self.dt
 
+        # Keep boids within borders
         # positions[:, 0] = np.clip(positions[:, 0], self.borders[0], self.borders[2])
         # positions[:, 1] = np.clip(positions[:, 1], self.borders[1], self.borders[3])
 
@@ -86,17 +87,17 @@ class Boids:
             (accelerations,) if return_accel else ()
         )
 
-    def generate_trajectory(self, random_init=False, fixed_init=True, return_accel=False):
+    def generate_trajectory(self, random_init=True, fixed_init=False, return_accel=False):
         if random_init is False and fixed_init:
             positions, velocities, neighbors = self.set_fixed_init(self.n_boids)
         elif random_init is True:
             positions, velocities, neighbors = self.get_random_init(self.n_boids)
-        else:
-            assert (
-                len(random_init) == 2
-            ), "Expected random_init to have length 2 (positions, velocities)"
-            positions, velocities = random_init
-            neighbors = self.get_neighbors(positions)
+        # else:
+        #     assert (
+        #         len(random_init) == 2
+        #     ), "Expected random_init to have length 2 (positions, velocities)"
+        #     positions, velocities = random_init
+        #     neighbors = self.get_neighbors(positions)
         history = {
             "positions": [positions],
             "velocities": [velocities],
@@ -208,33 +209,35 @@ class Boids:
     
     def update_goal(self, positions):
         """
-        Update the goal position after boids reach it and loiter for 50 steps.
+        Update the goal position after boids reach it and loiter for 5 seconds.
         """
-        # Fetch current positions of boids and compute distance to goal
-        goal_vec = self.goal_positions - positions[:, None, :]  # (num_boids, num_goals, 2)
-        goal_dist = np.linalg.norm(goal_vec, axis=-1)  # (num_boids, num_goals)
-        # If average distance to goal is less than 0.5, start loitering timer
-        if np.mean(goal_dist[:, self.current_goal]) < 0.5 and not self.reached_goal:
-            self.reached_goal = True
 
-        if self.reached_goal and np.mean(goal_dist[:, self.current_goal]) < 0.5:
-            self.loiter_timer += 1
-            # print(f"Loitering at goal for {self.loiter_timer} steps.")
-
-        # If loitering timer is equal to 50, switch to next goal in triangular fashion
-        if self.loiter_timer == 50:
-            self.current_goal = (self.current_goal + 1) % len(self.goal_positions)
-            self.loiter_timer = 0
-            self.goals_completed += 1
-            self.reached_goal = False
+        # Compute distance to current goal
+        goal_vec = self.goal_positions[self.current_goal] - positions
+        goal_dist = np.linalg.norm(goal_vec, axis=-1)
+        required_loiter_duration_seconds = 5
+        # If average distance to goal is less than threshold, start/continue loitering
+        if np.mean(goal_dist) < 0.25:
+            # print("We are in the goal area.")
+            if not hasattr(self, 'loiter_start_time'):
+                self.loiter_start_time = time.time()
+            if time.time() - self.loiter_start_time > required_loiter_duration_seconds:
+                # print(f"Goal {self.current_goal + 1} reached and loitered for {required_loiter_duration_seconds} seconds. Moving to next goal.")
+                self.current_goal = (self.current_goal + 1) % len(self.goal_positions)
+                self.goals_completed += 1
+                del self.loiter_start_time
+        else:
+            if hasattr(self, 'loiter_start_time'):
+                # print(f"We are not in the goal area. The time spent loitering at goal {self.current_goal + 1} was {time.time() - self.loiter_start_time:.2f} seconds. Resetting loiter timer.")
+                del self.loiter_start_time
 
     def check_termination(self):
         """
-        Terminate the trajectory if boids finish loitering at all goals for 50 steps.
+        Terminate the trajectory if boids finish loitering at all goals for 5 seconds.
         """
         
-        if self.goals_completed == 3:  # Assuming 3 goals and 50 steps of loitering each
-            # print("Termination condition met: Boids have loitered at all goals for 50 steps.")
+        if self.goals_completed == 3:  # Assuming 3 goals and 5 seconds of loitering each
+            # print("Termination condition met: Boids have loitered at all goals for 5 seconds.")
             return True
         else:
             return False
@@ -381,15 +384,16 @@ def make_dataset(reps, trajectory_len=None, random_init=False, fixed_init=True, 
     boids = Boids(**kwargs)
     all_graphs = []
 
-    print(f">>> Generating {reps} trajectories with random_init={random_init}...")
+    print(f">>> Generating {reps} trajectories with random_init={active_random_init}...")
     
-    for i in tqdm(range(reps)):
+    for i in tqdm(range(reps+1)):
         # 2. Generate trajectory using the 'init' data from evaluate
         history = boids.generate_trajectory(
-            random_init=False,
+            random_init=active_random_init,
             fixed_init=fixed_init,
             return_accel=accel
         )
+        print(i)
         
         samples = history_to_samples(history, accel=accel)
         
