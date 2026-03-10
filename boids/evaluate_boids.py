@@ -46,7 +46,7 @@ def convert_to_tf_sparse(a):
     # 3. Always reorder to ensure the sparse indices are in canonical order
     return tf.sparse.reorder(a_tf)
 
-def evaluate(model, forward, trajectory_len, n_boids, init_blob=False):
+def evaluate(model, forward, reps_unique, repeat_reps, n_boids):
     """
     Evaluates the GNCA by comparing it to the true Boids math.
     Uses randomized starting clumps to test the model's robustness.
@@ -57,14 +57,13 @@ def evaluate(model, forward, trajectory_len, n_boids, init_blob=False):
     # 1. Generate the ground truth trajectory
     # By passing init=None, it forces the use of your new clumped get_random_init()
     data_te, boids_te = make_dataset(
-        1,
-        trajectory_len,
-        random_init=False,    
-        fixed_init=True,    
+        reps_unique=1,
+        repeat_reps=1,
+        random_init=True,
+        fixed_init=False,
         return_boids=True,
         n_boids=n_boids,
-        n_jobs=1,            
-        init=None            
+        n_jobs=1,                     
     )
     loader_te = DisjointLoader(data_te, node_level=True, epochs=1, shuffle=False)
 
@@ -126,7 +125,7 @@ def evaluate(model, forward, trajectory_len, n_boids, init_blob=False):
         plt.plot(*boid_trajectory_pred[:, boid_idx, :2].T, label=l_g, c="g", lw=2)
     plt.title("One-step Prediction Paths")
     plt.legend()
-    plt.savefig("boids_pred_fixed.pdf")
+    plt.savefig(f"boids_pred_{reps_unique}_{repeat_reps}.pdf")
 
     # --- Plotting 2: Autoregressive Comparison ---
     plt.figure(figsize=(8, 6))
@@ -137,7 +136,7 @@ def evaluate(model, forward, trajectory_len, n_boids, init_blob=False):
         plt.plot(*boid_trajectory_auto[:, boid_idx, :2].T, label=l_g, c="g", lw=2)
     plt.title("Autoregressive (Full Flight) Paths")
     plt.legend()
-    plt.savefig("boids_auto_fixed.pdf")
+    plt.savefig(f"boids_auto_{reps_unique}_{repeat_reps}.pdf")
 
     # --- Plotting 3: Average Degree (Neighbor Stability) ---
     plt.figure()
@@ -146,7 +145,7 @@ def evaluate(model, forward, trajectory_len, n_boids, init_blob=False):
     plt.ylabel("Average Neighbor Count")
     plt.xlabel("Step")
     plt.legend()
-    plt.savefig("boids_avg_degree_fixed.pdf")
+    plt.savefig(f"boids_avg_degree_{reps_unique}_{repeat_reps}.pdf")
 
     plt.show()
 
@@ -187,14 +186,13 @@ def evaluate_complexity(model, forward, te_set_size, trajectory_len, n_boids, in
     for i in range(te_set_size):
         # We rely on get_random_init() for the 'clump', so we keep init=None
         data_te, boids_te = make_dataset(
-            1,
-            trajectory_len,
-            random_init=False,
-            fixed_init=True,
+            reps_unique=1,
+            repeat_reps=1,
+            random_init=True,
+            fixed_init=False,
             return_boids=True,
             n_boids=n_boids,
             n_jobs=1,
-            init=None, 
         )
         loader_te = DisjointLoader(data_te, node_level=True, epochs=1, shuffle=False)
 
@@ -241,12 +239,7 @@ def evaluate_complexity(model, forward, te_set_size, trajectory_len, n_boids, in
     print(f"\nFINAL COMPLEXITY STATS OVER {te_set_size} RUNS:")
     print(f"SampEn True: {measures_mean[0]:.6f} +- {measures_std[0]:.6f}")
     print(f"SampEn GNCA: {measures_mean[1]:.6f} +- {measures_std[1]:.6f}")
+    print(f"CorrDim True: {measures_mean[2]:.6f} +- {measures_std[2]:.6f}")
+    print(f"CorrDim GNCA: {measures_mean[3]:.6f} +- {measures_std[3]:.6f}")
     
     return measures_mean, measures_std
-
-if __name__ == "__main__":
-    trajectory_len = 1000
-    n_boids = 100
-    # Use compile=False if the model has custom Spektral layers not currently in scope
-    model = load_model("best_model", compile=False)
-    evaluate(model, forward, trajectory_len, n_boids, init_blob=True)

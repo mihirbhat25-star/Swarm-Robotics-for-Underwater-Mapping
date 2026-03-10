@@ -25,7 +25,6 @@ physical_devices = tf.config.list_physical_devices("GPU")
 if len(physical_devices) > 0:
     tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
-
 def run(data_tr, data_va, data_te):
 
     model = GNNCASimpleBoids(
@@ -72,7 +71,7 @@ parser.add_argument(
     "--batch_size", default=30, type=int, help="Size of the mini-batches"
 )
 parser.add_argument(
-    "--epochs", default=1000, type=int, help="Number of training epochs"
+    "--epochs", default=1000000, type=int, help="Number of training epochs"
 )
 parser.add_argument(
     "--es_patience", default=200, type=int, help="Patience for early stopping"
@@ -90,13 +89,16 @@ parser.add_argument(
     "--trajectory_len", default=300, type=int, help="Length of trajectories"
 )
 parser.add_argument(
-    "--tr_set_size", default=300, type=int, help="N. of training trajectories"
+    "--train_set_size", default=300, type=int, help="N. of training trajectories"
 )
 parser.add_argument(
-    "--va_set_size", default=30, type=int, help="N. of valid. trajectories"
+    "--tr_set_unique", default=300, type=int, help="N. of unique training trajectories"
 )
 parser.add_argument(
-    "--te_set_size", default=30, type=int, help="N. of test trajectories"
+    "--va_set_unique", default=30, type=int, help="N. of unique validation trajectories"
+)
+parser.add_argument(
+    "--te_set_unique", default=30, type=int, help="N. of unique test trajectories"
 )
 parser.add_argument(
     "--test_complexity_every",
@@ -112,18 +114,19 @@ parser.add_argument(
 args = parser.parse_args()
 print(f"\n>>> Generating dataset (n_jobs=1)...")
 data_tr = make_dataset(
-    args.tr_set_size, random_init=True, fixed_init=False, trajectory_len=args.trajectory_len, n_boids=args.n_boids, n_jobs=1
+    reps_unique=args.tr_set_unique, repeat_reps=args.train_set_size // args.tr_set_unique, random_init=True, fixed_init=False, n_boids=args.n_boids, n_jobs=11
 )
-data_va = make_dataset(
-    args.va_set_size, random_init=True, fixed_init=False, trajectory_len=args.trajectory_len, n_boids=args.n_boids, n_jobs=1
-)
-data_te = make_dataset(
-    args.te_set_size, random_init=True, fixed_init=False, trajectory_len=args.trajectory_len, n_boids=args.n_boids, n_jobs=1
-)
+print("Train dataset size:", len(data_tr.graphs))
 
-print("Train dataset size:", len(data_tr))
-print("Validation dataset size:", len(data_va))
-print("Test dataset size:", len(data_te))
+data_va = make_dataset(
+    reps_unique=args.va_set_unique, repeat_reps=1, random_init=True, fixed_init=False, n_boids=args.n_boids, n_jobs=1
+)
+print("Validation dataset size:", len(data_va.graphs))
+
+data_te = make_dataset(
+    reps_unique=args.te_set_unique, repeat_reps=1, random_init=True, fixed_init=False, n_boids=args.n_boids, n_jobs=1
+)
+print("Test dataset size:", len(data_te.graphs))
 
 history, results_te, model = run(data_tr, data_va, data_te)
 
@@ -134,11 +137,8 @@ joblib.dump(history.history, "history.pkl")
 ####################################################################################
 # Evaluation
 ####################################################################################
-trajectory_len = 1000
 n_boids = 100
-init_blob = False
-# RESTORED: Execute evaluation
-evaluate(model, forward, trajectory_len, n_boids, init_blob=init_blob)
+evaluate(model, forward, repeat_reps=args.train_set_size // args.tr_set_unique, reps_unique=args.tr_set_unique, n_boids=n_boids)
 
 ####################################################################################
 # Plot SampEn and Correlation Dimension
