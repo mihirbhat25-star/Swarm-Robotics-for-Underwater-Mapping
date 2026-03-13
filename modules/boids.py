@@ -261,8 +261,8 @@ class Boids:
         """
         Spawns boids in a tight clump at a random location on the canvas.
         """
-        # 1. Pick a random 'center' for the flock (between -7 and 7)
-        center = np.random.uniform(-7, 7, (1, 2))
+        # 1. Pick a random 'center' for the flock (between -10 and -7.5)
+        center = np.random.uniform([-10, -10], [-7.5, -7.5], (1, 2))
         
         # 2. Spawn boids in a small clump (0.5 radius) around that center
         positions = center + np.random.uniform(-0.5, 0.5, (n_boids, 2))
