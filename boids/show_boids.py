@@ -20,8 +20,8 @@ boids = Boids(
     show=False,
 )
 
-init_config = boids.get_random_init(boids.n_boids)
-history = boids.generate_trajectory(init_config, loiter=True)
+init_config = boids.get_random_init(boids.n_boids)  # Get a random initial configuration
+history = boids.generate_trajectory(init_config, loiter=True)  # Generate a trajectory
 positions = history["positions"]
 
 fig, ax = plt.subplots(figsize=(6, 6))
