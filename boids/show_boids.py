@@ -12,7 +12,7 @@ boids = Boids(
     max_turn=5,
     perception=0.25,
     crowding=0.025,
-    n_boids=100,
+    n_boids=25,
     dt=1,
     canvas_scale=1,
     boundary_size_pctg=0.2,
@@ -21,7 +21,7 @@ boids = Boids(
 )
 
 init_config = boids.get_random_init(boids.n_boids)
-history = boids.generate_trajectory(init_config)
+history = boids.generate_trajectory(init_config, loiter=True)
 positions = history["positions"]
 
 fig, ax = plt.subplots(figsize=(6, 6))

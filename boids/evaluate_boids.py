@@ -46,7 +46,7 @@ def convert_to_tf_sparse(a):
     # 3. Always reorder to ensure the sparse indices are in canonical order
     return tf.sparse.reorder(a_tf)
 
-def evaluate(model, forward, reps_unique, repeat_reps, n_boids):
+def evaluate(model, forward, reps_unique, repeat_reps, n_boids, loiter, anim_gen=False):
     """
     Evaluates the GNCA by comparing it to the true Boids math.
     Uses randomized starting clumps to test the model's robustness.
@@ -54,6 +54,12 @@ def evaluate(model, forward, reps_unique, repeat_reps, n_boids):
     # Set seed for reproducibility of this specific test run
     np.random.seed(0) 
     
+    # Initialize the FFMpegWriter instance
+    writer = FFMpegWriter(fps=20)
+    
+    # Initialize the figure and axis for plotting
+    fig, ax = plt.subplots(figsize=(7, 7))
+
     # 1. Generate the ground truth trajectory
     # By passing init=None, it forces the use of your new clumped get_random_init()
     data_te, boids_te = make_dataset(
@@ -62,10 +68,14 @@ def evaluate(model, forward, reps_unique, repeat_reps, n_boids):
         random_init=True,
         fixed_init=False,
         return_boids=True,
+        loiter=loiter,
         n_boids=n_boids,
         n_jobs=1,                     
     )
     loader_te = DisjointLoader(data_te, node_level=True, epochs=1, shuffle=False)
+
+    # Ensure goals are explicitly assigned from boids_te
+    goals = boids_te.goal_positions
 
     boid_trajectory_true = []
     boid_trajectory_pred = [] # One-step predictions
@@ -107,25 +117,55 @@ def evaluate(model, forward, reps_unique, repeat_reps, n_boids):
     boid_trajectory_pred = np.array(boid_trajectory_pred)
     boid_trajectory_auto = np.array(boid_trajectory_auto)
 
-    print("\n--- Evaluation Metrics ---")
-    print("True values:")
-    avg_measure(boid_trajectory_true, nolds.sampen)
-    avg_measure(boid_trajectory_true, nolds.corr_dim, emb_dim=10)
-    print("\nAuto (Recursive) values:")
-    avg_measure(boid_trajectory_auto, nolds.sampen)
-    avg_measure(boid_trajectory_auto, nolds.corr_dim, emb_dim=10)
+    if anim_gen:
+
+        local_path = "gnca_boids.mp4"  # Save in the container's workspace
+        print(f"🎬 Saving GNCA flight to {local_path}...")
+
+        try:
+            with writer.saving(fig, local_path, dpi=100):
+                for i in range(len(boid_trajectory_auto)):
+                    ax.clear()
+
+                    # Pull positions (Latitude/Longitude)
+                    pos = boid_trajectory_auto[i][:, :2]
+
+                    # Draw everything
+                    ax.scatter(goals[:, 0], goals[:, 1], c='red', marker='*', s=150)
+                    ax.scatter(pos[:, 0], pos[:, 1], c='lime', s=20, edgecolors='k')
+
+                    # Keep the view consistent
+                    ax.set_xlim(boids_te.borders[0], boids_te.borders[2])
+                    ax.set_ylim(boids_te.borders[1], boids_te.borders[3])
+                    ax.set_title(f"Step {i}")
+
+                    writer.grab_frame()
+
+            print(f"✅ Done! Check your local path for {local_path}")
+        except FileNotFoundError as e:
+            print("Error: ffmpeg is not installed or the path is invalid.")
+            return
+
+    # Evaluation metrics
+    # print("\n--- Evaluation Metrics ---")
+    # print("True values:")
+    # avg_measure(boid_trajectory_true, nolds.sampen)
+    # avg_measure(boid_trajectory_true, nolds.corr_dim, emb_dim=10)
+    # print("\nAuto (Recursive) values:")
+    # avg_measure(boid_trajectory_auto, nolds.sampen)
+    # avg_measure(boid_trajectory_auto, nolds.corr_dim, emb_dim=10)
 
     # --- Plotting 1: One-Step Comparison ---
     plt.figure(figsize=(8, 6))
     indices = np.random.permutation(boid_trajectory_auto.shape[-2])[:5]
-    for i, boid_idx in enumerate(indices):
-        l_t = "True" if i == 0 else None
-        l_g = "GNCA" if i == 0 else None
-        plt.plot(*boid_trajectory_true[:, boid_idx, :2].T, label=l_t, c="k", alpha=0.3, ls='--')
-        plt.plot(*boid_trajectory_pred[:, boid_idx, :2].T, label=l_g, c="g", lw=2)
-    plt.title("One-step Prediction Paths")
-    plt.legend()
-    plt.savefig(f"boids_pred_{reps_unique}_{repeat_reps}.pdf")
+    # for i, boid_idx in enumerate(indices):
+    #     l_t = "True" if i == 0 else None
+    #     l_g = "GNCA" if i == 0 else None
+    #     plt.plot(*boid_trajectory_true[:, boid_idx, :2].T, label=l_t, c="k", alpha=0.3, ls='--')
+    #     plt.plot(*boid_trajectory_pred[:, boid_idx, :2].T, label=l_g, c="g", lw=2)
+    # plt.title("One-step Prediction Paths")
+    # plt.legend()
+    # plt.savefig(f"boids_pred_{reps_unique}_{repeat_reps}.pdf")
 
     # --- Plotting 2: Autoregressive Comparison ---
     plt.figure(figsize=(8, 6))
@@ -139,42 +179,17 @@ def evaluate(model, forward, reps_unique, repeat_reps, n_boids):
     plt.savefig(f"boids_auto_{reps_unique}_{repeat_reps}.pdf")
 
     # --- Plotting 3: Average Degree (Neighbor Stability) ---
-    plt.figure()
-    plt.plot(avg_degree_trajectory_true, label="True", c="k", alpha=0.5)
-    plt.plot(avg_degree_trajectory_auto, label="GNCA", c="g")
-    plt.ylabel("Average Neighbor Count")
-    plt.xlabel("Step")
-    plt.legend()
-    plt.savefig(f"boids_avg_degree_{reps_unique}_{repeat_reps}.pdf")
+    # plt.figure()
+    # plt.plot(avg_degree_trajectory_true, label="True", c="k", alpha=0.5)
+    # plt.plot(avg_degree_trajectory_auto, label="GNCA", c="g")
+    # plt.ylabel("Average Neighbor Count")
+    # plt.xlabel("Step")
+    # plt.legend()
+    # plt.savefig(f"boids_avg_degree_{reps_unique}_{repeat_reps}.pdf")
 
-    plt.show()
+    # plt.show()
 
-    # 1. Setup the figure and writer
-    # fig, ax = plt.subplots(figsize=(7, 7))
-    # writer = FFMpegWriter(fps=20)
-    # goals = boids_te.goal_positions
-
-    # print("🎬 Saving GNCA flight to gnca_boids.mp4...")
-
-    # with writer.saving(fig, "gnca_boids.mp4", dpi=100):
-    #     for i in range(len(boid_trajectory_auto)):
-    #         ax.clear()
-            
-    #         # Pull positions (Latitude/Longitude)
-    #         pos = boid_trajectory_auto[i][:, :2]
-            
-    #         # Draw everything
-    #         ax.scatter(goals[:, 0], goals[:, 1], c='red', marker='*', s=150)
-    #         ax.scatter(pos[:, 0], pos[:, 1], c='lime', s=20, edgecolors='k')
-            
-    #         # Keep the view consistent
-    #         ax.set_xlim(boids_te.borders[0], boids_te.borders[2])
-    #         ax.set_ylim(boids_te.borders[1], boids_te.borders[3])
-    #         ax.set_title(f"Step {i}")
-            
-    #         writer.grab_frame()
-
-# print("✅ Done! Check your workspace folder for gnca_boids.mp4")
+    return boid_trajectory_true, boid_trajectory_pred, boid_trajectory_auto
 
 def evaluate_complexity(model, forward, te_set_size, trajectory_len, n_boids, init_blob=False):
     """
