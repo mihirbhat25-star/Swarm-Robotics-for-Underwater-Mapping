@@ -3,7 +3,6 @@ Trains the GNCA to imitate the Boids GCA.
 """
 import argparse
 import os
-
 import joblib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -30,7 +29,6 @@ class PrintESPatience(tf.keras.callbacks.Callback):
         # patience is the total allowed, wait is the current counter of non-improvement
         remaining = self.es_callback.patience - self.es_callback.wait
         print(f" — EarlyStopping Patience: {remaining}/{self.es_callback.patience}")
-# --------------------------------------
 
 # tf.config.run_functions_eagerly(True)
 physical_devices = tf.config.list_physical_devices("GPU")
@@ -80,8 +78,9 @@ def run(data_tr, data_va):
 ####################################################################################
 parser = argparse.ArgumentParser()
 parser.add_argument("--lr", default=1e-3, type=float, help="Initial LR")
-parser.add_argument("--loiter", default=True, type=bool, help="Whether boids should loiter")
 parser.add_argument("--anim_gen", default=False, type=bool, help="Whether to generate animations")
+parser.add_argument("--time_bool", default=True, type=bool, help="Whether to include time as a feature")
+parser.add_argument("--loiter_bool", default=True, type=bool, help="Whether boids should loiter")
 parser.add_argument(
     "--batch_size", default=30, type=int, help="Size of the mini-batches"
 )
@@ -89,8 +88,7 @@ parser.add_argument(
     "--epochs", default=1000000, type=int, help="Number of training epochs"
 )
 parser.add_argument(
-    "--es_patience", default=200
-    , type=int, help="Patience for early stopping"
+    "--es_patience", default=200, type=int, help="Patience for early stopping"
 )
 parser.add_argument(
     "--lr_patience", default=10, type=int, help="Patience for LR annealing"
@@ -102,17 +100,17 @@ parser.add_argument(
     "--n_boids", default=100, type=int, help="N. of boids in simulation"
 )
 parser.add_argument(
-    "--train_set_size", default=300, type=int, help="N. of training trajectories"
+    "--tr_set_size", default=300, type=int, help="N. of training trajectories"
 )
 parser.add_argument(
     "--tr_set_unique", default=300, type=int, help="N. of unique training trajectories"
 )
-parser.add_argument(
-    "--va_set_unique", default=30, type=int, help="N. of unique validation trajectories"
-)
-parser.add_argument(
-    "--te_set_unique", default=30, type=int, help="N. of unique test trajectories"
-)
+# parser.add_argument(
+#     "--va_set_unique", default=30, type=int, help="N. of unique validation trajectories"
+# )
+# parser.add_argument(
+#     "--te_set_unique", default=30, type=int, help="N. of unique test trajectories"
+# )
 parser.add_argument(
     "--test_complexity_every",
     default=-1,
@@ -127,15 +125,16 @@ parser.add_argument(
 args = parser.parse_args()
 print(f"\n>>> Generating dataset (n_jobs=1)...")
 data_tr = make_dataset(
-    reps_unique=args.tr_set_unique, repeat_reps=args.train_set_size // args.tr_set_unique, random_init=True, fixed_init=False, n_boids=args.n_boids, n_jobs=1, loiter=args.loiter
+    reps_unique=args.tr_set_unique, repeat_reps=args.tr_set_size // args.tr_set_unique, random_init=True, fixed_init=False, n_boids=args.n_boids, n_jobs=1, loiter=args.loiter_bool, time_bool=args.time_bool
 )
 print("Train dataset size:", len(data_tr.graphs))
 
 data_va = make_dataset(
-    reps_unique=args.va_set_unique, repeat_reps=1, random_init=True, fixed_init=False, n_boids=args.n_boids, n_jobs=1, loiter=args.loiter
+    reps_unique=30, repeat_reps=1, random_init=True, fixed_init=False, n_boids=args.n_boids, n_jobs=1, loiter=args.loiter_bool, time_bool=args.time_bool
 )
 print("Validation dataset size:", len(data_va.graphs))
 
+print(f"\n>>> Training GNCA model... with config: {args}")
 history, model = run(data_tr, data_va)
 
 model.save("gnca_model", save_format="tf")
@@ -144,5 +143,4 @@ joblib.dump(history.history, "history.pkl")
 ####################################################################################
 # Evaluation
 ####################################################################################
-n_boids = 100
-evaluate(model, forward, repeat_reps=args.train_set_size // args.tr_set_unique, reps_unique=args.tr_set_unique, n_boids=n_boids, loiter=args.loiter, anim_gen=args.anim_gen)
+evaluate(model, forward, repeat_reps=args.tr_set_size // args.tr_set_unique, reps_unique=args.tr_set_unique, n_boids=args.n_boids, loiter=args.loiter_bool, anim_gen=args.anim_gen, time_bool=args.time_bool)

@@ -46,7 +46,7 @@ def convert_to_tf_sparse(a):
     # 3. Always reorder to ensure the sparse indices are in canonical order
     return tf.sparse.reorder(a_tf)
 
-def evaluate(model, forward, reps_unique, repeat_reps, n_boids, loiter, anim_gen=False):
+def evaluate(model, forward, reps_unique, repeat_reps, n_boids, loiter, anim_gen, time_bool):
     """
     Evaluates the GNCA by comparing it to the true Boids math.
     Uses randomized starting clumps to test the model's robustness.
@@ -69,6 +69,7 @@ def evaluate(model, forward, reps_unique, repeat_reps, n_boids, loiter, anim_gen
         fixed_init=False,
         return_boids=True,
         loiter=loiter,
+        time_bool=time_bool,
         n_boids=n_boids,
         n_jobs=1,                     
     )

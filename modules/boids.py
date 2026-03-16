@@ -64,7 +64,7 @@ class Boids:
         accelerations += self.get_separation(neighbors, positions)
         accelerations += self.get_alignment(neighbors, velocities) / 8
         accelerations += self.get_cohesion(neighbors, positions) / 100
-        accelerations += self.get_goal(neighbors, positions) / 125
+        accelerations += self.get_goal(neighbors, positions) / 103.75
 
         velocities_new = velocities + accelerations * self.dt
         if self.limits:
@@ -76,8 +76,8 @@ class Boids:
         positions = positions + velocities * self.dt
 
         # Keep boids within borders
-        # positions[:, 0] = np.clip(positions[:, 0], self.borders[0], self.borders[2])
-        # positions[:, 1] = np.clip(positions[:, 1], self.borders[1], self.borders[3])
+        positions[:, 0] = np.clip(positions[:, 0], self.borders[0], self.borders[2])
+        positions[:, 1] = np.clip(positions[:, 1], self.borders[1], self.borders[3])
 
         # Plot if needed
         if self.show:
@@ -87,7 +87,7 @@ class Boids:
             (accelerations,) if return_accel else ()
         )
 
-    def generate_trajectory(self, init_config, loiter, return_accel=False):
+    def generate_trajectory(self, init_config, loiter, time_bool, return_accel=False):
         positions, velocities, neighbors = init_config
         history = {
             "positions": [init_config[0]],
@@ -104,7 +104,7 @@ class Boids:
             history["neighbors"].append(neighbors)
             if return_accel:
                 history["accelerations"].append(output[3])
-            self.update_goal(positions, loiter=loiter)
+            self.update_goal(positions, loiter=loiter, time_bool=time_bool)
             if self.check_termination():
                 break
 
@@ -188,7 +188,7 @@ class Boids:
         steering = self.clamp(steering)
         return steering
     
-    def update_goal(self, positions, loiter):
+    def update_goal(self, positions, loiter, time_bool):
         """
         Update the goal position after boids reach it and loiter for 5 seconds.
         """
@@ -196,23 +196,36 @@ class Boids:
         # Compute distance to current goal
         goal_vec = self.goal_positions[self.current_goal] - positions
         goal_dist = np.linalg.norm(goal_vec, axis=-1)
-
+        
         if loiter:
-            required_loiter_duration_seconds = 5
+            required_loiter_duration = 12 if time_bool else 1200  # How long to loiter at each goal before switching to the next one
 
             # If average distance to goal is less than threshold, start/continue loitering
-            if np.mean(goal_dist) < 0.25 and not hasattr(self, 'loiter_start_time'):
+            if np.mean(goal_dist) < 0.35:
                 # Start the loiter timer if not already started
-                self.loiter_start_time = time.time()
+                if time_bool and not hasattr(self, 'loiter_start_time'):
+                    # print(f"Boids have reached goal {self.current_goal} and are starting to loiter...")
+                    self.loiter_start_time = time.time()
+                elif not time_bool and not hasattr(self, 'loiter_counter'):
+                    # print(f"Boids have reached goal {self.current_goal} and are starting to loiter...")
+                    self.loiter_counter = 0  # Discrete counter for loitering if time_bool is False
 
             # Check if loitering duration is met
-            if time.time() - self.loiter_start_time > required_loiter_duration_seconds:
+            if time_bool and hasattr(self, 'loiter_start_time') and time.time() - self.loiter_start_time > required_loiter_duration:
                 self.current_goal = (self.current_goal + 1) % len(self.goal_positions)
                 self.goals_completed += 1
                 del self.loiter_start_time
+
+            elif not time_bool and hasattr(self, 'loiter_counter'):
+                self.loiter_counter += 1
+                if self.loiter_counter >= required_loiter_duration:
+                    self.current_goal = (self.current_goal + 1) % len(self.goal_positions)
+                    self.goals_completed += 1
+                    del self.loiter_counter
+
         else:
-            # If average distance to goal is less than threshold, switch to next goal
-            if np.mean(goal_dist) < 0.25:
+            if np.mean(goal_dist) < 0.35:
+                print(f"Boids have reached goal {self.current_goal} and are moving to the next goal...")
                 self.current_goal = (self.current_goal + 1) % len(self.goal_positions)
                 self.goals_completed += 1
 
@@ -270,11 +283,18 @@ class Boids:
         # 1. Pick a random 'center' for the flock (between (-10 and -7.5)^2)
         center = np.random.uniform([-10, -10], [-7.5, -7.5], (1, 2))
         
-        # 2. Spawn boids in a small clump (0.5 radius) around that center
+        # 2. Spawn boids in a small clump (0.5 radius) around that center.
         positions = center + np.random.uniform(-0.5, 0.5, (n_boids, 2))
         positions[:, 0] = np.clip(positions[:, 0], self.borders[0], self.borders[2])
         positions[:, 1] = np.clip(positions[:, 1], self.borders[1], self.borders[3])
-        
+
+        # Debug: print if any boid is off the grid
+        off_grid_x = (positions[:, 0] < self.borders[0]) | (positions[:, 0] > self.borders[2])
+        off_grid_y = (positions[:, 1] < self.borders[1]) | (positions[:, 1] > self.borders[3])
+        if np.any(off_grid_x) or np.any(off_grid_y):
+            print(f"Warning: {np.sum(off_grid_x | off_grid_y)} boids are off the grid!")
+            print("Positions off grid:", positions[off_grid_x | off_grid_y])
+
         # 3. Give them a random shared initial direction + small individual jitter
         shared_velocity = np.random.uniform(-0.01, 0.01, (1, 2))
         jitter = np.random.uniform(-0.001, 0.001, (n_boids, 2))
@@ -360,7 +380,7 @@ def history_to_samples(history, accel=False):
 
     return [(x, a, y) for x, a, y in zip(inputs[:-1], neighbors[:-1], targets)]
 
-def make_dataset(reps_unique, repeat_reps, random_init, fixed_init, loiter, return_boids=False, accel=False, **kwargs):
+def make_dataset(reps_unique, repeat_reps, random_init, fixed_init, loiter, time_bool, return_boids=False, accel=False, **kwargs):
     # Clean up kwargs so Boids() doesn't crash
     n_jobs = kwargs.pop("n_jobs", 1)
     # If evaluate() passes 'init', we'll use it as our random_init data
@@ -380,6 +400,7 @@ def make_dataset(reps_unique, repeat_reps, random_init, fixed_init, loiter, retu
             history = boids.generate_trajectory(
                 init_config=init_config,
                 loiter=loiter,
+                time_bool=time_bool,
                 return_accel=accel
             )
             samples = history_to_samples(history, accel=accel)

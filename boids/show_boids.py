@@ -12,7 +12,7 @@ boids = Boids(
     max_turn=5,
     perception=0.25,
     crowding=0.025,
-    n_boids=25,
+    n_boids=100,
     dt=1,
     canvas_scale=1,
     boundary_size_pctg=0.2,
@@ -21,7 +21,7 @@ boids = Boids(
 )
 
 init_config = boids.get_random_init(boids.n_boids)  # Get a random initial configuration
-history = boids.generate_trajectory(init_config, loiter=True)  # Generate a trajectory
+history = boids.generate_trajectory(init_config, loiter=False, time_bool=True)  # Generate a trajectory
 positions = history["positions"]
 
 fig, ax = plt.subplots(figsize=(6, 6))
@@ -30,11 +30,11 @@ ax.set_ylim(-10, 10)
 ax.set_title("Boids Simulation")
 scat = ax.scatter([], [], s=20)
 
-writer = FFMpegWriter(fps=20)
-print("🎬 Saving boids animation to boids_animation.mp4...")
-with writer.saving(fig, "boids_animation.mp4", dpi=100):
+writer = FFMpegWriter(fps=40)
+print("🎬 Saving boids animation to boids_animation_wo_loiter.mp4...")
+with writer.saving(fig, "boids_animation_wo_loiter.mp4", dpi=100):
     for frame in range(len(positions)):
         scat.set_offsets(positions[frame])
-        ax.set_title(f"Boids Simulation - Frame {frame}")
+        ax.set_title(f"Boids Simulation")
         writer.grab_frame()
-print("✅ Animation saved as boids_animation.mp4")
+print("✅ Animation saved as boids_animation_wo_loiter.mp4")
