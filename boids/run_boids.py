@@ -78,9 +78,10 @@ def run(data_tr, data_va):
 ####################################################################################
 parser = argparse.ArgumentParser()
 parser.add_argument("--lr", default=1e-3, type=float, help="Initial LR")
-parser.add_argument("--anim_gen", default=False, type=bool, help="Whether to generate animations")
+parser.add_argument("--anim_gen", default=True, type=bool, help="Whether to generate animations")
 parser.add_argument("--time_bool", default=True, type=bool, help="Whether to include time as a feature")
 parser.add_argument("--loiter_bool", default=True, type=bool, help="Whether boids should loiter")
+parser.add_argument("--random_init", default=False, type=bool, help="Whether to use random initial conditions for training")
 parser.add_argument(
     "--batch_size", default=30, type=int, help="Size of the mini-batches"
 )
@@ -124,23 +125,22 @@ parser.add_argument(
 
 args = parser.parse_args()
 print(f"\n>>> Generating dataset (n_jobs=1)...")
-data_tr = make_dataset(
-    reps_unique=args.tr_set_unique, repeat_reps=args.tr_set_size // args.tr_set_unique, random_init=True, fixed_init=False, n_boids=args.n_boids, n_jobs=1, loiter=args.loiter_bool, time_bool=args.time_bool
+print("Init configuration: random_init =", args.random_init, ", loiter_bool =", args.loiter_bool, ", time_bool =", args.time_bool)
+data_tr, init_config_for_eval = make_dataset(
+    reps_unique=args.tr_set_unique, repeat_reps=args.tr_set_size // args.tr_set_unique, random_init=args.random_init, fixed_init=not args.random_init, n_boids=args.n_boids, n_jobs=1, loiter=args.loiter_bool, time_bool=args.time_bool, saved_init_config=None, return_init_config=True
 )
 print("Train dataset size:", len(data_tr.graphs))
 
 data_va = make_dataset(
-    reps_unique=30, repeat_reps=1, random_init=True, fixed_init=False, n_boids=args.n_boids, n_jobs=1, loiter=args.loiter_bool, time_bool=args.time_bool
+    reps_unique=30, repeat_reps=1, random_init=args.random_init, fixed_init=not args.random_init, n_boids=args.n_boids, n_jobs=1, loiter=args.loiter_bool, time_bool=args.time_bool, saved_init_config=init_config_for_eval, return_init_config=False
 )
 print("Validation dataset size:", len(data_va.graphs))
 
-print(f"\n>>> Training GNCA model... with config: {args}")
 history, model = run(data_tr, data_va)
-
 model.save("gnca_model", save_format="tf")
 joblib.dump(history.history, "history.pkl")
 
 ####################################################################################
 # Evaluation
 ####################################################################################
-evaluate(model, forward, repeat_reps=args.tr_set_size // args.tr_set_unique, reps_unique=args.tr_set_unique, n_boids=args.n_boids, loiter=args.loiter_bool, anim_gen=args.anim_gen, time_bool=args.time_bool)
+evaluate(model, forward, random_init=args.random_init, fixed_init=not args.random_init, repeat_reps=args.tr_set_size // args.tr_set_unique, reps_unique=args.tr_set_unique, n_boids=args.n_boids, loiter=args.loiter_bool, anim_gen=args.anim_gen, time_bool=args.time_bool, saved_init_config_for_eval=init_config_for_eval)

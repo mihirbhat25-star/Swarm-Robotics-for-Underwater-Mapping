@@ -46,7 +46,7 @@ def convert_to_tf_sparse(a):
     # 3. Always reorder to ensure the sparse indices are in canonical order
     return tf.sparse.reorder(a_tf)
 
-def evaluate(model, forward, reps_unique, repeat_reps, n_boids, loiter, anim_gen, time_bool):
+def evaluate(model, forward, random_init, fixed_init, reps_unique, repeat_reps, n_boids, loiter, anim_gen, time_bool, saved_init_config_for_eval):
     """
     Evaluates the GNCA by comparing it to the true Boids math.
     Uses randomized starting clumps to test the model's robustness.
@@ -65,13 +65,15 @@ def evaluate(model, forward, reps_unique, repeat_reps, n_boids, loiter, anim_gen
     data_te, boids_te = make_dataset(
         reps_unique=1,
         repeat_reps=1,
-        random_init=True,
-        fixed_init=False,
+        random_init=random_init,
+        fixed_init=fixed_init,
         return_boids=True,
         loiter=loiter,
         time_bool=time_bool,
         n_boids=n_boids,
-        n_jobs=1,                     
+        n_jobs=1,
+        saved_init_config=saved_init_config_for_eval,
+        return_init_config=False                     
     )
     loader_te = DisjointLoader(data_te, node_level=True, epochs=1, shuffle=False)
 
@@ -204,8 +206,8 @@ def evaluate_complexity(model, forward, te_set_size, trajectory_len, n_boids, in
         data_te, boids_te = make_dataset(
             reps_unique=1,
             repeat_reps=1,
-            random_init=True,
-            fixed_init=False,
+            random_init=False,
+            fixed_init=True,
             return_boids=True,
             n_boids=n_boids,
             n_jobs=1,

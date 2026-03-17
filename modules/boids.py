@@ -278,44 +278,20 @@ class Boids:
 
     def get_random_init(self, n_boids):
         """
-        Spawns boids in a tight clump at a random location on the canvas.
-        """
-        # 1. Pick a random 'center' for the flock (between (-10 and -7.5)^2)
-        center = np.random.uniform([-10, -10], [-7.5, -7.5], (1, 2))
-        
-        # 2. Spawn boids in a small clump (0.5 radius) around that center.
-        positions = center + np.random.uniform(-0.5, 0.5, (n_boids, 2))
-        positions[:, 0] = np.clip(positions[:, 0], self.borders[0], self.borders[2])
-        positions[:, 1] = np.clip(positions[:, 1], self.borders[1], self.borders[3])
-
-        # Debug: print if any boid is off the grid
-        off_grid_x = (positions[:, 0] < self.borders[0]) | (positions[:, 0] > self.borders[2])
-        off_grid_y = (positions[:, 1] < self.borders[1]) | (positions[:, 1] > self.borders[3])
-        if np.any(off_grid_x) or np.any(off_grid_y):
-            print(f"Warning: {np.sum(off_grid_x | off_grid_y)} boids are off the grid!")
-            print("Positions off grid:", positions[off_grid_x | off_grid_y])
-
-        # 3. Give them a random shared initial direction + small individual jitter
-        shared_velocity = np.random.uniform(-0.01, 0.01, (1, 2))
-        jitter = np.random.uniform(-0.001, 0.001, (n_boids, 2))
-        velocities = shared_velocity + jitter
-        
-        neighbors = self.get_neighbors(positions)
-        return [positions, velocities, neighbors]
-    
-    def set_fixed_init(self, n_boids):
-        """
-        Set a fixed initial position of (-7, -7).
+        Get a random initial position and velocity for each boid
         :param n_boids: int, number of boids
         """
-        positions = np.full((n_boids, 2), -7.0) + 0.001 * np.random.rand(n_boids, 2)
-        # Set all boids to have the same initial velocity
-        # Example: all boids move right at max_speed
-        direction = np.array([1.0, 0.0])  # unit vector to the right
-        velocity = direction * self.max_speed
-        velocities = np.tile(velocity, (n_boids, 1))
+        
+        print(f">>> Generating random initial configuration for {n_boids} boids...")
+        positions = np.random.uniform(-10, -7.5, (n_boids, 2))
+        velocities = to_cartesian(
+            np.random.uniform(-1, 1, (n_boids, 2)) * self.max_speed
+        )
         neighbors = self.get_neighbors(positions)
 
+        return positions, velocities, neighbors
+    
+    def get_fixed_init(self, n_boids, positions, velocities, neighbors):
         return positions, velocities, neighbors
 
     def plot(self, positions, **kwargs):
@@ -380,22 +356,41 @@ def history_to_samples(history, accel=False):
 
     return [(x, a, y) for x, a, y in zip(inputs[:-1], neighbors[:-1], targets)]
 
-def make_dataset(reps_unique, repeat_reps, random_init, fixed_init, loiter, time_bool, return_boids=False, accel=False, **kwargs):
+def make_dataset(reps_unique, repeat_reps, random_init, fixed_init, loiter, time_bool, saved_init_config, return_init_config, return_boids=False, accel=False, **kwargs):
     # Clean up kwargs so Boids() doesn't crash
     n_jobs = kwargs.pop("n_jobs", 1)
     # If evaluate() passes 'init', we'll use it as our random_init data
     init_data = kwargs.pop("init", None) 
-    
-    # Use the passed init_data if it exists, otherwise use the random_init flag
-    active_random_init = init_data if init_data is not None else random_init
 
     boids = Boids(**kwargs)
     all_graphs = []
 
-    print(f">>> Generating {reps_unique} unique trajectories that are repeated {repeat_reps} times with random_init={active_random_init}...")
+    if saved_init_config is not None:
+        print(f">>> Using provided initial configuration for all trajectories.")
+        for i in tqdm(range(reps_unique)):
+            for _ in range(repeat_reps):
+                history = boids.generate_trajectory(
+                    init_config=saved_init_config,
+                    loiter=loiter,
+                    time_bool=time_bool,
+                    return_accel=accel
+                )
+                samples = history_to_samples(history, accel=accel)
+                for x, a, y in samples:
+                    all_graphs.append(Graph(x=x, a=a, y=y))
+                del history
+                del samples
+
+        dataset = BoidsDataset(all_graphs)
+        if return_boids:
+            return (dataset, boids)
+        return dataset
+
+    print(f">>> Generating {reps_unique} unique trajectories that are repeated {repeat_reps} times with random_init={random_init}...")
     
+    init_config = boids.get_random_init(boids.n_boids) if not random_init else None
     for i in tqdm(range(reps_unique)):
-        init_config = boids.get_random_init(boids.n_boids) if active_random_init else boids.set_fixed_init(boids.n_boids)
+        init_config = boids.get_random_init(boids.n_boids) if random_init else init_config
         for _ in range(repeat_reps):
             history = boids.generate_trajectory(
                 init_config=init_config,
@@ -410,4 +405,9 @@ def make_dataset(reps_unique, repeat_reps, random_init, fixed_init, loiter, time
             del samples
 
     dataset = BoidsDataset(all_graphs)
-    return (dataset, boids) if return_boids else dataset
+    if return_boids:
+        return (dataset, boids) 
+    elif return_init_config:
+        return (dataset, init_config)
+    else:
+        return dataset
