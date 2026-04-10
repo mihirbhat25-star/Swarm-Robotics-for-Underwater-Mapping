@@ -11,6 +11,7 @@ from spektral.data import DisjointLoader
 from spektral.layers import ops
 from tensorflow.keras.models import load_model
 from modules.boids import make_dataset
+from modules.boids import Boids
 
 @tf.function(experimental_relax_shapes=True)
 def forward(model, x, a, i, training=None):
@@ -46,153 +47,69 @@ def convert_to_tf_sparse(a):
     # 3. Always reorder to ensure the sparse indices are in canonical order
     return tf.sparse.reorder(a_tf)
 
-def evaluate(model, forward, random_init, fixed_init, reps_unique, repeat_reps, n_boids, loiter, anim_gen, time_bool, saved_init_config_for_eval):
+def evaluate(model, forward, max_trajectory_len, n_boids, init_blob=False):
     """
-    Evaluates the GNCA by comparing it to the true Boids math.
-    Uses randomized starting clumps to test the model's robustness.
+    Minimal evaluation: only autoregressive GNCA trajectory and animation using fixed init.
     """
-    # Set seed for reproducibility of this specific test run
-    np.random.seed(0) 
-    
-    # Initialize the FFMpegWriter instance
-    writer = FFMpegWriter(fps=20)
-    
-    # Initialize the figure and axis for plotting
-    fig, ax = plt.subplots(figsize=(7, 7))
+    np.random.seed(0)
 
-    # 1. Generate the ground truth trajectory
-    # By passing init=None, it forces the use of your new clumped get_random_init()
-    data_te, boids_te = make_dataset(
-        reps_unique=1,
-        repeat_reps=1,
-        random_init=random_init,
-        fixed_init=fixed_init,
-        return_boids=True,
-        loiter=loiter,
-        time_bool=time_bool,
-        n_boids=n_boids,
-        n_jobs=1,
-        saved_init_config=saved_init_config_for_eval,
-        return_init_config=False                     
-    )
-    loader_te = DisjointLoader(data_te, node_level=True, epochs=1, shuffle=False)
+    # Create a stateless Boids instance for neighbor calculation and static info
+    boids = Boids(n_boids=n_boids)
+    positions, velocities, _ = boids.get_random_init(n_boids)
+    x = np.concatenate([positions, velocities], axis=-1)
+    goals = boids.goal_positions
+    borders = boids.borders
 
-    # Ensure goals are explicitly assigned from boids_te
-    goals = boids_te.goal_positions
+    # Initial adjacency
+    a_scipy = boids.get_neighbors(positions)
+    def to_tf_sparse(a):
+        indices = np.stack([a.row, a.col], axis=1)
+        a_tf = tf.SparseTensor(indices=indices, values=a.data.astype(np.float32), dense_shape=a.shape)
+        return tf.sparse.reorder(a_tf)
+    a = to_tf_sparse(a_scipy)
 
-    boid_trajectory_true = []
-    boid_trajectory_pred = [] # One-step predictions
-    boid_trajectory_auto = [] # Autoregressive (recursive) predictions
-    avg_degree_trajectory_true = []
-    avg_degree_trajectory_auto = []
-    
-    for sample in loader_te:
-        inputs, x_next = sample
-        
-        # Compute the one-step prediction (standard GNCA behavior)
-        x_next_pred = forward(model, *inputs, training=False)
-        avg_degree_trajectory_true.append(np.average(ops.degrees(inputs[1]).numpy()))
-        
-        if len(boid_trajectory_auto) == 0:
-            # SYNC POINT: To compare fairly, the GNCA must start at the 
-            # exact same location as the first step of the True trajectory.
-            boid_trajectory_auto.append(x_next_pred)
-        else:
-            x_last = boid_trajectory_auto[-1]
-            
-            # Update neighbors based on the GNCA's own previous movement
-            a_scipy = boids_te.get_neighbors(x_last[:, :2])
-            a = convert_to_tf_sparse(a_scipy) # Using the safe TF conversion function
-            
-            avg_degree_trajectory_auto.append(np.average(ops.degrees(a).numpy()))
+    # Autoregressive GNCA trajectory
+    boid_trajectory_auto = [x.astype(np.float32)]
+    for t in range(max_trajectory_len-1):
+        x_last = boid_trajectory_auto[-1]
+        # Update neighbors based on GNCA's own previous prediction
+        a_scipy = boids.get_neighbors(x_last[:, :2])
+        a = to_tf_sparse(a_scipy)
+        # Forward pass
+        # For GNCA, you may need to pass goal info as well if required by your model
+        # Here, we assume only (x, a) are needed
+        x_next = forward(model, x_last, a, np.zeros((n_boids, 1)), training=False)
+        boid_trajectory_auto.append(x_next.numpy())
 
-            # Recursive step: GNCA uses its OWN previous prediction as input
-            # inputs[-1] provides the Goal coordinates which remain constant/external
-            inputs_auto = [x_last, a, inputs[-1]]
-            x_next_auto = forward(model, *inputs_auto, training=False)
-            boid_trajectory_auto.append(x_next_auto)
-
-        boid_trajectory_true.append(x_next)
-        boid_trajectory_pred.append(x_next_pred.numpy())
-
-    # Finalize arrays for plotting and metrics
-    boid_trajectory_true = np.array(boid_trajectory_true)
-    boid_trajectory_pred = np.array(boid_trajectory_pred)
     boid_trajectory_auto = np.array(boid_trajectory_auto)
 
-    if anim_gen:
-
-        local_path = "gnca_boids.mp4"  # Save in the container's workspace
-        print(f"🎬 Saving GNCA flight to {local_path}...")
-
-        try:
-            with writer.saving(fig, local_path, dpi=100):
-                for i in range(len(boid_trajectory_auto)):
-                    ax.clear()
-
-                    # Pull positions (Latitude/Longitude)
-                    pos = boid_trajectory_auto[i][:, :2]
-
-                    # Draw everything
-                    ax.scatter(goals[:, 0], goals[:, 1], c='red', marker='*', s=150)
-                    ax.scatter(pos[:, 0], pos[:, 1], c='lime', s=20, edgecolors='k')
-
-                    # Keep the view consistent
-                    ax.set_xlim(boids_te.borders[0], boids_te.borders[2])
-                    ax.set_ylim(boids_te.borders[1], boids_te.borders[3])
-                    ax.set_title(f"Step {i}")
-
-                    writer.grab_frame()
-
-            print(f"✅ Done! Check your local path for {local_path}")
-        except FileNotFoundError as e:
-            print("Error: ffmpeg is not installed or the path is invalid.")
-            return
-
-    # Evaluation metrics
-    # print("\n--- Evaluation Metrics ---")
-    # print("True values:")
-    # avg_measure(boid_trajectory_true, nolds.sampen)
-    # avg_measure(boid_trajectory_true, nolds.corr_dim, emb_dim=10)
-    # print("\nAuto (Recursive) values:")
-    # avg_measure(boid_trajectory_auto, nolds.sampen)
-    # avg_measure(boid_trajectory_auto, nolds.corr_dim, emb_dim=10)
-
-    # --- Plotting 1: One-Step Comparison ---
+    # Save autoregressive trajectory as PDF
     plt.figure(figsize=(8, 6))
-    indices = np.random.permutation(boid_trajectory_auto.shape[-2])[:5]
-    # for i, boid_idx in enumerate(indices):
-    #     l_t = "True" if i == 0 else None
-    #     l_g = "GNCA" if i == 0 else None
-    #     plt.plot(*boid_trajectory_true[:, boid_idx, :2].T, label=l_t, c="k", alpha=0.3, ls='--')
-    #     plt.plot(*boid_trajectory_pred[:, boid_idx, :2].T, label=l_g, c="g", lw=2)
-    # plt.title("One-step Prediction Paths")
-    # plt.legend()
-    # plt.savefig(f"boids_pred_{reps_unique}_{repeat_reps}.pdf")
-
-    # --- Plotting 2: Autoregressive Comparison ---
-    plt.figure(figsize=(8, 6))
+    indices = np.random.permutation(n_boids)[:5]
     for i, boid_idx in enumerate(indices):
-        l_t = "True" if i == 0 else None
-        l_g = "GNCA" if i == 0 else None
-        plt.plot(*boid_trajectory_true[:, boid_idx, :2].T, label=l_t, c="k", alpha=0.3, ls='--')
-        plt.plot(*boid_trajectory_auto[:, boid_idx, :2].T, label=l_g, c="g", lw=2)
+        label = "GNCA" if i == 0 else None
+        plt.plot(*boid_trajectory_auto[:, boid_idx, :2].T, label=label, c="g", lw=2)
+    plt.scatter(goals[:, 0], goals[:, 1], c='red', marker='*', s=150, label='Goals')
     plt.title("Autoregressive (Full Flight) Paths")
     plt.legend()
-    plt.savefig(f"boids_auto_{reps_unique}_{repeat_reps}.pdf")
+    plt.savefig("boids_auto_fixed.pdf")
+    plt.close()
 
-    # --- Plotting 3: Average Degree (Neighbor Stability) ---
-    # plt.figure()
-    # plt.plot(avg_degree_trajectory_true, label="True", c="k", alpha=0.5)
-    # plt.plot(avg_degree_trajectory_auto, label="GNCA", c="g")
-    # plt.ylabel("Average Neighbor Count")
-    # plt.xlabel("Step")
-    # plt.legend()
-    # plt.savefig(f"boids_avg_degree_{reps_unique}_{repeat_reps}.pdf")
-
-    # plt.show()
-
-    return boid_trajectory_true, boid_trajectory_pred, boid_trajectory_auto
+    # Animation
+    fig, ax = plt.subplots(figsize=(7, 7))
+    writer = FFMpegWriter(fps=20)
+    print("🎬 Saving GNCA flight to gnca_boids.mp4...")
+    with writer.saving(fig, "gnca_boids.mp4", dpi=100):
+        for i in range(len(boid_trajectory_auto)):
+            ax.clear()
+            pos = boid_trajectory_auto[i][:, :2]
+            ax.scatter(goals[:, 0], goals[:, 1], c='red', marker='*', s=150)
+            ax.scatter(pos[:, 0], pos[:, 1], c='lime', s=20, edgecolors='k')
+            ax.set_xlim(borders[0], borders[2])
+            ax.set_ylim(borders[1], borders[3])
+            ax.set_title(f"Step {i}")
+            writer.grab_frame()
+    print("✅ Done! Check your workspace folder for gnca_boids.mp4")
 
 def evaluate_complexity(model, forward, te_set_size, trajectory_len, n_boids, init_blob=False):
     """
@@ -204,13 +121,13 @@ def evaluate_complexity(model, forward, te_set_size, trajectory_len, n_boids, in
     for i in range(te_set_size):
         # We rely on get_random_init() for the 'clump', so we keep init=None
         data_te, boids_te = make_dataset(
-            reps_unique=1,
-            repeat_reps=1,
-            random_init=False,
-            fixed_init=True,
+            1,
+            trajectory_len,
+            random_init=True,
             return_boids=True,
             n_boids=n_boids,
             n_jobs=1,
+            init=None, 
         )
         loader_te = DisjointLoader(data_te, node_level=True, epochs=1, shuffle=False)
 
@@ -259,5 +176,4 @@ def evaluate_complexity(model, forward, te_set_size, trajectory_len, n_boids, in
     print(f"SampEn GNCA: {measures_mean[1]:.6f} +- {measures_std[1]:.6f}")
     print(f"CorrDim True: {measures_mean[2]:.6f} +- {measures_std[2]:.6f}")
     print(f"CorrDim GNCA: {measures_mean[3]:.6f} +- {measures_std[3]:.6f}")
-    
     return measures_mean, measures_std

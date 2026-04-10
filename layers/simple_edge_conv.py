@@ -19,7 +19,10 @@ class SimpleEdgeConv(EdgeConv):
         # Calculate messages
         messages = self.mlp(tf.concat([diff, dist], axis=-1))
 
+        # Aggregate (mean messages for each target node j)
+        out = tf.math.unsorted_segment_mean(messages, j, tf.shape(x)[0])
+
         # Aggregate (sum messages for each target node j)
-        out = tf.math.unsorted_segment_sum(messages, j, tf.shape(x)[0])
+        # out = tf.math.unsorted_segment_sum(messages, j, tf.shape(x)[0])
         
         return out
