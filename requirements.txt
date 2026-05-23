@@ -1,5 +1,5 @@
 # Machine Learning Core
-tensorflow==2.4.1
+# tensorflow==2.4.1
 spektral==1.0.6
 
 # Critical Fixes for Python 3.8 Compatibility

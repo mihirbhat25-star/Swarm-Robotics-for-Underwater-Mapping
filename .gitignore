@@ -1,1 +1,18 @@
 __pycache__/
+
+# Large generated files
+*.npz
+*.pkl
+*.h5
+*.keras
+
+# Trained model directories
+gnca_model*/
+
+# Result outputs
+results/
+history_*.pkl
+boids_tr_*.pkl
+
+# PDF outputs
+*.pdf

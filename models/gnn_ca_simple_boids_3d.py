@@ -2,7 +2,8 @@ import tensorflow as tf
 from spektral.models.general_gnn import MLP, GeneralGNN
 from layers.simple_edge_conv import SimpleEdgeConv
 
-class GNNCASimpleBoids(tf.keras.Model):
+
+class GNNCASimpleBoids3D(tf.keras.Model):
     def __init__(
         self,
         activation=None,
@@ -14,10 +15,7 @@ class GNNCASimpleBoids(tf.keras.Model):
         aggregate="mean",
         **kwargs
     ):
-        # Separate Keras-standard kwargs from custom boids kwargs
-        # This prevents the TypeError: 'Keyword argument not understood'
         super().__init__(**kwargs)
-        
         self.boids_activation = activation
         self.message_passing = message_passing
         self.batch_norm = batch_norm
@@ -27,9 +25,9 @@ class GNNCASimpleBoids(tf.keras.Model):
         self.aggregate = aggregate
 
     def build(self, input_shape):
-        # MP for full state (pos + vel)
+        # MP for full 3D state (pos_xyz + vel_xyz = 6 features)
         self.mp = GeneralGNN(
-            2,
+            3,  # output 3D velocity
             activation="linear",
             message_passing=self.message_passing,
             pool=None,
@@ -40,29 +38,27 @@ class GNNCASimpleBoids(tf.keras.Model):
             aggregate=self.aggregate,
         )
 
-        # MP for relative position differences
-        self.mp_diff = SimpleEdgeConv(2, activation="linear", mlp_hidden=[self.hidden])
+        # MP for relative 3D position differences
+        self.mp_diff = SimpleEdgeConv(3, activation="linear", mlp_hidden=[self.hidden])
 
-        # Final acceleration/velocity model
+        # Final velocity model
         self.limits_model = MLP(
-            2, batch_norm=self.batch_norm, activation=self.hidden_activation
+            3, batch_norm=self.batch_norm, activation=self.hidden_activation
         )
 
     def call(self, inputs, training=False):
         x_v = inputs[0]
         adj = inputs[1]
-        
-        pos = x_v[:, :2]
-        vel = x_v[:, 2:]
 
-        # Now we just pass the standard list. 
-        # No extra 'indices' keyword needed because propagate handles it.
+        pos = x_v[:, :3]   # 3D position
+        vel = x_v[:, 3:]   # 3D velocity
+
         diff_effect = self.mp_diff([pos, adj], training=training)
         mp_effect = self.mp([x_v, adj], training=training)
 
         v_next = vel + mp_effect + diff_effect
         v_next = self.limits_model(v_next, training=training)
-        
+
         x_next = pos + v_next
         return tf.concat([x_next, v_next], axis=-1)
 
@@ -72,5 +68,5 @@ class GNNCASimpleBoids(tf.keras.Model):
         steps_int = tf.cast(steps, tf.int32)
         for _ in tf.range(steps_int):
             state = self([state, adj], training=False)
-            state = tf.ensure_shape(state, [None, 4])
+            state = tf.ensure_shape(state, [None, 6])
         return state
