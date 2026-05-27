@@ -194,7 +194,7 @@ def _model_hash(model):
 
 def evaluate(model, forward, max_trajectory_len, n_boids, use_saved_config, saved_boids,
              init_blob=False, viz_mode='tubular', max_viz_runs=50,
-             traj_cache_path="viz_trajectories.npz"):
+             traj_cache_path="viz_trajectories.npz", run_tag=""):
     """
     Evaluate GNCA trajectories and produce a visualization PDF.
 
@@ -278,13 +278,17 @@ def evaluate(model, forward, max_trajectory_len, n_boids, use_saved_config, save
         ax.set_aspect('equal')
         ax.legend()
         plt.tight_layout()
-        plt.savefig("boids_tube_mean.pdf")
+        tag = f"_{run_tag}" if run_tag else ""
+        mean_fname = f"boids_tube_mean{tag}.pdf"
+        multi_fname = f"boids_tube_multi{tag}.pdf"
+        single_fname = f"boids_tube_single{tag}.pdf"
+        plt.savefig(mean_fname)
         plt.close()
-        print("Saved boids_tube_mean.pdf")
+        print(f"Saved {mean_fname}")
         # 2. 10 random runs, each as a separate tube
-        _plot_multi_tubular(trajs, goals, n_boids, n_show=10, filename="boids_tube_multi.pdf")
+        _plot_multi_tubular(trajs, goals, n_boids, n_show=10, filename=multi_fname)
         # 3. Single random run as a tube
-        _plot_single_tubular(trajs, goals, n_boids, filename="boids_tube_single.pdf")
+        _plot_single_tubular(trajs, goals, n_boids, filename=single_fname)
     elif viz_mode == 'per_boid':
         _plot_per_boid(trajs, goals, n_boids)
     else:

@@ -23,8 +23,8 @@ class Boids:
         wrap=False,  # If True, wrap around instead of avoiding boundary
         limits=True,  # If True, enforce speed and turn limits
         show=False,
-        pos_noise=0.000,  # Max magnitude of bounded uniform noise added to positions at each step (~20% of max step distance)
-        vel_noise=0.0000  # Max magnitude of bounded uniform noise added to velocities at each step (~5% of max_speed)
+        pos_noise=0.004,  # Max magnitude of bounded uniform noise added to positions at each step
+        vel_noise=0.001  # Max magnitude of bounded uniform noise added to velocities at each step
     ):
         self.min_speed = min_speed
         self.max_speed = max_speed

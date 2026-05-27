@@ -21,7 +21,9 @@ physical_devices = tf.config.list_physical_devices("GPU")
 if len(physical_devices) > 0:
     tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
-def custom_weighted_mse(y_true, y_pred):
+UPWEIGHT = True  # Set to False if no upweighting (plain MSE) → saves with _oldl suffix
+
+def custom_weighted_mse(y_true, y_pred, UPWEIGHT_NEAR_GOAL=UPWEIGHT):
     # y_true is [current_state, next_state, current_goal_pos], y_pred is predicted next_state
     n_features = tf.shape(y_pred)[-1]
     current_state = y_true[..., :n_features]
@@ -35,8 +37,8 @@ def custom_weighted_mse(y_true, y_pred):
     avg_goal = tf.reduce_mean(current_goal, axis=-2)  # all nodes share same goal value
     dist_to_goal = tf.norm(avg_pos - avg_goal, axis=-1)
 
-    # Weight by 2.5 if within 3 units of the current goal, else 1
-    goal_weight = tf.where(dist_to_goal < 2.5, 2.5, 1.0)
+    # Weight by 2.5 if within 3 units of the current goal and UPWEIGHT_NEAR_GOAL is True, else 1
+    goal_weight = tf.where(dist_to_goal < 2.5, 2.5, 1.0) if UPWEIGHT_NEAR_GOAL else 1.0
     return mse * goal_weight
 
 def run(data_tr, data_va):
@@ -100,10 +102,10 @@ parser.add_argument(
     "--trajectory_len", default=300, type=int, help="Length of trajectories"
 )
 parser.add_argument(
-    "--tr_set_unique", default=100, type=int, help="N. of unique training trajectories"
+    "--tr_set_unique", default=50, type=int, help="N. of unique training trajectories"
 )
 parser.add_argument(
-    "--tr_set_repeats", default=10, type=int, help="N. of repeats for each training trajectory"
+    "--tr_set_repeats", default=20, type=int, help="N. of repeats for each training trajectory"
 )
 parser.add_argument(
     "--va_set_size", default=30, type=int, help="N. of valid. trajectories"
@@ -148,11 +150,6 @@ def make_val_init_list(centers, n_boids, max_speed):
 if train_init_centers is not None and len(train_init_centers) == args.tr_set_unique:
     # Use the saved centers directly for validation
     val_centers = np.array(train_init_centers)
-    # Debug: check if validation centers match training centers
-    # if np.allclose(val_centers, train_init_centers):
-    #     print("[DEBUG] Validation initial configs MATCH training centers.")
-    # else:
-    #     print("[DEBUG] Validation initial configs DO NOT match training centers!")
     data_va = make_dataset(
         unique_reps=args.tr_set_unique, repeat_reps=1, save_config=False, trajectory_len=args.trajectory_len, n_boids=args.n_boids, n_jobs=1, random_init=train_init_centers
     )
@@ -164,7 +161,10 @@ else:
 
 history, model = run(data_tr, data_va)
 
-run_tag = f"{args.tr_set_unique}x{args.tr_set_repeats}"
+# Append _oldl if loss has no upweighting near goal
+noise_config = "nw5" # Noise config for this run
+run_tag = f"{args.tr_set_unique}x{args.tr_set_repeats}" + ("" if UPWEIGHT else "_oldl") + (f"_{noise_config}")
+print(f"\n>>> Saving model and history with run_tag='{run_tag}'...")
 model.save(f"gnca_model_{run_tag}", save_format="tf")
 joblib.dump(history.history, f"history_{run_tag}.pkl")
 joblib.dump(boids_tr, f"boids_tr_{run_tag}.pkl")
@@ -175,7 +175,7 @@ joblib.dump(boids_tr, f"boids_tr_{run_tag}.pkl")
 max_trajectory_len = 2000
 n_boids = 100
 init_blob = False
-evaluate(model, forward, max_trajectory_len, n_boids, use_saved_config=True, saved_boids=boids_tr, init_blob=init_blob, viz_mode='tubular', traj_cache_path=f"viz_trajectories_{run_tag}.npz")
+evaluate(model, forward, max_trajectory_len, n_boids, use_saved_config=True, saved_boids=boids_tr, init_blob=init_blob, viz_mode='tubular', traj_cache_path=f"viz_trajectories_{run_tag}.npz", run_tag=run_tag)
 
 ####################################################################################
 # Plot SampEn and Correlation Dimension
