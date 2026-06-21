@@ -1,5 +1,6 @@
 """
 Evaluates the trained GNCA by comparing it to the true Boids GCA.
+Imports visualization functions from visualize_boids.
 """
 
 import matplotlib.pyplot as plt
@@ -15,6 +16,8 @@ from modules.boids import make_dataset
 from modules.boids import Boids
 from shapely.geometry import LineString
 import random
+
+from boids.visualize_boids import save_tubular_triplet, _plot_per_boid, _plot_multi_tubular, _get_tube_exterior, _plot_individual_ranked
 
 @tf.function(experimental_relax_shapes=True)
 def forward(model, x, a, i, training=None):
@@ -50,139 +53,6 @@ def convert_to_tf_sparse(a):
     # 3. Always reorder to ensure the sparse indices are in canonical order
     return tf.sparse.reorder(a_tf)
 
-
-def _get_tube_exterior(tube):
-    """Return (x, y) arrays for the exterior of a shapely Polygon or the largest polygon in a MultiPolygon."""
-    from shapely.geometry import MultiPolygon
-    if isinstance(tube, MultiPolygon):
-        tube = max(tube.geoms, key=lambda p: p.area)
-    return tube.exterior.xy
-
-
-def _plot_tubular(trajs, goals, n_boids):
-    """
-    Tubular band visualization.
-    trajs: list of (T, n_boids, 4) arrays, one per run.
-    Plots the mean swarm centroid curve with a 99% tubular band.
-    Uses shapely.buffer() for a correct Euclidean tube (no self-intersection artifacts).
-    """
-
-    centroids = np.array([t[:, :, :2].mean(axis=1) for t in trajs])  # (N, T, 2)
-    mean_curve = centroids.mean(axis=0)  # (T, 2)
-
-    # Per-run trimmed-sup distance: Q0.95 of pointwise Euclidean distances over time
-    dists = np.linalg.norm(centroids - mean_curve[None], axis=-1)  # (N, T)
-    d_i = np.percentile(dists, 95, axis=1)  # (N,)
-    r_99 = np.percentile(d_i, 99)  # 99% tube radius
-
-    # Build true Euclidean tube using shapely: union of circles of radius r_99 along mean_curve
-    line = LineString(mean_curve)
-    tube = line.buffer(r_99)
-    tube_x, tube_y = _get_tube_exterior(tube)
-
-    return mean_curve, np.array(tube_x), np.array(tube_y), r_99
-
-
-def _plot_per_boid(trajs, goals, n_boids):
-    """
-    Per-boid individual path visualization.
-    trajs: list of (T, n_boids, 4) arrays, one per run.
-    Picks one random run and plots all individual boid paths from that rollout.
-    """
-    run_idx = np.random.randint(len(trajs))
-    traj = trajs[run_idx]  # (T, n_boids, 4)
-    print(f"Per-boid viz using run {run_idx} of {len(trajs)}")
-
-    fig, ax = plt.subplots(figsize=(7, 7))
-    for b in range(n_boids):
-        ax.plot(
-            traj[:, b, 0], traj[:, b, 1],
-            color='#8B0000', lw=0.6, alpha=0.4,
-            label='Boid path' if b == 0 else None
-        )
-    ax.scatter(goals[:, 0], goals[:, 1], c='red', marker='*', s=150, zorder=5, label='Goals')
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_title(f"GNCA Swarm — Individual Boid Paths (run {run_idx})")
-    ax.set_aspect('equal')
-    ax.legend()
-    plt.tight_layout()
-    plt.savefig("boids_auto_rand.pdf")
-    plt.close()
-
-
-def _plot_multi_tubular(trajs, goals, n_boids, n_show=10, filename="boids_multi_tube.pdf"):
-    """
-    Plots n_show randomly selected runs as separate tubular bands on the same canvas.
-    Each run gets its own per-boid centroid curve + individual tube.
-    trajs: list of (T, n_boids, 4) arrays, one per run.
-    """
-    from shapely.geometry import LineString
-    import matplotlib.cm as cm
-
-    indices = np.random.choice(len(trajs), min(n_show, len(trajs)), replace=False)
-    colors = cm.Reds(np.linspace(0.4, 0.9, len(indices)))
-
-    fig, ax = plt.subplots(figsize=(7, 7))
-    for color, run_idx in zip(colors, indices):
-        traj = trajs[run_idx]  # (T, n_boids, 4)
-        centroid = traj[:, :, :2].mean(axis=1)  # (T, 2)
-
-        boid_dists = np.linalg.norm(traj[:, :, :2] - centroid[:, None, :], axis=-1)  # (T, n_boids)
-        r = np.percentile(np.percentile(boid_dists, 95, axis=1), 99)
-
-        line = LineString(centroid)
-        tube = line.buffer(r)
-        tx, ty = _get_tube_exterior(tube)
-        ax.fill(tx, ty, color=color, alpha=0.25)
-        ax.plot(centroid[:, 0], centroid[:, 1], color=color, lw=1.2,
-                label=f'Run {run_idx}')
-
-    ax.scatter(goals[:, 0], goals[:, 1], c='red', marker='*', s=150, zorder=5, label='Goals')
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_title(f"GNCA Swarm — {len(indices)} Separate Tubular Bands")
-    ax.set_aspect('equal')
-    ax.legend(fontsize=7)
-    plt.tight_layout()
-    plt.savefig(filename)
-    plt.close()
-    print(f"Saved {filename}")
-
-
-def _plot_single_tubular(trajs, goals, n_boids, filename="boids_single_tube.pdf"):
-    """
-    Picks ONE random run and plots its per-boid centroid as a single tubular band.
-    """
-    from shapely.geometry import LineString
-
-    run_idx = np.random.randint(len(trajs))
-    traj = trajs[run_idx]  # (T, n_boids, 4)
-    centroid = traj[:, :, :2].mean(axis=1)  # (T, 2)
-    print(f"Single-tube viz using run {run_idx} of {len(trajs)}")
-
-    boid_dists = np.linalg.norm(traj[:, :, :2] - centroid[:, None, :], axis=-1)  # (T, n_boids)
-    r = np.percentile(np.percentile(boid_dists, 95, axis=1), 99)
-
-    line = LineString(centroid)
-    tube = line.buffer(r)
-    tx, ty = _get_tube_exterior(tube)
-
-    fig, ax = plt.subplots(figsize=(7, 7))
-    ax.fill(tx, ty, color='#8B0000', alpha=0.3, label=f'99% tube (r={r:.2f})')
-    ax.plot(centroid[:, 0], centroid[:, 1], color='#8B0000', lw=1.5, label=f'Run {run_idx}')
-    ax.scatter(goals[:, 0], goals[:, 1], c='red', marker='*', s=150, zorder=5, label='Goals')
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_title(f"GNCA Swarm — Single Run Tube (run {run_idx})")
-    ax.set_aspect('equal')
-    ax.legend()
-    plt.tight_layout()
-    plt.savefig(filename)
-    plt.close()
-    print(f"Saved {filename}")
-
-
 def _model_hash(model):
     """Compute a short hash of the model's trainable weights for cache keying."""
     import hashlib
@@ -192,27 +62,9 @@ def _model_hash(model):
     return h.hexdigest()[:12]
 
 
-def evaluate(model, forward, max_trajectory_len, n_boids, use_saved_config, saved_boids,
-             init_blob=False, viz_mode='tubular', max_viz_runs=50,
-             traj_cache_path="viz_trajectories.npz", run_tag=""):
-    """
-    Evaluate GNCA trajectories and produce a visualization PDF.
-
-    viz_mode:        'tubular'       — mean over all runs with 99% tubular band (default)
-                     'per_boid'      — all 100 boid paths from one random run
-                     'multi_tubular' — 10 random runs each as a separate tube
-    max_viz_runs:    cap on number of runs used for visualization (default 20)
-    traj_cache_path: path to cache computed trajectories; reused if model unchanged
-    """
-    np.random.seed(0)  # seed for reproducible trajectory generation only
-
-    if saved_boids is not None:
-        boids = saved_boids
-    else:
-        boids = Boids(n_boids=n_boids)
-
-    goals = boids.goal_positions
-    borders = boids.borders
+def _make_gnca_runner(model, boids, n_boids, max_trajectory_len):
+    """Returns a callable that runs the 2D GNCA autoregressively."""
+    i = tf.zeros(n_boids, dtype=tf.int64)
 
     def to_tf_sparse(a):
         indices = np.stack([a.row, a.col], axis=1)
@@ -220,99 +72,125 @@ def evaluate(model, forward, max_trajectory_len, n_boids, use_saved_config, save
         return tf.sparse.reorder(a_tf)
 
     def run_gnca_traj(positions, velocities):
-        x = np.concatenate([positions, velocities], axis=-1)
-        a = to_tf_sparse(boids.get_neighbors(positions))
-        traj = [x.astype(np.float32)]
-        for t in range(max_trajectory_len - 1):
+        traj = [np.concatenate([positions, velocities], axis=-1).astype(np.float32)]
+        for _ in range(max_trajectory_len - 1):
             x_last = traj[-1]
             a = to_tf_sparse(boids.get_neighbors(x_last[:, :2]))
-            x_next = forward(model, x_last, a, np.zeros((n_boids, 1)), training=False)
+            x_next = model([tf.constant(x_last, dtype=tf.float32), a, i], training=False)
             traj.append(x_next.numpy())
         return np.array(traj)
 
-    # Cap runs at max_viz_runs
-    if use_saved_config and len(boids.rand_configs) > 0:
+    return run_gnca_traj
+
+
+def _load_or_compute_trained_trajs(boids, n_boids, run_gnca_traj, traj_cache_path, model_tag):
+    """Select up to 50 trained centers, load from cache or compute trajectories."""
+    if len(boids.rand_configs) > 0:
         all_centers = np.array(boids.rand_configs)
-        n_runs = min(max_viz_runs, len(all_centers))
-        selected_centers = all_centers[:n_runs]
+        n_runs = min(50, len(all_centers))
+        rand_indices = np.random.choice(len(all_centers), size=n_runs, replace=False)
+        selected_centers = all_centers[rand_indices]
     else:
         selected_centers = None
-        n_runs = max_viz_runs
+        n_runs = 50
 
-    # Check trajectory cache
-    model_tag = _model_hash(model)
     trajs = None
     if os.path.exists(traj_cache_path):
         cache = np.load(traj_cache_path, allow_pickle=True)
         if cache.get("model_tag", "") == model_tag and cache.get("n_runs", 0) == n_runs:
             print(f"✅ Loaded cached trajectories ({n_runs} runs) from '{traj_cache_path}'")
             trajs = list(cache["trajs"])
+            if "centers" in cache:
+                selected_centers = cache["centers"]
 
     if trajs is None:
-        print(f"🔄 Computing {n_runs} trajectories (model_tag={model_tag})...")
+        print(f"🔄 Computing {n_runs} trajectories from trained centers...")
         trajs = []
-        for i in range(n_runs):
+        for idx in range(n_runs):
             if selected_centers is not None:
-                center = selected_centers[i]
-                pos = center + 0.325 * np.random.rand(n_boids, 2)
+                center = selected_centers[idx]
+                pos = center + boids.init_scatter * np.random.rand(n_boids, 2)
                 vel = np.tile(np.array([1.0, 0.0]) * boids.max_speed, (n_boids, 1))
             else:
-                pos, vel, _ = boids.get_random_init(n_boids, save_config=False)
+                pos, vel, _, _ = boids.get_random_init(n_boids, save_config=False)
             trajs.append(run_gnca_traj(pos, vel))
-        np.savez(traj_cache_path, trajs=np.array(trajs), model_tag=model_tag, n_runs=n_runs)
+        np.savez(traj_cache_path, trajs=np.array(trajs), model_tag=model_tag, n_runs=n_runs,
+                 centers=selected_centers if selected_centers is not None else np.array([]))
         print(f"💾 Cached trajectories to '{traj_cache_path}'")
 
-    # Reset seed so visualization run/index selection is truly random each call
+    return trajs, selected_centers
+
+
+def _compute_test_trajs(boids, n_boids, test_centers, run_gnca_traj, selected_centers):
+    """Generate 50 test trajectories and check overlap with training centers."""
+    print(f"\n🔄 Generating 50 test-center trajectories...")
+    trajs_test = []
+    centers_collected = []
+
+    if test_centers is not None:
+        test_centers_arr = np.array(test_centers)
+        n_test = min(50, len(test_centers_arr))
+        print(f"   Using {n_test} provided test centers")
+        for idx in range(n_test):
+            center = test_centers_arr[idx]
+            pos = center + boids.init_scatter * np.random.rand(n_boids, 2)
+            vel = np.tile(np.array([1.0, 0.0]) * boids.max_speed, (n_boids, 1))
+            centers_collected.append(center)
+            trajs_test.append(run_gnca_traj(pos, vel))
+    else:
+        for _ in range(50):
+            pos, vel, _, center = boids.get_random_init(n_boids, save_config=False)
+            centers_collected.append(center)
+            trajs_test.append(run_gnca_traj(pos, vel))
+
+    print(f"✅ Generated {len(trajs_test)} test trajectories")
+
+    if selected_centers is not None and len(selected_centers) > 0:
+        matches = sum(1 for rc in centers_collected if any(np.array_equal(rc, tc) for tc in selected_centers))
+        print(f"🔎 Overlap check: {matches}/{len(trajs_test)} test centers exactly matched training centers")
+
+    return trajs_test
+
+
+def evaluate(model, forward, max_trajectory_len, n_boids, use_saved_config, saved_boids,
+             init_blob=False, viz_mode='tubular', max_viz_runs=50,
+             traj_cache_path="viz_trajectories.npz", run_tag="", n_show=50, specific_runs=None, output_dir=".",
+             test_centers=None):
+    """
+    Evaluate GNCA trajectories and produce visualization PDFs.
+    test_centers: if provided, use these for the test-set visualization instead of fresh random centers.
+    """
+    np.random.seed(0)
+    boids = saved_boids if saved_boids is not None else Boids(n_boids=n_boids)
+    goals = boids.goal_positions
+
+    run_gnca_traj = _make_gnca_runner(model, boids, n_boids, max_trajectory_len)
+    model_tag = _model_hash(model)
+    trajs, selected_centers = _load_or_compute_trained_trajs(
+        boids, n_boids, run_gnca_traj, traj_cache_path, model_tag)
     np.random.seed(None)
 
+    tag = f"_{run_tag}" if run_tag else ""
+
+
     if viz_mode == 'tubular':
-        # 1. Mean over all runs
-        mean_curve, poly_x, poly_y, r_99 = _plot_tubular(trajs, goals, n_boids)
-        fig, ax = plt.subplots(figsize=(7, 7))
-        ax.fill(poly_x, poly_y, color='#8B0000', alpha=0.3, label=f'99% tube (r={r_99:.2f})')
-        ax.plot(mean_curve[:, 0], mean_curve[:, 1], color='#8B0000', lw=1.5, label='Mean path')
-        ax.scatter(goals[:, 0], goals[:, 1], c='red', marker='*', s=150, zorder=5, label='Goals')
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-        ax.set_title(f"GNCA Swarm — Mean over {len(trajs)} Runs (Tubular Band)")
-        ax.set_aspect('equal')
-        ax.legend()
-        plt.tight_layout()
-        tag = f"_{run_tag}" if run_tag else ""
-        mean_fname = f"boids_tube_mean{tag}.pdf"
-        multi_fname = f"boids_tube_multi{tag}.pdf"
-        single_fname = f"boids_tube_single{tag}.pdf"
-        plt.savefig(mean_fname)
-        plt.close()
-        print(f"Saved {mean_fname}")
-        # 2. 10 random runs, each as a separate tube
-        _plot_multi_tubular(trajs, goals, n_boids, n_show=10, filename=multi_fname)
-        # 3. Single random run as a tube
-        _plot_single_tubular(trajs, goals, n_boids, filename=single_fname)
+        save_tubular_triplet(trajs, goals, n_boids, tag, 'trained', output_dir)
+        trajs_test = _compute_test_trajs(boids, n_boids, test_centers, run_gnca_traj, selected_centers)
+        save_tubular_triplet(trajs_test, goals, n_boids, tag, 'random', output_dir)
+
     elif viz_mode == 'per_boid':
-        _plot_per_boid(trajs, goals, n_boids)
+        _plot_per_boid(trajs, goals, n_boids, filename=os.path.join(output_dir, f"boids_auto_rand{tag}.pdf"))
+
+    elif viz_mode == 'multi_tubular':
+        _plot_multi_tubular(trajs, goals, n_boids, n_show=n_show,
+                           filename=os.path.join(output_dir, f"boids_multi_tubular{tag}.pdf"),
+                           specific_runs=specific_runs if specific_runs else list(range(min(n_show, len(trajs)))))
+
+    elif viz_mode == 'individual':
+        _plot_individual_ranked(trajs, goals, n_boids, selected_centers, run_tag, output_dir)
+
     else:
-        raise ValueError(f"Unknown viz_mode '{viz_mode}'. Choose 'tubular' or 'per_boid'.")
-
-    # Animation: use the median-y trajectory
-    # mid_positions = configs[selected_indices[1]] + 0.325 * np.random.rand(n_boids, 2) if use_saved_config and len(boids.rand_configs) > 0 else configs[1][0]
-    # mid_velocities = np.tile(np.array([1.0, 0.0]) * boids.max_speed, (n_boids, 1)) if use_saved_config and len(boids.rand_configs) > 0 else configs[1][1]
-    # boid_trajectory_auto = run_gnca_traj(mid_positions, mid_velocities)
-
-    # fig, ax = plt.subplots(figsize=(7, 7))
-    # writer = FFMpegWriter(fps=20)
-    # print("🎬 Saving GNCA flight to gnca_boids_rand.mp4...")
-    # with writer.saving(fig, "gnca_boids_rand.mp4", dpi=100):
-    #     for i in range(len(boid_trajectory_auto)):
-    #         ax.clear()
-    #         pos = boid_trajectory_auto[i][:, :2]
-    #         ax.scatter(goals[:, 0], goals[:, 1], c='red', marker='*', s=150)
-    #         ax.scatter(pos[:, 0], pos[:, 1], c='lime', s=20, edgecolors='k')
-    #         ax.set_xlim(borders[0], borders[2])
-    #         ax.set_ylim(borders[1], borders[3])
-    #         ax.set_title(f"Step {i}")
-    #         writer.grab_frame()
-    # print("✅ Done! Check your workspace folder for gnca_boids_rand.mp4")
+        raise ValueError(f"Unknown viz_mode '{viz_mode}'. Choose 'tubular', 'per_boid', 'multi_tubular', or 'individual'.")
 
 def evaluate_complexity(model, forward, te_set_size, trajectory_len, n_boids, init_blob=False):
     """

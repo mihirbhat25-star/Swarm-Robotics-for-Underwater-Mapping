@@ -6,7 +6,7 @@ from spektral import utils
 from spektral.data import Dataset, Graph
 from tqdm import tqdm
 import tensorflow as tf
-
+import h5py
 
 class Boids3D:
     def __init__(
@@ -24,6 +24,8 @@ class Boids3D:
         wrap=False,
         limits=True,
         show=False,
+        pos_noise=0.004,  # Max magnitude of bounded uniform noise added to positions at each step
+        vel_noise=0.0005  # Max magnitude of bounded uniform noise added to velocities at each step
     ):
         self.min_speed = min_speed
         self.max_speed = max_speed
@@ -37,6 +39,9 @@ class Boids3D:
         self.boundary_size_pctg = boundary_size_pctg
         self.wrap = wrap
         self.limits = limits
+        self.pos_noise = pos_noise
+        self.vel_noise = vel_noise
+        self.init_scatter = 0.325  # Spread of boids around the initial center
 
         # 3D canvas: [xmin, ymin, zmin, xmax, ymax, zmax]
         self.borders = canvas_scale * np.array([-5, -5, -5, 5, 5, 5])
@@ -47,6 +52,7 @@ class Boids3D:
         self.loiter_timer = 0
         self.goals_completed = 0
         self.rand_configs = []
+        self.unseen_configs = []  # Centers from cache NOT used in training
 
         self.boundary_margins = self.borders * boundary_size_pctg
         self.boundaries = self.borders - self.boundary_margins
@@ -86,6 +92,10 @@ class Boids3D:
         for dim in range(3):
             positions[:, dim] = np.clip(positions[:, dim], self.borders[dim], self.borders[dim + 3])
 
+        # Add a bounded random noise to positions and velocities
+        positions += np.random.uniform(-self.pos_noise, self.pos_noise, positions.shape)
+        velocities += np.random.uniform(-self.vel_noise, self.vel_noise, velocities.shape)
+
         if self.show:
             self.plot(positions)
 
@@ -94,12 +104,27 @@ class Boids3D:
         )
 
     def generate_trajectory(self, save_config, random_init, return_accel=False):
+        # Reset goal state for each new trajectory
+        self.current_goal = 0
+        self.goals_completed = 0
+        self.reached_goal = False
+
         if random_init is False:
             positions, velocities, neighbors = self.get_fixed_init(self.n_boids)
         elif random_init is True:
-            positions, velocities, neighbors = self.get_random_init(self.n_boids, save_config)
+            positions, velocities, neighbors, _ = self.get_random_init(self.n_boids, save_config)
+        elif isinstance(random_init, np.ndarray) and random_init.shape == (3,):
+            # Treat as a center for the flock (3D)
+            center = random_init
+            positions = center + 0.325 * np.random.rand(self.n_boids, 3)
+            direction = np.array([1.0, 0.0, 0.0])
+            velocity = direction * self.max_speed
+            velocities = np.tile(velocity, (self.n_boids, 1))
+            neighbors = self.get_neighbors(positions)
         else:
-            assert len(random_init) == 2
+            assert (
+                len(random_init) == 2
+            ), "Expected random_init to have length 2 (positions, velocities) or a center (3,)"
             positions, velocities = random_init
             neighbors = self.get_neighbors(positions)
 
@@ -107,6 +132,7 @@ class Boids3D:
             "positions": [positions],
             "velocities": [velocities],
             "neighbors": [neighbors],
+            "goal_positions": [self.goal_positions[self.current_goal].copy()],
         }
         if return_accel:
             history["accelerations"] = []
@@ -117,6 +143,7 @@ class Boids3D:
             history["positions"].append(positions)
             history["velocities"].append(velocities)
             history["neighbors"].append(neighbors)
+            history["goal_positions"].append(self.goal_positions[self.current_goal].copy())
             if return_accel:
                 history["accelerations"].append(output[3])
             self.update_goal(positions)
@@ -125,6 +152,7 @@ class Boids3D:
 
         history["positions"] = np.array(history["positions"])
         history["velocities"] = np.array(history["velocities"])
+        history["goal_positions"] = np.array(history["goal_positions"])
         if return_accel:
             history["accelerations"] = np.array(history["accelerations"])
 
@@ -227,7 +255,7 @@ class Boids3D:
         velocity = direction * self.max_speed
         velocities = np.tile(velocity, (n_boids, 1))
         neighbors = self.get_neighbors(positions)
-        return positions, velocities, neighbors
+        return positions, velocities, neighbors, center
 
     def get_fixed_init(self, n_boids):
         center = np.array([-3.0, -3.0, -3.0])
@@ -257,7 +285,6 @@ class Boids3D:
         self.figure.canvas.draw()
         self.figure.canvas.flush_events()
 
-
 class BoidsDataset3D(Dataset):
     def __init__(self, dataset):
         super().__init__()
@@ -270,57 +297,111 @@ class BoidsDataset3D(Dataset):
 def scale(x, length=1.0):
     return length * x / np.linalg.norm(x, axis=-1, keepdims=True)
 
-
 def history_to_samples_3d(history, accel=False):
-    """Standard MSE version: y is just the next state (6 features)."""
+    """Convert 3D trajectory history to graph samples.
+    y is [current_state (6D), next_state (6D)] if goal present, else just next_state (6D).
+    """
     inputs = np.concatenate((history["positions"], history["velocities"]), axis=-1)
     neighbors = history["neighbors"]
+    n_boids = inputs.shape[1]
     if accel and "accelerations" in history:
         targets = history["accelerations"]
         return [(x, a, y) for x, a, y in zip(inputs[:-1], neighbors[:-1], targets)]
     else:
-        targets = inputs[1:]
+        base_targets = np.concatenate([inputs[:-1], inputs[1:]], axis=-1)  # [T-1, n_boids, 12]
+        if "goal_positions" in history:
+            # goal_positions: [T, 3] -> broadcast to [T-1, n_boids, 3]
+            goal_pos = history["goal_positions"][:-1]  # [T-1, 3]
+            goal_broadcast = np.broadcast_to(goal_pos[:, None, :], (len(goal_pos), n_boids, 3)).copy()
+            targets = np.concatenate([base_targets, goal_broadcast], axis=-1)  # [T-1, n_boids, 15]
+        else:
+            targets = base_targets  # [T-1, n_boids, 12]
         return [(x, a, y_) for x, a, y_ in zip(inputs[:-1], neighbors[:-1], targets)]
 
 
-def history_to_samples_3d_weighted(history, accel=False):
-    """Custom weighted loss version: y is [current_state, next_state] (12 features)."""
-    inputs = np.concatenate((history["positions"], history["velocities"]), axis=-1)
-    neighbors = history["neighbors"]
-    if accel and "accelerations" in history:
-        targets = history["accelerations"]
-        return [(x, a, y) for x, a, y in zip(inputs[:-1], neighbors[:-1], targets)]
-    else:
-        targets = np.concatenate([
-            inputs[:-1],  # current state (t)
-            inputs[1:]    # next state (t+1)
-        ], axis=-1)
-        return [(x, a, y_) for x, a, y_ in zip(inputs[:-1], neighbors[:-1], targets)]
-
-
-def make_dataset_3d(unique_reps, repeat_reps, save_config, trajectory_len=None, random_init=False, return_boids=False, accel=False, custom_loss=False, **kwargs):
+def make_dataset_3d(unique_reps, repeat_reps, save_config, trajectory_len=None, random_init=True, return_boids=False, accel=False, **kwargs):
     kwargs.pop("n_jobs", 1)
     kwargs.pop("init", None)
+    boids_cache_npz = kwargs.pop("boids_cache_npz", None)
+    timestep_stride = kwargs.pop("timestep_stride", 1)
 
     boids = Boids3D(**kwargs)
     all_graphs = []
-    sample_fn = history_to_samples_3d_weighted if custom_loss else history_to_samples_3d
 
-    print(f">>> Generating {unique_reps} unique 3D trajectories with {repeat_reps} repeats each, random_init={random_init}, custom_loss={custom_loss}...")
+    # Fast path: load precomputed graph tuples from HDF5 cache
+    if boids_cache_npz is not None:
+        
+        print(f">>> Loading precomputed 3D training data from '{boids_cache_npz}'...")
+        with h5py.File(boids_cache_npz, 'r') as f:
+            centers       = f['centers'][:]
+            cache_unique  = int(f.attrs['unique_reps'])
+            cache_repeats = int(f.attrs['repeats'])
+            n_boids_cache = int(f.attrs['n_boids'])
+
+            n_train = min(unique_reps, cache_unique)
+            train_indices  = np.random.choice(cache_unique, size=n_train, replace=False)
+            unseen_indices = np.array([i for i in range(cache_unique) if i not in set(train_indices)])
+
+            boids.rand_configs   = [np.array(centers[i], dtype=np.float32) for i in train_indices]
+            boids.unseen_configs = [np.array(centers[i], dtype=np.float32) for i in unseen_indices]
+            print(f"✅ Loaded cache: {n_train} training centers, {len(unseen_indices)} unseen centers, timestep_stride={timestep_stride}")
+
+            n_reps = min(repeat_reps, cache_repeats)
+            total_samples    = f['x'].shape[0]
+            samples_per_traj = total_samples // (cache_unique * cache_repeats)
+
+            for traj_i in train_indices:
+                for rep_j in range(n_reps):
+                    flat_idx = traj_i * cache_repeats + rep_j
+                    start = flat_idx * samples_per_traj
+                    end   = min(start + samples_per_traj, total_samples)
+                    x_chunk    = f['x'][start:end:timestep_stride]
+                    y_chunk    = f['y'][start:end:timestep_stride]
+                    arow_chunk = f['a_row'][start:end:timestep_stride]
+                    acol_chunk = f['a_col'][start:end:timestep_stride]
+                    alen_chunk = f['a_len'][start:end:timestep_stride]
+                    for k in range(len(x_chunk)):
+                        length = int(alen_chunk[k])
+                        row  = arow_chunk[k, :length]
+                        col  = acol_chunk[k, :length]
+                        data = np.ones(length, dtype=np.float32)
+                        a = sp.coo_matrix((data, (row, col)), shape=(n_boids_cache, n_boids_cache))
+                        all_graphs.append(Graph(x=x_chunk[k], a=a, y=y_chunk[k]))
+
+        dataset = BoidsDataset3D(all_graphs)
+        return (dataset, boids) if return_boids else dataset
+
+    # Normal path: simulate trajectories
+    print(f">>> Generating {unique_reps} unique 3D trajectories with {repeat_reps} repeats each...")
+
+    use_init_list = isinstance(random_init, list) and len(random_init) == unique_reps
 
     for i in tqdm(range(unique_reps)):
-        print(f"\nGenerating trajectory {i+1}/{unique_reps}...")
+        # Sample one center per unique rep, reuse for all repeats
+        if use_init_list:
+            center = random_init[i]
+        elif random_init is True:
+            _, _, _, center = boids.get_random_init(boids.n_boids, save_config=save_config)
+        else:
+            center = None  # fixed init — handled inside generate_trajectory
+
         for j in range(repeat_reps):
-            history = boids.generate_trajectory(
-                random_init=random_init,
-                return_accel=accel,
-                save_config=(save_config and j == 0)
-            )
-            samples = sample_fn(history, accel=accel)
+            if center is not None:
+                history = boids.generate_trajectory(
+                    random_init=center,
+                    return_accel=accel,
+                    save_config=False,
+                )
+            else:
+                history = boids.generate_trajectory(
+                    random_init=random_init,
+                    return_accel=accel,
+                    save_config=(save_config and j == 0),
+                )
+            samples = history_to_samples_3d(history, accel=accel)
             for x, a, y in samples:
                 all_graphs.append(Graph(x=x, a=a, y=y))
-            del history
-            del samples
+            del history, samples
 
     dataset = BoidsDataset3D(all_graphs)
     return (dataset, boids) if return_boids else dataset

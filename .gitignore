@@ -1,18 +1,32 @@
+# Python cache
 __pycache__/
+.venv/
+*.pyc
+.pytest_cache/
 
-# Large generated files
-*.npz
-*.pkl
+# Large cache and dataset files
 *.h5
-*.keras
+boids_cache*.h5
 
-# Trained model directories
-gnca_model*/
+# Configuration files (keep only in local)
+config.txt
 
-# Result outputs
+# Experimental directories
+experimentation/
+
+# Generated and cached outputs
 results/
-history_*.pkl
-boids_tr_*.pkl
+saved_boids_tr/
+saved_datasets/
+saved_history/
+saved_models/
+saved_trajectory/
+
+# Generated model files
+*.pkl
+*.npz
+*.keras
+gnca_model*/
 
 # PDF outputs
 *.pdf

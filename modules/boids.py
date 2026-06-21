@@ -6,6 +6,7 @@ from spektral import utils
 from spektral.data import Dataset, Graph
 from tqdm import tqdm
 import tensorflow as tf
+import h5py
 
 class Boids:
     def __init__(
@@ -24,7 +25,7 @@ class Boids:
         limits=True,  # If True, enforce speed and turn limits
         show=False,
         pos_noise=0.004,  # Max magnitude of bounded uniform noise added to positions at each step
-        vel_noise=0.001  # Max magnitude of bounded uniform noise added to velocities at each step
+        vel_noise=0.0005  # Max magnitude of bounded uniform noise added to velocities at each step
     ):
         self.min_speed = min_speed
         self.max_speed = max_speed
@@ -49,6 +50,8 @@ class Boids:
         self.loiter_timer = 0  # Timer to track how long boids have been loitering at the current goal
         self.goals_completed = 0  # Counter to track how many goals have been completed
         self.rand_configs = []  # Store random initial configurations for reproducibility
+        self.unseen_configs = []  # Centers from cache NOT used in training (for unseen viz testing)
+        self.init_scatter = 0.325  # Spread of boids around the initial center
 
         # Soft boundary inside which boids are pushed towards the center to avoid leaving the canvas
         self.boundary_margins = self.borders * boundary_size_pctg
@@ -103,10 +106,15 @@ class Boids:
         )
 
     def generate_trajectory(self, save_config, random_init, return_accel=False):
+        # Reset goal state for each new trajectory
+        self.current_goal = 0
+        self.goals_completed = 0
+        self.reached_goal = False
+
         if random_init is False:
             positions, velocities, neighbors = self.get_fixed_init(self.n_boids)
         elif random_init is True:
-            positions, velocities, neighbors = self.get_random_init(self.n_boids, save_config)
+            positions, velocities, neighbors, _ = self.get_random_init(self.n_boids, save_config)
         elif isinstance(random_init, np.ndarray) and random_init.shape == (2,):
             # Treat as a center for the flock
             center = random_init
@@ -218,22 +226,19 @@ class Boids:
         return self.get_alignment(neighbors, positions)
     
     def get_goal(self, neighbors, positions):
-        
         """
         Get the steering component to move towards a goal position.
         """
-        neighbor_mask = neighbors.toarray()
-        steering = np.zeros_like(positions)
-        for i in range(self.n_boids):
-            neighbor_indices = np.where(neighbor_mask[i] == 1)[0]
-            if len(neighbor_indices) == 0:
-                continue
-            # For each neighbor, compute distance to goal and direction vector
-            neighbor_positions = positions[neighbor_indices]
-            group_positions = np.vstack([neighbor_positions, positions[i]])
-            centroid = np.mean(group_positions, axis=0)
-            goal_vec = self.goal_positions[self.current_goal] - centroid  # (num_neighbors, 2)
-            steering[i] = goal_vec
+        neighbor_mask = neighbors.toarray().astype(float)  # (n, n)
+        n_neighbors = neighbor_mask.sum(axis=1)  # (n,)
+        has_neighbors = n_neighbors > 0
+
+        # Vectorized centroid: (sum of neighbor positions + self position) / (n_neighbors + 1)
+        neighbor_pos_sum = neighbor_mask @ positions  # (n, 2)
+        centroid = (neighbor_pos_sum + positions) / (n_neighbors[:, None] + 1)
+
+        goal_vec = self.goal_positions[self.current_goal] - centroid  # (n, 2)
+        steering = np.where(has_neighbors[:, None], goal_vec, 0.0)
         steering = self.clamp(steering)
         return steering
     
@@ -249,6 +254,7 @@ class Boids:
             self.reached_goal = True
 
         if self.reached_goal:
+            # print(f"[GOAL] Reached goal {self.current_goal} {self.goal_positions[self.current_goal]} at timestep {timestep}")
             self.current_goal = (self.current_goal + 1) % len(self.goal_positions)
             self.goals_completed += 1
             self.reached_goal = False
@@ -303,14 +309,18 @@ class Boids:
     def get_random_init(self, n_boids, save_config):
         """
         Spawns boids in a tight clump at a random location on the canvas.
+        save_config=True:  Save center to rand_configs (training data collection)
+        save_config=False: Generate fresh random center (testing/validation/robustness)
+        Returns: positions, velocities, neighbors, center
         """
         # 1. Pick a random 'center' for the flock (between [-5 and -2.5]^2)
         center = np.array([np.random.uniform(-5, -2.5), np.random.uniform(-5, -2.5)])
         if save_config:
             # print(f"Saving random initial configuration for reproducibility. Center of flock: {center}")
             self.rand_configs.append(center)
-        # print(f"Center of flock: {center}")
-        positions = center + 0.325 * np.random.rand(n_boids, 2)
+        # else:
+        #     print(f"[ROBUSTNESS TEST] Generating random center (NOT saved): {np.round(center, 4)}")
+        positions = center + self.init_scatter * np.random.rand(n_boids, 2)
         # Set all boids to have the same initial velocity
         # Example: all boids move right at max_speed
         direction = np.array([1.0, 0.0])  # unit vector to the right
@@ -318,14 +328,14 @@ class Boids:
         velocities = np.tile(velocity, (n_boids, 1))
         neighbors = self.get_neighbors(positions)
 
-        return positions, velocities, neighbors
+        return positions, velocities, neighbors, center
     
     def get_fixed_init(self, n_boids):
         """
         Set a fixed initial position of (-4, -4).
         :param n_boids: int, number of boids
         """
-        positions = np.full((n_boids, 2), -4.0) + 0.325 * np.random.rand(n_boids, 2)
+        positions = np.full((n_boids, 2), -4.0) + self.init_scatter * np.random.rand(n_boids, 2)
         # print(f"Using fixed initial configuration for trajectory generation.")
         # Set all boids to have the same initial velocity
         # Example: all boids move right at max_speed
@@ -408,35 +418,88 @@ def history_to_samples(history, accel=False):
 def make_dataset(unique_reps, repeat_reps, save_config, trajectory_len=None, random_init=True, return_boids=False, accel=False, **kwargs):
     n_jobs = kwargs.pop("n_jobs", 1)
     init_data = kwargs.pop("init", None)
+    boids_cache_npz = kwargs.pop("boids_cache_npz", None)
+    timestep_stride = kwargs.pop("timestep_stride", 1)
 
     boids = Boids(**kwargs)
     all_graphs = []
 
+    # Fast path: load precomputed graph tuples from cache
+    if boids_cache_npz is not None:
+        
+        print(f">>> Loading precomputed training data from '{boids_cache_npz}'...")
+        with h5py.File(boids_cache_npz, 'r') as f:
+            centers       = f['centers'][:]
+            cache_unique  = int(f.attrs['unique_reps'])
+            cache_repeats = int(f.attrs['repeats'])
+            n_boids_cache = int(f.attrs['n_boids'])
+            max_edges     = int(f.attrs['max_edges'])
+
+            # Subsample unique_reps centers for training; rest go to unseen_configs
+            n_train = min(unique_reps, cache_unique)
+            train_indices  = np.random.choice(cache_unique, size=n_train, replace=False)
+            unseen_indices = np.array([i for i in range(cache_unique) if i not in set(train_indices)])
+
+            boids.rand_configs   = [np.array(centers[i], dtype=np.float32) for i in train_indices]
+            boids.unseen_configs = [np.array(centers[i], dtype=np.float32) for i in unseen_indices]
+            print(f"✅ Loaded cache: {n_train} training centers, {len(unseen_indices)} unseen centers, timestep_stride={timestep_stride}")
+
+            n_reps = min(repeat_reps, cache_repeats)
+            total_samples    = f['x'].shape[0]
+            samples_per_traj = total_samples // (cache_unique * cache_repeats)
+
+            for traj_i in train_indices:
+                for rep_j in range(n_reps):
+                    flat_idx = traj_i * cache_repeats + rep_j
+                    start = flat_idx * samples_per_traj
+                    end   = min(start + samples_per_traj, total_samples)
+                    # Apply stride at read time — h5py supports step slicing, reads only needed rows
+                    x_chunk    = f['x'][start:end:timestep_stride]
+                    y_chunk    = f['y'][start:end:timestep_stride]
+                    arow_chunk = f['a_row'][start:end:timestep_stride]
+                    acol_chunk = f['a_col'][start:end:timestep_stride]
+                    alen_chunk = f['a_len'][start:end:timestep_stride]
+                    for k in range(len(x_chunk)):
+                        length = int(alen_chunk[k])
+                        row  = arow_chunk[k, :length]
+                        col  = acol_chunk[k, :length]
+                        data = np.ones(length, dtype=np.float32)
+                        a = sp.coo_matrix((data, (row, col)), shape=(n_boids_cache, n_boids_cache))
+                        all_graphs.append(Graph(x=x_chunk[k], a=a, y=y_chunk[k]))
+
+        dataset = BoidsDataset(all_graphs)
+        return (dataset, boids) if return_boids else dataset
+
+    # Normal path: simulate trajectories
     print(f">>> Generating {unique_reps} unique trajectories with {repeat_reps} repeats each...")
-    
-    # Support for passing a list of (positions, velocities) as random_init for reproducible validation
+
     use_init_list = isinstance(random_init, list) and len(random_init) == unique_reps
+
     for i in tqdm(range(unique_reps)):
+        # Sample one center per unique rep, reuse for all repeats
+        if use_init_list:
+            center = random_init[i]
+        elif random_init is True:
+            _, _, _, center = boids.get_random_init(boids.n_boids, save_config=(save_config))
+        else:
+            center = None  # fixed init or other — handled inside generate_trajectory
+
         for j in range(repeat_reps):
-            if use_init_list:
-                # Use the i-th (positions, velocities) tuple for this unique rep
-                init_tuple = random_init[i]
+            if center is not None:
                 history = boids.generate_trajectory(
-                    random_init=init_tuple,
+                    random_init=center,
                     return_accel=accel,
-                    save_config=(save_config and j == 0)
+                    save_config=False,
                 )
             else:
                 history = boids.generate_trajectory(
                     random_init=random_init,
                     return_accel=accel,
-                    save_config=(save_config and j == 0)
+                    save_config=(save_config and j == 0),
                 )
             samples = history_to_samples(history, accel=accel)
             for x, a, y in samples:
                 all_graphs.append(Graph(x=x, a=a, y=y))
-            del history
-            del samples
 
     dataset = BoidsDataset(all_graphs)
     return (dataset, boids) if return_boids else dataset

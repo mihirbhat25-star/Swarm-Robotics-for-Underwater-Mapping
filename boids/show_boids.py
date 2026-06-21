@@ -20,8 +20,9 @@ boids = Boids(
     show=False,
 )
 
-init_config = boids.get_random_init(boids.n_boids)
-history = boids.generate_trajectory(init_config)
+init_config = boids.get_random_init(boids.n_boids, save_config=False)
+# get_random_init returns (pos, vel, neighbors, center); pass center to random_init
+history = boids.generate_trajectory(save_config=False, random_init=init_config[3])
 positions = history["positions"]
 
 fig, ax = plt.subplots(figsize=(6, 6))
