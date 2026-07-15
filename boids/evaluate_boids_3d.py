@@ -124,7 +124,8 @@ def _compute_test_trajs_3d(boids, n_boids, test_centers, run_gnca_traj, selected
 def evaluate_3d(model, max_trajectory_len, n_boids, saved_boids,
                 run_tag="", viz_mode='tubular', test_centers=None,
                 max_viz_runs=50, traj_cache_path="viz_trajectories_3d.npz",
-                n_show=50, specific_runs=None, output_dir="."):
+                n_show=50, specific_runs=None, output_dir=".",
+                skip_trained_viz=False):
     """
     Evaluate 3D GNCA trajectories and produce visualization PDFs.
     test_centers: if provided, use these for the test-set visualization instead of fresh random centers.
@@ -139,28 +140,35 @@ def evaluate_3d(model, max_trajectory_len, n_boids, saved_boids,
 
     run_gnca_traj = _make_gnca_runner_3d(model, boids, n_boids, max_trajectory_len)
     model_tag = _model_hash_3d(model)
-    trajs, selected_centers = _load_or_compute_trained_trajs_3d(
-        boids, n_boids, run_gnca_traj, traj_cache_path, model_tag)
+
+    if not skip_trained_viz:
+        trajs, selected_centers = _load_or_compute_trained_trajs_3d(
+            boids, n_boids, run_gnca_traj, traj_cache_path, model_tag)
+    else:
+        trajs, selected_centers = [], None
+
     np.random.seed(None)
 
     tag = f"_{run_tag}" if run_tag else ""
 
+    trajs_test = _compute_test_trajs_3d(boids, n_boids, test_centers, run_gnca_traj, selected_centers)
+
     if viz_mode == 'tubular':
-        _save_tubular_triplet_3d(trajs, goals, n_boids, tag, 'trained', output_dir)
-        trajs_test = _compute_test_trajs_3d(boids, n_boids, test_centers, run_gnca_traj, selected_centers)
-        _save_tubular_triplet_3d(trajs_test, goals, n_boids, tag, 'random', output_dir)
+        if trajs:
+            _save_tubular_triplet_3d(trajs, goals, n_boids, tag, 'trained', output_dir)
+        _save_tubular_triplet_3d(trajs_test, goals, n_boids, tag, 'test', output_dir)
 
     elif viz_mode == 'per_boid':
-        _plot_per_boid_3d(trajs, goals, n_boids, 
+        _plot_per_boid_3d(trajs_test, goals, n_boids,
                          filename=os.path.join(output_dir, f"boids_per_boid{tag}.pdf"))
 
     elif viz_mode == 'multi_tubular':
-        _plot_multi_tubular_3d(trajs, goals, n_boids, n_show=n_show,
+        _plot_multi_tubular_3d(trajs_test, goals, n_boids, n_show=n_show,
                               filename=os.path.join(output_dir, f"boids_multi_tube{tag}.pdf"),
-                              specific_runs=specific_runs if specific_runs else list(range(min(n_show, len(trajs)))))
+                              specific_runs=specific_runs if specific_runs else list(range(min(n_show, len(trajs_test)))))
 
     elif viz_mode == 'individual':
-        _plot_individual_ranked_3d(trajs, goals, n_boids, selected_centers, run_tag, output_dir)
+        _plot_individual_ranked_3d(trajs_test, goals, n_boids, test_centers, run_tag, output_dir)
 
     else:
         raise ValueError(f"Unknown viz_mode '{viz_mode}'. Choose 'tubular', 'per_boid', 'multi_tubular', or 'individual'.")

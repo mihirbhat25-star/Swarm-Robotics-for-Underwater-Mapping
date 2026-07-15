@@ -2,6 +2,7 @@
 Trains the GNCA to imitate the Boids algorithm.
 """
 import argparse
+import gc
 import os
 import joblib
 import matplotlib.pyplot as plt
@@ -13,9 +14,10 @@ from tensorflow.keras.optimizers import Adam
 from boids.evaluate_boids import evaluate
 from boids.forward import forward
 from models.gnn_ca_simple_boids import GNNCASimpleBoids
-from modules.boids import make_dataset
+from modules.boids import make_dataset, Boids, load_chunk_from_cache
 from modules.callbacks import ComplexityCallback
 import h5py
+import psutil
 
 # tf.config.run_functions_eagerly(True)
 physical_devices = tf.config.list_physical_devices("GPU")
@@ -132,6 +134,185 @@ class BestAfterEpochCallback(tf.keras.callbacks.Callback):
                 self.model.save_weights(self.save_path)
                 print(f"\n💾 New best val_loss after epoch 50: {val_loss:.6f} at epoch {self.best_epoch}")
 
+class _BestInfo:
+    """Minimal checkpoint-info object compatible with the post-training restore block."""
+    def __init__(self, best_epoch, best_val_loss):
+        self.best_epoch    = best_epoch
+        self.best_val_loss = best_val_loss
+
+
+class _HistoryProxy:
+    """Wraps a plain dict so it has the same .history attribute as a Keras History."""
+    def __init__(self, history_dict):
+        self.history = history_dict
+
+
+def _build_model(lr):
+    """Construct and compile a fresh GNNCASimpleBoids. Called once per chunk."""
+    m = GNNCASimpleBoids(
+        activation="linear",
+        batch_norm=False,
+        hidden=256,
+        hidden_activation="relu",
+        connectivity="cat",
+        aggregate="mean",
+    )
+    m.compile(optimizer=Adam(learning_rate=lr), loss=custom_weighted_mse, run_eagerly=True)
+    return m
+
+
+def run_chunked(boids_cache_path, flat_traj_indices, boundaries, cache_info, data_va, run_tag):
+    """Sequential chunk fine-tuning with val_loss early stopping per chunk.
+
+    For each chunk:
+      1. tf.keras.backend.clear_session() — frees ALL TF memory from previous chunk.
+      2. Rebuild model fresh and restore weights from previous chunk (numpy arrays).
+      3. Load chunk data from HDF5.
+      4. Train with val_loss EarlyStopping until this chunk converges.
+      5. Save best weights as numpy arrays; track current LR.
+      6. Free all Python/TF objects. Repeat.
+
+    clear_session() between chunks prevents the cumulative TF eager-kernel and
+    optimizer-state memory growth that causes OOM on long chunk sequences.
+    """
+    chunk_size     = args.chunk_size
+    chunk_patience = args.chunk_patience
+    n_boids_c      = cache_info['n_boids']
+    stride           = cache_info['timestep_stride']
+    near_goal_radius = cache_info.get('near_goal_radius', 1.0)
+    cache_repeats    = cache_info.get('cache_repeats', 1)
+    centers          = cache_info.get('centers', None)  # (cache_unique, 2) center coords
+
+    os.makedirs("saved_models", exist_ok=True)
+
+    # ── Build quadrant-balanced chunks ───────────────────────────────────
+    from boids.generate_boids_cache import QUADRANTS
+
+    def _center_quadrant(flat_idx):
+        """Return quadrant index (0-3) for a flat trajectory index."""
+        if centers is None:
+            return 0
+        ci = int(flat_idx) // cache_repeats
+        cx, cy = centers[ci]
+        for q, (xmn, xmx, ymn, ymx, _) in enumerate(QUADRANTS):
+            if xmn <= cx <= xmx and ymn <= cy <= ymx:
+                return q
+        return 0
+
+    # Group all flat indices by quadrant, then shuffle each bucket
+    q_buckets = [[] for _ in range(4)]
+    for fi in flat_traj_indices:
+        q_buckets[_center_quadrant(fi)].append(fi)
+    for q in range(4):
+        np.random.shuffle(q_buckets[q])
+
+    # Find non-empty quadrants and interleave from them only
+    active_quads = [q for q in range(4) if len(q_buckets[q]) > 0]
+    n_per_q   = chunk_size // len(active_quads) if active_quads else chunk_size
+    remainder = chunk_size % len(active_quads) if active_quads else 0
+    q_ptrs = [0, 0, 0, 0]
+    balanced_chunks = []
+    while any(q_ptrs[q] < len(q_buckets[q]) for q in active_quads):
+        chunk = []
+        for i, q in enumerate(active_quads):
+            take = n_per_q + (1 if i < remainder else 0)
+            end  = min(q_ptrs[q] + take, len(q_buckets[q]))
+            chunk.extend(q_buckets[q][q_ptrs[q]:end])
+            q_ptrs[q] = end
+        if chunk:
+            balanced_chunks.append(np.array(chunk, dtype=np.int64))
+    n_chunks = len(balanced_chunks)
+
+    # Weight state carried across chunks as plain numpy lists (survive clear_session).
+    saved_weights_np = None   # None → chunk 1 starts from random init
+    saved_lr         = args.lr
+    last_chunk_losses = []
+    total_trajs = sum(len(c) for c in balanced_chunks)
+
+    print(f"\n>>> Chunked training: {total_trajs} trajectories, "
+          f"chunk_size={chunk_size} ({n_chunks} balanced chunks), "
+          f"chunk_patience={chunk_patience} (val_loss early stopping per chunk)")
+
+    for chunk_num, chunk_idxs in enumerate(balanced_chunks, start=1):
+        # ── Per-chunk quadrant breakdown (debug) ─────────────────────────
+        q_counts = [0, 0, 0, 0]
+        for fi in chunk_idxs:
+            q_counts[_center_quadrant(fi)] += 1
+        q_summary = "  ".join(
+            f"{QUADRANTS[q][4]}:{q_counts[q]}" for q in range(4)
+        )
+        print(f"\n--- Chunk {chunk_num}/{n_chunks}  [{q_summary}] ---")
+
+        # ── 1. Clear ALL TF state from previous chunk ────────────────────
+        tf.keras.backend.clear_session()
+        gc.collect()
+
+        # ── 2. Rebuild model; restore previous chunk's weights ───────────
+        model = _build_model(saved_lr)
+        chunk_data = load_chunk_from_cache(
+            boids_cache_path, chunk_idxs, boundaries, n_boids_c, stride, near_goal_radius
+        )
+        loader_tr = DisjointLoader(chunk_data, node_level=True, batch_size=args.batch_size)
+        loader_va = DisjointLoader(data_va,    node_level=True, batch_size=args.batch_size)
+
+        if saved_weights_np is not None:
+            # Build the model with 1 step, then overwrite with saved weights.
+            model.fit(loader_tr.load(), steps_per_epoch=1, epochs=1, verbose=0)
+            model.set_weights(saved_weights_np)
+            # Recreate loaders — generators were exhausted by the build step.
+            loader_tr = DisjointLoader(chunk_data, node_level=True, batch_size=args.batch_size)
+            loader_va = DisjointLoader(data_va,    node_level=True, batch_size=args.batch_size)
+
+        # ── 3 & 4. Train until val_loss plateaus ─────────────────────────
+        h = model.fit(
+            loader_tr.load(),
+            steps_per_epoch=loader_tr.steps_per_epoch,
+            epochs=10_000,
+            validation_data=loader_va.load(),
+            validation_steps=loader_va.steps_per_epoch,
+            callbacks=[
+                EarlyStopping(
+                    monitor='val_loss',
+                    patience=chunk_patience,
+                    restore_best_weights=True,
+                    verbose=1,
+                ),
+                ReduceLROnPlateau(patience=args.lr_patience, min_delta=1e-8, verbose=1),
+            ],
+        )
+        last_chunk_losses = h.history.get('loss', [])
+
+        # ── 5. Persist weights & LR as numpy (survive clear_session) ─────
+        saved_weights_np = model.get_weights()
+        saved_lr = float(tf.keras.backend.get_value(model.optimizer.learning_rate))
+
+        # ── 6. Destroy all TF/Python objects ─────────────────────────────
+        del chunk_data, loader_tr, loader_va, h, model
+        gc.collect()
+
+        try:
+            rss_mb = psutil.Process().memory_info().rss / 1e6
+            print(f"  [chunk {chunk_num}/{n_chunks}] RAM after cleanup: {rss_mb:.0f} MB")
+        except ImportError:
+            print(f"  [chunk {chunk_num}/{n_chunks}] cleanup done (install psutil for RAM stats)")
+
+    # ── Reconstruct final model from saved weights for return ────────────
+    tf.keras.backend.clear_session()
+    gc.collect()
+    final_model = _build_model(saved_lr)
+    checkpoint_path = f"saved_models/best_weights_{run_tag}"
+    # Build via one val batch then set weights
+    loader_va_build = DisjointLoader(data_va, node_level=True, batch_size=args.batch_size)
+    final_model.fit(loader_va_build.load(), steps_per_epoch=1, epochs=1, verbose=0)
+    del loader_va_build
+    final_model.set_weights(saved_weights_np)
+    final_model.save_weights(checkpoint_path)   # persist to disk for post-training restore
+
+    print(f"\n✅ Chunked training done ({n_chunks} chunks). "
+          f"Final model = last chunk's best weights.")
+    return _HistoryProxy({'loss': last_chunk_losses}), final_model, _BestInfo(n_chunks, float('nan'))
+
+
 def run(data_tr, data_va, run_tag):
 
     model = GNNCASimpleBoids(
@@ -149,7 +330,7 @@ def run(data_tr, data_va, run_tag):
     loader_va = DisjointLoader(data_va, node_level=True, batch_size=args.batch_size)
 
     checkpoint_path = f"saved_models/best_weights_{run_tag}"
-    best_after50_cb = BestAfterEpochCallback(save_path=checkpoint_path, min_epoch=50)
+    best_after50_cb = BestAfterEpochCallback(save_path=checkpoint_path, min_epoch=args.best_after_epoch)
 
     history = model.fit(
         loader_tr.load(),
@@ -186,6 +367,10 @@ parser.add_argument(
 )
 parser.add_argument(
     "--lr_patience", default=10, type=int, help="Patience for LR annealing"
+)
+parser.add_argument(
+    "--best_after_epoch", default=50, type=int,
+    help="Save best val_loss checkpoint only after this epoch (default: 50)."
 )
 parser.add_argument(
     "--lr_red_factor", default=0.1, type=float, help="Rate for LR annealing"
@@ -237,7 +422,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--noise_tag",
-    default="nw2",
+    default="",
     type=str,
     help="String suffix to append in run_tag for noise setting (e.g. 'nw2'). Use empty string for no-noise tags.",
 )
@@ -260,6 +445,15 @@ parser.add_argument(
     help="Load every Nth timestep from cache (default 1 = all). Increase to reduce RAM usage (e.g. 10 = 10x fewer samples).",
 )
 parser.add_argument(
+    "--near_goal_radius",
+    default=1.0,
+    type=float,
+    help="When timestep_stride>1, always include timesteps where the flock mean position "
+         "is within this distance of the current goal (default: 1.0). "
+         "Prevents goal-transition frames from being skipped by the stride. "
+         "Set to 0 to disable.",
+)
+parser.add_argument(
     "--viz_n_centers",
     default=50,
     type=int,
@@ -268,8 +462,20 @@ parser.add_argument(
 parser.add_argument(
     "--viz_centers_source",
     default="trained",
-    choices=["trained", "unseen_cache", "random"],
-    help="Source of centers for the test visualization: 'trained' (from training set), 'unseen_cache' (cache centers not used in training), 'random' (fresh random, default).",
+    choices=["trained", "unseen_cache", "random", "fresh_quadrant"],
+    help="Source of centers for the test visualization: "
+         "'trained' = from training set; "
+         "'unseen_cache' = cache centers not used in training; "
+         "'random' = fresh random; "
+         "'fresh_quadrant' = newly sampled centers per quadrant, confirmed not in training set.",
+)
+parser.add_argument(
+    "--selected_quadrants",
+    type=int,
+    nargs="+",
+    default=None,
+    help="Which quadrants to restrict fresh_quadrant sampling to (0=Q1, 1=Q2, 2=Q3, 3=Q4). "
+         "Default: all 4. E.g. '--selected_quadrants 2 3' for Q3 and Q4 only.",
 )
 parser.add_argument(
     "--viz_mode",
@@ -289,6 +495,43 @@ parser.add_argument(
     nargs="+",
     default=None,
     help="Specific run indices to plot in multi_tubular mode (e.g., 0 5 10 15).",
+)
+parser.add_argument(
+    "--viz_trained",
+    action="store_true",
+    default=False,
+    help="Also run GNCA inference on training centers and include them in visualization. "
+         "Off by default — only test centers are visualized.",
+)
+parser.add_argument(
+    "--chunk_size",
+    default=0,
+    type=int,
+    help="Trajectories per training chunk (0 = disabled, load all at once). "
+         "Enable to train on large HDF5 caches without loading them fully into RAM.",
+)
+parser.add_argument(
+    "--chunk_patience",
+    default=3,
+    type=int,
+    help="Per-chunk early-stopping patience (default: 3). Training on each chunk "
+         "stops when the chunk's training loss doesn't improve for this many epochs.",
+)
+parser.add_argument(
+    "--train_quadrants",
+    type=int,
+    nargs="+",
+    default=None,
+    help="Which quadrants to use for training (0=Q1, 1=Q2, 2=Q3, 3=Q4). "
+         "Default: all 4. E.g. '--train_quadrants 2 3' for Q3 and Q4 only. "
+         "Only applicable when loading from --boids_cache.",
+)
+parser.add_argument(
+    "--exclusion_size",
+    type=float,
+    default=0.2,
+    help="Buffer radius around the goal triangle for excluding test center sampling. "
+         "Should match the exclusion size used when generating the cache (default: 0.2).",
 )
 
 ####################################################################################
@@ -317,30 +560,9 @@ run_tag = build_run_tag(
 )
 print_run_parameters(args, UPWEIGHT, noise_config, effective_unique_reps, run_tag)
 
-print(f"\n>>> Generating dataset (n_jobs=1)...")
-# If a precomputed cache is provided, load from it; otherwise simulate
-boids_cache = args.boids_cache if args.boids_cache else None
-if boids_cache:
-    with h5py.File(boids_cache, 'r') as _f:
-        cache_total_unique = int(_f.attrs["unique_reps"])
-    print(f">>> Using precomputed cache: {boids_cache} ({cache_total_unique} total unique centers, training on {effective_unique_reps})")
-
-data_tr, boids_tr = make_dataset(
-    unique_reps=effective_unique_reps,
-    repeat_reps=args.tr_set_repeats,
-    save_config=train_init_centers is None and not boids_cache,
-    n_boids=args.n_boids,
-    n_jobs=args.n_jobs,
-    return_boids=True,
-    random_init=train_init_centers if train_init_centers is not None else True,
-    boids_cache_npz=boids_cache,
-    timestep_stride=args.timestep_stride,
-)
-
-if train_init_centers is not None: # What is this for? Preserving the initial centers for evaluation. What does the else go to? It 
-    # Preserve reused center list for downstream evaluate(use_saved_config=True)
-    boids_tr.rand_configs = [np.array(c, dtype=np.float32) for c in train_init_centers]
-# else: boids_tr.rand_configs already populated during make_dataset with save_config=True
+print(f"\n>>> Generating dataset...")
+boids_cache  = args.boids_cache if args.boids_cache else None
+use_chunked  = args.chunk_size > 0 and boids_cache is not None
 
 data_va = make_dataset(
     unique_reps=args.va_set_size,
@@ -351,7 +573,101 @@ data_va = make_dataset(
     random_init=True,
 )
 
-history, model, best_after50_cb = run(data_tr, data_va, run_tag)
+if use_chunked:
+    # ------------------------------------------------------------------ #
+    # Chunked path: extract metadata without loading all graphs into RAM. #
+    # ------------------------------------------------------------------ #
+    boids_tr = Boids(n_boids=args.n_boids)
+    with h5py.File(boids_cache, 'r') as _f:
+        _centers       = _f['centers'][:]
+        _cache_unique  = int(_f.attrs['unique_reps'])
+        _cache_repeats = int(_f.attrs['repeats'])
+        _n_boids_cache = int(_f.attrs['n_boids'])
+        _traj_lengths  = _f['traj_lengths'][:] if 'traj_lengths' in _f else None
+
+    _n_train     = min(effective_unique_reps, _cache_unique)
+    
+    # Filter to selected quadrants first if specified, then select from filtered set
+    if args.train_quadrants is not None:
+        from boids.generate_boids_cache import QUADRANTS
+        # Group all centers by quadrant
+        _idxs_by_quad = {q: [] for q in args.train_quadrants}
+        for ti in range(_cache_unique):
+            cx, cy = _centers[ti]
+            for q in args.train_quadrants:
+                xmn, xmx, ymn, ymx, _ = QUADRANTS[q]
+                if xmn <= cx <= xmx and ymn <= cy <= ymx:
+                    _idxs_by_quad[q].append(ti)
+                    break
+        # Balance selection across quadrants
+        n_per_q = _n_train // len(args.train_quadrants)
+        remainder = _n_train % len(args.train_quadrants)
+        _train_idxs_list = []
+        for i, q in enumerate(args.train_quadrants):
+            take = n_per_q + (1 if i < remainder else 0)
+            take = min(take, len(_idxs_by_quad[q]))
+            _train_idxs_list.extend(np.random.choice(_idxs_by_quad[q], size=take, replace=False))
+        _train_idxs = np.array(_train_idxs_list, dtype=np.int64)
+        _n_train = len(_train_idxs)
+        print(f">>> Filtered to quadrants {args.train_quadrants}: {_n_train} unique centers selected")
+    else:
+        _train_idxs = np.random.choice(_cache_unique, size=_n_train, replace=False)
+    _unseen_idxs = np.array([i for i in range(_cache_unique) if i not in set(_train_idxs)])
+    boids_tr.rand_configs   = [np.array(_centers[i], dtype=np.float32) for i in _train_idxs]
+    boids_tr.unseen_configs = [np.array(_centers[i], dtype=np.float32) for i in _unseen_idxs]
+
+    _n_reps = min(args.tr_set_repeats, _cache_repeats)
+    _flat_traj_idxs = np.array([ti * _cache_repeats + rj
+                                 for ti in _train_idxs
+                                 for rj in range(_n_reps)], dtype=np.int64)
+
+    if _traj_lengths is not None:
+        _boundaries = np.concatenate([[0], np.cumsum(_traj_lengths)])
+    else:
+        _total_samples    = int(h5py.File(boids_cache, 'r')['x'].shape[0])
+        _samples_per_traj = _total_samples // (_cache_unique * _cache_repeats)
+        _boundaries       = np.arange(_cache_unique * _cache_repeats + 1) * _samples_per_traj
+
+    _cache_info = {'n_boids': _n_boids_cache, 'timestep_stride': args.timestep_stride,
+                   'near_goal_radius': args.near_goal_radius,
+                   'cache_repeats': _cache_repeats,
+                   'centers': _centers}
+    print(f">>> Chunked training: cache={boids_cache}, "
+          f"{_n_train} unique × {_n_reps} reps = {len(_flat_traj_idxs)} trajectories, "
+          f"chunk_size={args.chunk_size}, chunk_patience={args.chunk_patience}")
+
+    history, model, best_after50_cb = run_chunked(
+        boids_cache, _flat_traj_idxs, _boundaries, _cache_info, data_va, run_tag
+    )
+
+else:
+    # ------------------------------------------------------------------ #
+    # Standard path: load all training graphs into RAM, then train.      #
+    # ------------------------------------------------------------------ #
+    if boids_cache:
+        with h5py.File(boids_cache, 'r') as _f:
+            cache_total_unique = int(_f.attrs["unique_reps"])
+        print(f">>> Using precomputed cache: {boids_cache} "
+              f"({cache_total_unique} total unique centers, training on {effective_unique_reps})")
+
+    data_tr, boids_tr = make_dataset(
+        unique_reps=effective_unique_reps,
+        repeat_reps=args.tr_set_repeats,
+        save_config=train_init_centers is None and not boids_cache,
+        n_boids=args.n_boids,
+        n_jobs=args.n_jobs,
+        return_boids=True,
+        random_init=train_init_centers if train_init_centers is not None else True,
+        boids_cache_npz=boids_cache,
+        timestep_stride=args.timestep_stride,
+        near_goal_radius=args.near_goal_radius,
+    )
+
+    if train_init_centers is not None:
+        # Preserve reused center list for downstream evaluate()
+        boids_tr.rand_configs = [np.array(c, dtype=np.float32) for c in train_init_centers]
+
+    history, model, best_after50_cb = run(data_tr, data_va, run_tag)
 
 print(f"\n>>> Saving model and history with run_tag='{run_tag}'...")
 os.makedirs("saved_models", exist_ok=True)
@@ -361,13 +677,13 @@ model.save(f"saved_models/gnca_model_{run_tag}", save_format="tf")
 joblib.dump(history.history, f"saved_history/history_{run_tag}.pkl")
 joblib.dump(boids_tr, f"saved_boids_tr/boids_tr_{run_tag}.pkl")
 
-# Restore best post-epoch-50 weights onto the existing model object
+# Restore best weights onto the existing model object
 checkpoint_path = f"saved_models/best_weights_{run_tag}"
 if best_after50_cb.best_epoch is not None:
-    print(f"\n✅ Restoring best post-epoch-50 weights (epoch {best_after50_cb.best_epoch}, val_loss={best_after50_cb.best_val_loss:.6f})...")
+    print(f"\n✅ Restoring best weights (epoch {best_after50_cb.best_epoch}, val_loss={best_after50_cb.best_val_loss:.6f})...")
     model.load_weights(checkpoint_path)
 else:
-    print(f"\n⚠️ No post-epoch-50 checkpoint found (training ended before epoch 50). Using early-stopped model.")
+    print(f"\n⚠️ No best-weights checkpoint found. Using early-stopped model.")
 
 ####################################################################################
 # Evaluation
@@ -382,10 +698,34 @@ if args.viz_centers_source == "trained":
     print(f">>> Viz test centers: {len(test_centers) if test_centers else 0} trained centers")
 elif args.viz_centers_source == "unseen_cache":
     if not boids_tr.unseen_configs:
-        print("⚠️ No unseen_cache centers available (requires --boids_cache with more unique centers than --tr_set_unique). Falling back to random.")
+        print("⚠️ No unseen_cache centers available. Falling back to random.")
         test_centers = None
     else:
         test_centers = boids_tr.unseen_configs[:args.viz_n_centers]
+elif args.viz_centers_source == "fresh_quadrant":
+    # Sample brand-new centers per quadrant — not from the cache at all.
+    # Verified not to match any training center (continuous space → exact collision ≈ 0).
+    from boids.generate_boids_cache import QUADRANTS, build_exclusion_zone
+    _excl       = build_exclusion_zone(boids_tr.goal_positions, args.exclusion_size)
+    _selected_q = args.selected_quadrants if args.selected_quadrants is not None else [0, 1, 2, 3]
+    _n_per_q    = max(1, args.viz_n_centers // len(_selected_q))
+    _train_set  = {tuple(np.round(c, 6)) for c in boids_tr.rand_configs}
+    _sampler    = Boids(n_boids=args.n_boids)
+    test_centers = []
+    for _q_idx in _selected_q:
+        _xmn, _xmx, _ymn, _ymx, _qlabel = QUADRANTS[_q_idx]
+        _q_centers = []
+        while len(_q_centers) < _n_per_q:
+            _, _, _, _c = _sampler.get_random_init(
+                args.n_boids, save_config=False,
+                bounds=(_xmn, _xmx, _ymn, _ymx),
+                exclusion_zone=_excl,
+            )
+            if tuple(np.round(_c, 6)) not in _train_set:
+                _q_centers.append(_c)
+        test_centers.extend(_q_centers)
+    print(f">>> Viz test centers: {len(test_centers)} fresh per-quadrant centers "
+          f"({_n_per_q} per quadrant, {len(_selected_q)} quadrants), none in training set")
 else:  # random
     test_centers = None
     print(f">>> Viz test centers: random (fresh)")
@@ -406,6 +746,7 @@ evaluate(
     specific_runs=args.viz_runs,
     output_dir=".",
     test_centers=test_centers,
+    viz_trained=args.viz_trained,
 )
 
 ####################################################################################

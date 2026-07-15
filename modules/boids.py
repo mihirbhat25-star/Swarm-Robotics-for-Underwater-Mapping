@@ -2,6 +2,7 @@ import numpy as np
 import scipy.sparse as sp
 from joblib import Parallel, delayed
 from matplotlib import pyplot as plt
+from shapely.geometry import Point
 from spektral import utils
 from spektral.data import Dataset, Graph
 from tqdm import tqdm
@@ -24,8 +25,8 @@ class Boids:
         wrap=False,  # If True, wrap around instead of avoiding boundary
         limits=True,  # If True, enforce speed and turn limits
         show=False,
-        pos_noise=0.004,  # Max magnitude of bounded uniform noise added to positions at each step
-        vel_noise=0.0005  # Max magnitude of bounded uniform noise added to velocities at each step
+        pos_noise=0.000,  # Max magnitude of bounded uniform noise added to positions at each step
+        vel_noise=0.0000  # Max magnitude of bounded uniform noise added to velocities at each step
     ):
         self.min_speed = min_speed
         self.max_speed = max_speed
@@ -249,8 +250,8 @@ class Boids:
         # Fetch current positions of boids and compute distance to goal
         goal_vec = self.goal_positions[self.current_goal] - positions  # (num_boids, 2)
         goal_dist = np.linalg.norm(goal_vec, axis=-1)  # (num_boids,)
-        # If minimum distance to goal is less than 0.25, start loitering timer
-        if np.mean(goal_dist) < 0.25 and not self.reached_goal:
+        # If minimum distance to goal is less than 0.5, start loitering timer
+        if np.mean(goal_dist) < 0.5 and not self.reached_goal:
             self.reached_goal = True
 
         if self.reached_goal:
@@ -306,20 +307,31 @@ class Boids:
 
         return force
 
-    def get_random_init(self, n_boids, save_config):
+    def get_random_init(self, n_boids, save_config, bounds=None, exclusion_zone=None,
+                        center=None, max_attempts=10000):
         """
         Spawns boids in a tight clump at a random location on the canvas.
         save_config=True:  Save center to rand_configs (training data collection)
         save_config=False: Generate fresh random center (testing/validation/robustness)
+        bounds:          optional (x_min, x_max, y_min, y_max) to constrain sampling region.
+        exclusion_zone:  optional Shapely polygon; sampled centers inside it are rejected.
+        center:          if provided, skip sampling and use this center directly.
         Returns: positions, velocities, neighbors, center
         """
-        # 1. Pick a random 'center' for the flock (between [-5 and -2.5]^2)
-        center = np.array([np.random.uniform(-5, -2.5), np.random.uniform(-5, -2.5)])
+        if center is None:
+            x_min, x_max, y_min, y_max = bounds if bounds is not None else (-5, -2.5, -5, -2.5)
+            for _ in range(max_attempts):
+                center = np.array([np.random.uniform(x_min, x_max),
+                                   np.random.uniform(y_min, y_max)])
+                if exclusion_zone is None or not exclusion_zone.contains(Point(center)):
+                    break
+            else:
+                raise RuntimeError(
+                    f"Could not sample a valid center after {max_attempts} attempts. "
+                    f"Decrease goal_exclusion_size."
+                )
         if save_config:
-            # print(f"Saving random initial configuration for reproducibility. Center of flock: {center}")
             self.rand_configs.append(center)
-        # else:
-        #     print(f"[ROBUSTNESS TEST] Generating random center (NOT saved): {np.round(center, 4)}")
         positions = center + self.init_scatter * np.random.rand(n_boids, 2)
         # Set all boids to have the same initial velocity
         # Example: all boids move right at max_speed
@@ -420,6 +432,7 @@ def make_dataset(unique_reps, repeat_reps, save_config, trajectory_len=None, ran
     init_data = kwargs.pop("init", None)
     boids_cache_npz = kwargs.pop("boids_cache_npz", None)
     timestep_stride = kwargs.pop("timestep_stride", 1)
+    near_goal_radius = kwargs.pop("near_goal_radius", 1.0)
 
     boids = Boids(**kwargs)
     all_graphs = []
@@ -445,20 +458,23 @@ def make_dataset(unique_reps, repeat_reps, save_config, trajectory_len=None, ran
             print(f"✅ Loaded cache: {n_train} training centers, {len(unseen_indices)} unseen centers, timestep_stride={timestep_stride}")
 
             n_reps = min(repeat_reps, cache_repeats)
-            total_samples    = f['x'].shape[0]
-            samples_per_traj = total_samples // (cache_unique * cache_repeats)
+
+            # Use exact per-trajectory lengths if available, else fall back to estimate
+            if 'traj_lengths' in f:
+                traj_lengths = f['traj_lengths'][:]
+                boundaries = np.concatenate([[0], np.cumsum(traj_lengths)])
+            else:
+                total_samples    = f['x'].shape[0]
+                samples_per_traj = total_samples // (cache_unique * cache_repeats)
+                boundaries = np.arange(cache_unique * cache_repeats + 1) * samples_per_traj
 
             for traj_i in train_indices:
                 for rep_j in range(n_reps):
                     flat_idx = traj_i * cache_repeats + rep_j
-                    start = flat_idx * samples_per_traj
-                    end   = min(start + samples_per_traj, total_samples)
-                    # Apply stride at read time — h5py supports step slicing, reads only needed rows
-                    x_chunk    = f['x'][start:end:timestep_stride]
-                    y_chunk    = f['y'][start:end:timestep_stride]
-                    arow_chunk = f['a_row'][start:end:timestep_stride]
-                    acol_chunk = f['a_col'][start:end:timestep_stride]
-                    alen_chunk = f['a_len'][start:end:timestep_stride]
+                    start = int(boundaries[flat_idx])
+                    end   = int(boundaries[flat_idx + 1])
+                    x_chunk, y_chunk, arow_chunk, acol_chunk, alen_chunk = \
+                        _load_adaptive_stride(f, start, end, timestep_stride, near_goal_radius)
                     for k in range(len(x_chunk)):
                         length = int(alen_chunk[k])
                         row  = arow_chunk[k, :length]
@@ -503,3 +519,90 @@ def make_dataset(unique_reps, repeat_reps, save_config, trajectory_len=None, ran
 
     dataset = BoidsDataset(all_graphs)
     return (dataset, boids) if return_boids else dataset
+
+
+def _load_adaptive_stride(f, start, end, timestep_stride, near_goal_radius):
+    """Load timesteps from an open HDF5 file with adaptive stride.
+
+    Normal timesteps are loaded every `timestep_stride` steps.
+    Timesteps where the flock's mean position is within `near_goal_radius`
+    of the current goal are always included (stride=1 in that window) so
+    goal-transition frames are never skipped.
+
+    Args:
+        f:                Open h5py File object.
+        start, end:       Absolute slice [start, end) into the dataset.
+        timestep_stride:  Stride for non-near-goal timesteps.
+        near_goal_radius: Distance threshold (in simulation units).
+                          0 or stride==1 → plain strided load, no detection.
+
+    Returns:
+        Tuple (x_c, y_c, arow_c, acol_c, alen_c) as numpy arrays.
+    """
+    if timestep_stride <= 1 or near_goal_radius <= 0:
+        return (
+            f['x'][start:end:timestep_stride],
+            f['y'][start:end:timestep_stride],
+            f['a_row'][start:end:timestep_stride],
+            f['a_col'][start:end:timestep_stride],
+            f['a_len'][start:end:timestep_stride],
+        )
+
+    # Load positions and current goal cheaply to detect near-goal timesteps.
+    # x: (T, n_boids, 4);  y[:, 0, 8:10] = current goal (same for all boids).
+    x_full  = f['x'][start:end]       # (T, n_boids, 4)
+    y_full  = f['y'][start:end]       # (T, n_boids, 10)
+
+    mean_pos = x_full[:, :, :2].mean(axis=1)   # (T, 2)
+    y_goal   = y_full[:, 0, 8:10]              # (T, 2)
+    dist     = np.linalg.norm(mean_pos - y_goal, axis=1)  # (T,)
+
+    T = end - start
+    strided = np.zeros(T, dtype=bool)
+    strided[::timestep_stride] = True
+    keep = np.where(strided | (dist < near_goal_radius))[0]   # local indices
+
+    abs_keep = keep + start   # absolute indices into the HDF5 dataset
+    return (
+        x_full[keep],
+        y_full[keep],
+        f['a_row'][abs_keep],
+        f['a_col'][abs_keep],
+        f['a_len'][abs_keep],
+    )
+
+
+def load_chunk_from_cache(cache_path, flat_indices, boundaries, n_boids_cache,
+                          timestep_stride=1, near_goal_radius=1.0):
+    """Load a subset of trajectories from an HDF5 cache into a BoidsDataset.
+
+    Args:
+        cache_path:      Path to the HDF5 cache file.
+        flat_indices:    1-D array of flat trajectory indices to load
+                         (flat_idx = center_i * cache_repeats + rep_j).
+        boundaries:      Cumulative sample-count boundary array of length
+                         (total_trajectories + 1), as returned by np.cumsum.
+        n_boids_cache:   Number of boids (for sparse-matrix shape).
+        timestep_stride: Load every Nth timestep (default 1 = all).
+
+    Returns:
+        BoidsDataset containing Graph objects for the requested trajectories.
+    """
+    graphs = []
+    with h5py.File(cache_path, 'r') as f:
+        for flat_idx in flat_indices:
+            start = int(boundaries[flat_idx])
+            end   = int(boundaries[flat_idx + 1])
+            x_c, y_c, arow_c, acol_c, alen_c = _load_adaptive_stride(
+                f, start, end, timestep_stride, near_goal_radius
+            )
+            for k in range(len(x_c)):
+                length = int(alen_c[k])
+                row  = arow_c[k, :length]
+                col  = acol_c[k, :length]
+                a = sp.coo_matrix(
+                    (np.ones(length, dtype=np.float32), (row, col)),
+                    shape=(n_boids_cache, n_boids_cache),
+                )
+                graphs.append(Graph(x=x_c[k], a=a, y=y_c[k]))
+    return BoidsDataset(graphs)

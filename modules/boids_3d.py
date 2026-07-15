@@ -8,13 +8,34 @@ from tqdm import tqdm
 import tensorflow as tf
 import h5py
 
+
+def _in_exclusion_zone_3d(center, exclusion_zone):
+    """Return True if center is within capsule exclusion zone."""
+    if exclusion_zone is None:
+        return False
+    goals, radius = exclusion_zone
+    for i in range(len(goals)):
+        a = goals[i]
+        b = goals[(i + 1) % len(goals)]
+        ab = b - a
+        ab_len_sq = np.dot(ab, ab)
+        if ab_len_sq < 1e-10:
+            if np.linalg.norm(center - a) < radius:
+                return True
+            continue
+        t = np.clip(np.dot(center - a, ab) / ab_len_sq, 0.0, 1.0)
+        closest = a + t * ab
+        if np.linalg.norm(center - closest) < radius:
+            return True
+    return False
+
 class Boids3D:
     def __init__(
         self,
         min_speed=0.0001,
         max_speed=0.01,
         max_force=0.1,
-        max_turn=5,
+        max_turn=15,
         perception=0.1,
         crowding=0.02,
         n_boids=100,
@@ -24,8 +45,8 @@ class Boids3D:
         wrap=False,
         limits=True,
         show=False,
-        pos_noise=0.004,  # Max magnitude of bounded uniform noise added to positions at each step
-        vel_noise=0.0005  # Max magnitude of bounded uniform noise added to velocities at each step
+        pos_noise=0.000,  # Max magnitude of bounded uniform noise added to positions at each step
+        vel_noise=0.0000  # Max magnitude of bounded uniform noise added to velocities at each step
     ):
         self.min_speed = min_speed
         self.max_speed = max_speed
@@ -46,7 +67,7 @@ class Boids3D:
         # 3D canvas: [xmin, ymin, zmin, xmax, ymax, zmax]
         self.borders = canvas_scale * np.array([-5, -5, -5, 5, 5, 5])
         self.center = (self.borders[3:] + self.borders[:3]) / 2
-        self.goal_positions = np.array([[3.0, 3.0, 3.0]])  # One goal at far corner for full 3D diagonal trajectory
+        self.goal_positions = np.array([[-4, -4, -4], [4, 4, 4]])  # Two goals at opposite ends of the canvas diagonal
         self.current_goal = 0
         self.reached_goal = False
         self.loiter_timer = 0
@@ -59,20 +80,21 @@ class Boids3D:
 
         self.show = show
         self.figure = None
+        self.print_neighbors_warning = True
 
     def update_boids(self, positions, velocities, return_accel=False):
         accelerations = np.zeros_like(velocities)
 
         if self.wrap:
             positions = ((positions + 1) % 2) - 1
-        else:
-            accelerations += self.avoid_borders(positions)
+        # else:
+        #     accelerations += self.avoid_borders(positions)
 
         neighbors = self.get_neighbors(positions)
 
         SEPARATION_WEIGHT = 0.35
-        ALIGNMENT_WEIGHT = 0.70
-        COHESION_WEIGHT = 0.002
+        ALIGNMENT_WEIGHT = 0.35
+        COHESION_WEIGHT = 0.001
         GOAL_WEIGHT = 0.01
 
         accelerations += SEPARATION_WEIGHT * self.get_separation(neighbors, positions)
@@ -146,6 +168,7 @@ class Boids3D:
             history["goal_positions"].append(self.goal_positions[self.current_goal].copy())
             if return_accel:
                 history["accelerations"].append(output[3])
+            prev_goal = self.current_goal
             self.update_goal(positions)
             if self.check_termination():
                 break
@@ -198,24 +221,20 @@ class Boids3D:
         return self.get_alignment(neighbors, positions)
 
     def get_goal(self, neighbors, positions):
-        neighbor_mask = neighbors.toarray()
-        steering = np.zeros_like(positions)
-        for i in range(self.n_boids):
-            neighbor_indices = np.where(neighbor_mask[i] == 1)[0]
-            if len(neighbor_indices) == 0:
-                continue
-            neighbor_positions = positions[neighbor_indices]
-            group_positions = np.vstack([neighbor_positions, positions[i]])
-            centroid = np.mean(group_positions, axis=0)
-            goal_vec = self.goal_positions[self.current_goal] - centroid
-            steering[i] = goal_vec
+        neighbor_mask = neighbors.toarray().astype(float)  # (n, n)
+        n_neighbors = neighbor_mask.sum(axis=1)  # (n,)
+        has_neighbors = n_neighbors > 0
+        neighbor_pos_sum = neighbor_mask @ positions  # (n, 3)
+        centroid = (neighbor_pos_sum + positions) / (n_neighbors[:, None] + 1)
+        goal_vec = self.goal_positions[self.current_goal] - centroid  # (n, 3)
+        steering = np.where(has_neighbors[:, None], goal_vec, 0.0)
         steering = self.clamp(steering)
         return steering
 
     def update_goal(self, positions):
         goal_vec = self.goal_positions[self.current_goal] - positions
         goal_dist = np.linalg.norm(goal_vec, axis=-1)
-        if np.mean(goal_dist) < 0.25 and not self.reached_goal:
+        if np.mean(goal_dist) < 0.5 and not self.reached_goal:
             self.reached_goal = True
         if self.reached_goal:
             self.current_goal = (self.current_goal + 1) % len(self.goal_positions)
@@ -223,18 +242,34 @@ class Boids3D:
             self.reached_goal = False
 
     def check_termination(self):
-        return self.goals_completed == 1
+        return self.goals_completed == len(self.goal_positions)
 
     def enforce_limits(self, velocities_old, velocities_new):
-        """Enforce speed limits in 3D (no turn limit in 3D polar form)."""
+        """Enforce speed AND turn limits in 3D."""
         velocities = velocities_new.copy()
+
+        # ── Turn limit ───────────────────────────────────────────────────────
+        speed_old = np.linalg.norm(velocities_old, axis=-1, keepdims=True)
+        speed_new = np.linalg.norm(velocities, axis=-1, keepdims=True)
+        # Avoid division by zero
+        safe_old = np.where(speed_old > 1e-8, velocities_old / speed_old, np.array([1., 0., 0.]))
+        safe_new = np.where(speed_new > 1e-8, velocities / speed_new, safe_old)
+        cos_angle = np.clip((safe_old * safe_new).sum(axis=-1), -1.0, 1.0)
+        angle_rad = np.arccos(cos_angle)  # (n,)
+        max_turn_rad = np.deg2rad(self.max_turn)
+        mask = angle_rad > max_turn_rad
+        if mask.any():
+            t = np.where(mask, max_turn_rad / np.maximum(angle_rad, 1e-8), 1.0)[:, None]
+            # Slerp between old and new direction, then renormalize
+            blended = (1.0 - t) * safe_old + t * safe_new
+            norm = np.linalg.norm(blended, axis=-1, keepdims=True)
+            blended = np.where(norm > 1e-8, blended / norm, safe_old)
+            velocities = np.where(mask[:, None], blended * speed_new, velocities)
+
+        # ── Speed limit ──────────────────────────────────────────────────────
         speed = np.linalg.norm(velocities, axis=-1)
-        velocities[speed < self.min_speed] = scale(
-            velocities[speed < self.min_speed], self.min_speed
-        )
-        velocities[speed > self.max_speed] = scale(
-            velocities[speed > self.max_speed], self.max_speed
-        )
+        velocities[speed < self.min_speed] = scale(velocities[speed < self.min_speed], self.min_speed)
+        velocities[speed > self.max_speed] = scale(velocities[speed > self.max_speed], self.max_speed)
         return velocities
 
     def clamp(self, force):
@@ -242,18 +277,34 @@ class Boids3D:
         force[to_clamp] = scale(force[to_clamp], length=self.max_force)
         return force
 
-    def get_random_init(self, n_boids, save_config):
-        center = np.array([
-            np.random.uniform(-5, -2.5),
-            np.random.uniform(-5, -2.5),
-            np.random.uniform(-2.5, 0.0),
-        ])
+    def get_random_init(self, n_boids, save_config, bounds=None, exclusion_zone=None, center=None, max_attempts=10000):
+        """
+        Spawns boids in a tight clump at a random location.
+        bounds:         optional (x_min, x_max, y_min, y_max, z_min, z_max)
+        exclusion_zone: optional list of (center_3d, radius) spheres to reject
+        center:         if provided, skip sampling and use directly
+        """
+        if center is None:
+            if bounds is not None:
+                x_min, x_max, y_min, y_max, z_min, z_max = bounds
+            else:
+                x_min, x_max, y_min, y_max, z_min, z_max = -5, 0, -5, 0, -5, 0
+            for _ in range(max_attempts):
+                c = np.array([
+                    np.random.uniform(x_min, x_max),
+                    np.random.uniform(y_min, y_max),
+                    np.random.uniform(z_min, z_max),
+                ])
+                if exclusion_zone is None or not _in_exclusion_zone_3d(c, exclusion_zone):
+                    center = c
+                    break
+            else:
+                raise RuntimeError(f"Could not sample valid center after {max_attempts} attempts.")
         if save_config:
             self.rand_configs.append(center)
-        positions = center + 0.325 * np.random.rand(n_boids, 3)
+        positions = center + self.init_scatter * np.random.rand(n_boids, 3)
         direction = np.array([1.0, 0.0, 0.0])
-        velocity = direction * self.max_speed
-        velocities = np.tile(velocity, (n_boids, 1))
+        velocities = np.tile(direction * self.max_speed, (n_boids, 1))
         neighbors = self.get_neighbors(positions)
         return positions, velocities, neighbors, center
 
@@ -277,11 +328,17 @@ class Boids3D:
                 positions[:, 0], positions[:, 1], positions[:, 2],
                 marker=".", edgecolor="k", lw=0.5
             )
+            goal = self.goal_positions[self.current_goal]
+            self.goal_marker = self.ax.scatter([goal[0]], [goal[1]], [goal[2]],
+                                               c='red', marker='*', s=200, label='Goal')
             self.ax.set_xlim(self.borders[0], self.borders[3])
             self.ax.set_ylim(self.borders[1], self.borders[4])
             self.ax.set_zlim(self.borders[2], self.borders[5])
+            self.ax.legend()
             plt.show()
         self.scatter._offsets3d = (positions[:, 0], positions[:, 1], positions[:, 2])
+        goal = self.goal_positions[self.current_goal]
+        self.goal_marker._offsets3d = ([goal[0]], [goal[1]], [goal[2]])
         self.figure.canvas.draw()
         self.figure.canvas.flush_events()
 
@@ -319,6 +376,64 @@ def history_to_samples_3d(history, accel=False):
         return [(x, a, y_) for x, a, y_ in zip(inputs[:-1], neighbors[:-1], targets)]
 
 
+def _load_adaptive_stride_3d(f, start, end, timestep_stride, near_goal_radius):
+    """Load timesteps with adaptive stride: dense (stride=1) near any goal, sparse elsewhere.
+    y[:, 0, 12:15] = current goal position (same for all boids at each timestep).
+    """
+    if timestep_stride <= 1 or near_goal_radius <= 0:
+        return (
+            f['x'][start:end:timestep_stride],
+            f['y'][start:end:timestep_stride],
+            f['a_row'][start:end:timestep_stride],
+            f['a_col'][start:end:timestep_stride],
+            f['a_len'][start:end:timestep_stride],
+        )
+
+    x_full = f['x'][start:end]   # (T, n_boids, 6)
+    y_full = f['y'][start:end]   # (T, n_boids, 15)
+
+    mean_pos = x_full[:, :, :3].mean(axis=1)   # (T, 3)
+    y_goal   = y_full[:, 0, 12:15]             # (T, 3)
+    dist     = np.linalg.norm(mean_pos - y_goal, axis=1)  # (T,)
+
+    T = end - start
+    strided = np.zeros(T, dtype=bool)
+    strided[::timestep_stride] = True
+    keep = np.where(strided | (dist < near_goal_radius))[0]
+    abs_keep = keep + start
+
+    return (
+        x_full[keep],
+        y_full[keep],
+        f['a_row'][abs_keep],
+        f['a_col'][abs_keep],
+        f['a_len'][abs_keep],
+    )
+
+
+def load_chunk_from_cache_3d(cache_path, flat_indices, boundaries, n_boids_cache,
+                              timestep_stride=1, near_goal_radius=1.0):
+    """Load a subset of 3D trajectories from HDF5 into a BoidsDataset3D."""
+    graphs = []
+    with h5py.File(cache_path, 'r') as f:
+        for flat_idx in flat_indices:
+            start = int(boundaries[flat_idx])
+            end   = int(boundaries[flat_idx + 1])
+            x_c, y_c, arow_c, acol_c, alen_c = _load_adaptive_stride_3d(
+                f, start, end, timestep_stride, near_goal_radius
+            )
+            for k in range(len(x_c)):
+                length = int(alen_c[k])
+                row = arow_c[k, :length]
+                col = acol_c[k, :length]
+                a = sp.coo_matrix(
+                    (np.ones(length, dtype=np.float32), (row, col)),
+                    shape=(n_boids_cache, n_boids_cache),
+                )
+                graphs.append(Graph(x=x_c[k], a=a, y=y_c[k]))
+    return BoidsDataset3D(graphs)
+
+
 def make_dataset_3d(unique_reps, repeat_reps, save_config, trajectory_len=None, random_init=True, return_boids=False, accel=False, **kwargs):
     kwargs.pop("n_jobs", 1)
     kwargs.pop("init", None)
@@ -347,14 +462,20 @@ def make_dataset_3d(unique_reps, repeat_reps, save_config, trajectory_len=None, 
             print(f"✅ Loaded cache: {n_train} training centers, {len(unseen_indices)} unseen centers, timestep_stride={timestep_stride}")
 
             n_reps = min(repeat_reps, cache_repeats)
-            total_samples    = f['x'].shape[0]
-            samples_per_traj = total_samples // (cache_unique * cache_repeats)
+
+            if 'traj_lengths' in f:
+                traj_lengths = f['traj_lengths'][:]
+                boundaries = np.concatenate([[0], np.cumsum(traj_lengths)])
+            else:
+                total_samples    = f['x'].shape[0]
+                samples_per_traj = total_samples // (cache_unique * cache_repeats)
+                boundaries = np.arange(cache_unique * cache_repeats + 1) * samples_per_traj
 
             for traj_i in train_indices:
                 for rep_j in range(n_reps):
                     flat_idx = traj_i * cache_repeats + rep_j
-                    start = flat_idx * samples_per_traj
-                    end   = min(start + samples_per_traj, total_samples)
+                    start = int(boundaries[flat_idx])
+                    end   = int(boundaries[flat_idx + 1])
                     x_chunk    = f['x'][start:end:timestep_stride]
                     y_chunk    = f['y'][start:end:timestep_stride]
                     arow_chunk = f['a_row'][start:end:timestep_stride]

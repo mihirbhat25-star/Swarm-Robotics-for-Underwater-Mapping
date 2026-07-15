@@ -100,7 +100,8 @@ def _load_or_compute_trained_trajs(boids, n_boids, run_gnca_traj, traj_cache_pat
         if cache.get("model_tag", "") == model_tag and cache.get("n_runs", 0) == n_runs:
             print(f"✅ Loaded cached trajectories ({n_runs} runs) from '{traj_cache_path}'")
             trajs = list(cache["trajs"])
-            if "centers" in cache:
+            # Only use cached centers if we don't already have them from boids.rand_configs
+            if selected_centers is None and "centers" in cache:
                 selected_centers = cache["centers"]
 
     if trajs is None:
@@ -122,8 +123,9 @@ def _load_or_compute_trained_trajs(boids, n_boids, run_gnca_traj, traj_cache_pat
 
 
 def _compute_test_trajs(boids, n_boids, test_centers, run_gnca_traj, selected_centers):
-    """Generate 50 test trajectories and check overlap with training centers."""
-    print(f"\n🔄 Generating 50 test-center trajectories...")
+    """Generate test trajectories from provided or random centers."""
+    n_test = len(test_centers) if test_centers is not None else 50
+    print(f"\n🔄 Computing {n_test} test-center trajectories...")
     trajs_test = []
     centers_collected = []
 
@@ -137,11 +139,13 @@ def _compute_test_trajs(boids, n_boids, test_centers, run_gnca_traj, selected_ce
             vel = np.tile(np.array([1.0, 0.0]) * boids.max_speed, (n_boids, 1))
             centers_collected.append(center)
             trajs_test.append(run_gnca_traj(pos, vel))
+            print(f"   [{idx+1}/{n_test}] center=({center[0]:.2f}, {center[1]:.2f})")
     else:
-        for _ in range(50):
+        for i in range(50):
             pos, vel, _, center = boids.get_random_init(n_boids, save_config=False)
             centers_collected.append(center)
             trajs_test.append(run_gnca_traj(pos, vel))
+            print(f"   [{i+1}/50] center=({center[0]:.2f}, {center[1]:.2f})")
 
     print(f"✅ Generated {len(trajs_test)} test trajectories")
 
@@ -155,7 +159,7 @@ def _compute_test_trajs(boids, n_boids, test_centers, run_gnca_traj, selected_ce
 def evaluate(model, forward, max_trajectory_len, n_boids, use_saved_config, saved_boids,
              init_blob=False, viz_mode='tubular', max_viz_runs=50,
              traj_cache_path="viz_trajectories.npz", run_tag="", n_show=50, specific_runs=None, output_dir=".",
-             test_centers=None):
+             test_centers=None, viz_trained=False):
     """
     Evaluate GNCA trajectories and produce visualization PDFs.
     test_centers: if provided, use these for the test-set visualization instead of fresh random centers.
@@ -166,28 +170,45 @@ def evaluate(model, forward, max_trajectory_len, n_boids, use_saved_config, save
 
     run_gnca_traj = _make_gnca_runner(model, boids, n_boids, max_trajectory_len)
     model_tag = _model_hash(model)
-    trajs, selected_centers = _load_or_compute_trained_trajs(
-        boids, n_boids, run_gnca_traj, traj_cache_path, model_tag)
+    if viz_trained:
+        trajs, selected_centers = _load_or_compute_trained_trajs(
+            boids, n_boids, run_gnca_traj, traj_cache_path, model_tag)
+    else:
+        trajs, selected_centers = [], (np.array(boids.rand_configs) if boids.rand_configs else None)
     np.random.seed(None)
 
     tag = f"_{run_tag}" if run_tag else ""
 
+    # Compute test trajectories when test_centers are provided or as fallback
+    trajs_test = _compute_test_trajs(boids, n_boids, test_centers, run_gnca_traj, selected_centers) if (test_centers is not None or not viz_trained) else []
+
+    # Save test trajectories to disk so they can be reloaded for re-visualization
+    if trajs_test:
+        test_cache_path = traj_cache_path.replace('.npz', '_test.npz')
+        centers_arr = np.array(test_centers) if test_centers is not None else np.array([])
+        np.savez(test_cache_path, trajs=np.array(trajs_test, dtype=object),
+                 centers=centers_arr, model_tag=model_tag)
+        print(f"💾 Cached test trajectories to '{test_cache_path}'")
+
+    # Primary trajectories for visualization: test if viz_trained=False, else trained
+    trajs_viz    = trajs_test if not viz_trained else trajs
+    centers_viz  = list(test_centers) if (not viz_trained and test_centers is not None) else (list(selected_centers) if selected_centers is not None else [])
 
     if viz_mode == 'tubular':
-        save_tubular_triplet(trajs, goals, n_boids, tag, 'trained', output_dir)
-        trajs_test = _compute_test_trajs(boids, n_boids, test_centers, run_gnca_traj, selected_centers)
-        save_tubular_triplet(trajs_test, goals, n_boids, tag, 'random', output_dir)
+        if viz_trained and trajs:
+            save_tubular_triplet(trajs, goals, n_boids, tag, 'trained', output_dir)
+        save_tubular_triplet(trajs_test, goals, n_boids, tag, 'test', output_dir)
 
     elif viz_mode == 'per_boid':
-        _plot_per_boid(trajs, goals, n_boids, filename=os.path.join(output_dir, f"boids_auto_rand{tag}.pdf"))
+        _plot_per_boid(trajs_viz, goals, n_boids, filename=os.path.join(output_dir, f"boids_auto_rand{tag}.pdf"))
 
     elif viz_mode == 'multi_tubular':
-        _plot_multi_tubular(trajs, goals, n_boids, n_show=n_show,
+        _plot_multi_tubular(trajs_viz, goals, n_boids, n_show=n_show,
                            filename=os.path.join(output_dir, f"boids_multi_tubular{tag}.pdf"),
-                           specific_runs=specific_runs if specific_runs else list(range(min(n_show, len(trajs)))))
+                           specific_runs=specific_runs if specific_runs else list(range(min(n_show, len(trajs_viz)))))
 
     elif viz_mode == 'individual':
-        _plot_individual_ranked(trajs, goals, n_boids, selected_centers, run_tag, output_dir)
+        _plot_individual_ranked(trajs_viz, goals, n_boids, centers_viz, run_tag, output_dir)
 
     else:
         raise ValueError(f"Unknown viz_mode '{viz_mode}'. Choose 'tubular', 'per_boid', 'multi_tubular', or 'individual'.")

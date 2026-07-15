@@ -2,89 +2,135 @@
 Generates boids trajectories, converts them to training graph tuples,
 and saves to an HDF5 file for memory-efficient loading during training.
 Writes to disk incrementally per trajectory — no large RAM accumulation.
-
-The HDF5 contains:
-  - 'x':       (N, n_boids, 4)  — node features [pos_x, pos_y, vel_x, vel_y]
-  - 'a_row':   (N, max_edges)   — COO row indices (padded with -1)
-  - 'a_col':   (N, max_edges)   — COO col indices (padded with -1)
-  - 'a_len':   (N,)             — actual number of edges per timestep
-  - 'y':       (N, n_boids, 10) — targets [cur_state(4), next_state(4), goal(2)]
-  - 'centers': (unique_reps, 2) — flock start centers for viz/testing
-
-Usage:
-    python -m boids.generate_boids_cache --unique 50 --repeats 20
-    python -m boids.generate_boids_cache --unique 100 --repeats 20 --output my_cache.h5
-
-Load in training (via --boids_cache flag in run_boids.py):
-    python -m boids.run_boids --boids_cache boids_cache_50x20.h5 ...
-
-Load centers only (for viz/testing):
-    import h5py
-    with h5py.File("boids_cache_50x20.h5", "r") as f:
-        centers = f["centers"][:]  # (50, 2)
 """
+
 import argparse
 import os
 import sys
 import numpy as np
 import h5py
+from shapely.geometry import Polygon
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from modules.boids import Boids, history_to_samples
 
+# (xmin, xmax, ymin, ymax, label) for each quadrant
+QUADRANTS = [
+    ( 0.0,  5.0,  0.0,  5.0, "Q1"),
+    (-5.0,  0.0,  0.0,  5.0, "Q2"),
+    (-5.0,  0.0, -5.0,  0.0, "Q3"),
+    ( 0.0,  5.0, -5.0,  0.0, "Q4"),
+]
+
+
+def build_exclusion_zone(goal_positions, size):
+    """Triangle through goal vertices, buffered outward by `size` units."""
+    if size <= 0:
+        return None
+    return Polygon(goal_positions.tolist()).buffer(size)
+
+
 
 def main():
     parser = argparse.ArgumentParser(description="Generate and cache boids graph training data")
-    parser.add_argument("--unique", type=int, default=50)
-    parser.add_argument("--repeats", type=int, default=20)
-    parser.add_argument("--n_boids", type=int, default=100)
-    parser.add_argument("--pos_noise", type=float, default=0.004)
-    parser.add_argument("--vel_noise", type=float, default=0.0005)
-    parser.add_argument("--output", type=str, default=None)
-    parser.add_argument("--x_min", type=float, default=-5.0)
-    parser.add_argument("--x_max", type=float, default=-2.5)
-    parser.add_argument("--y_min", type=float, default=-5.0)
-    parser.add_argument("--y_max", type=float, default=-2.5)
-    parser.add_argument("--noise_tag", type=str, default="",
-                        help="Label to append to filename (e.g. 'nw_2'). Does not change noise values.")
+    parser.add_argument("--unique",   type=int,   default=50)
+    parser.add_argument("--repeats",  type=int,   default=20)
+    parser.add_argument("--n_boids",  type=int,   default=100)
+    parser.add_argument("--output",   type=str,   default=None)
+    parser.add_argument("--noise_tag", type=str,  default="",
+                        help="Label appended to filename. Does not change noise values.")
+    parser.add_argument("--sample_mode", default="q3",
+                        choices=["q3", "full_canvas", "quadrant"],
+                        help="'q3' = [-5,-2.5]²; 'full_canvas' = [-5,5]² with exclusion; "
+                             "'quadrant' = --unique per quadrant (4×unique total) with exclusion.")
+    parser.add_argument("--goal_exclusion_size", type=float, default=0.2,
+                        help="Buffer radius around the goal triangle to exclude from sampling. "
+                             "Used with full_canvas and quadrant modes. Default: 0.2")
+    parser.add_argument("--quadrants", type=int, nargs="+", default=None,
+                        help="Which quadrants to sample from (0=Q1, 1=Q2, 2=Q3, 3=Q4). "
+                             "Default: all 4. E.g. '--quadrants 2 3' for Q3 and Q4 only.")
     args = parser.parse_args()
+
+    boids = Boids(n_boids=args.n_boids)
+
+    # Determine total unique centers and per-center bounds list
+    if args.sample_mode == "quadrant":
+        selected_quads = args.quadrants if args.quadrants is not None else [0, 1, 2, 3]
+        total_unique = len(selected_quads) * args.unique
+        center_tasks = []
+        for q_idx in selected_quads:
+            xmn, xmx, ymn, ymx, qlabel = QUADRANTS[q_idx]
+            center_tasks.extend([(xmn, xmx, ymn, ymx)] * args.unique)
+    elif args.sample_mode == "full_canvas":
+        total_unique = args.unique
+        center_tasks = [(-5.0, 5.0, -5.0, 5.0)] * total_unique
+    else:  # q3
+        total_unique = args.unique
+        center_tasks = [(-5.0, -2.5, -5.0, -2.5)] * total_unique
+
+    exclusion_zone = None
+    if args.sample_mode in ("full_canvas", "quadrant"):
+        exclusion_zone = build_exclusion_zone(boids.goal_positions, args.goal_exclusion_size)
 
     if args.output is None:
         noise_suffix = f"_{args.noise_tag}" if args.noise_tag else ""
-        args.output = f"boids_cache_{args.unique}x{args.repeats}_x{args.x_min}_{args.x_max}_y{args.y_min}_{args.y_max}{noise_suffix}.h5"
+        if args.sample_mode == "quadrant":
+            quad_str = "".join(str(q) for q in (args.quadrants if args.quadrants is not None else [0, 1, 2, 3]))
+            mode_suffix = f"_q{quad_str}_ex{args.goal_exclusion_size:g}"
+        elif args.sample_mode == "full_canvas":
+            mode_suffix = f"_fc_ex{args.goal_exclusion_size:g}"
+        else:
+            mode_suffix = ""
+        args.output = f"boids_cache_{total_unique}x{args.repeats}{mode_suffix}{noise_suffix}.h5"
 
-    print(f"\n>>> Generating {args.unique} unique × {args.repeats} repeats = {args.unique * args.repeats} trajectories")
-    print(f">>> n_boids={args.n_boids}, pos_noise={args.pos_noise}, vel_noise={args.vel_noise}")
-    print(f">>> Sampling centers from x=[{args.x_min}, {args.x_max}], y=[{args.y_min}, {args.y_max}]")
+    print(f"\n>>> Sample mode: {args.sample_mode} | "
+          f"{total_unique} unique × {args.repeats} repeats = {total_unique * args.repeats} trajectories")
+    if exclusion_zone is not None:
+        print(f">>> Exclusion: goal triangle buffered by {args.goal_exclusion_size} units")
     print(f">>> Output: {args.output}\n")
 
-    boids = Boids(n_boids=args.n_boids, pos_noise=args.pos_noise, vel_noise=args.vel_noise)
-
-    # Theoretical max edges: every boid neighbors every other (n*(n-1))
     max_edges = args.n_boids * (args.n_boids - 1)
-    n_feat_x = 4   # pos_x, pos_y, vel_x, vel_y
-    n_feat_y = 10  # cur_state(4) + next_state(4) + goal(2)
-    print(f">>> max_edges={max_edges} (theoretical max), x_feat={n_feat_x}, y_feat={n_feat_y}\n")
-
-    all_centers = []
+    n_feat_x, n_feat_y = 4, 10
+    all_centers, all_traj_lengths = [], []
 
     with h5py.File(args.output, 'w') as f:
-        ds_x    = f.create_dataset('x',     shape=(0, args.n_boids, n_feat_x), maxshape=(None, args.n_boids, n_feat_x), dtype='float32', chunks=(256, args.n_boids, n_feat_x), compression='gzip', compression_opts=4)
-        ds_y    = f.create_dataset('y',     shape=(0, args.n_boids, n_feat_y), maxshape=(None, args.n_boids, n_feat_y), dtype='float32', chunks=(256, args.n_boids, n_feat_y), compression='gzip', compression_opts=4)
-        ds_arow = f.create_dataset('a_row', shape=(0, max_edges), maxshape=(None, max_edges), dtype='int32', chunks=(256, max_edges), fillvalue=-1, compression='gzip', compression_opts=4)
-        ds_acol = f.create_dataset('a_col', shape=(0, max_edges), maxshape=(None, max_edges), dtype='int32', chunks=(256, max_edges), fillvalue=-1, compression='gzip', compression_opts=4)
-        ds_alen = f.create_dataset('a_len', shape=(0,), maxshape=(None,), dtype='int32', chunks=(1024,), compression='gzip', compression_opts=4)
+        ds_x    = f.create_dataset('x',     shape=(0, args.n_boids, n_feat_x),
+                                   maxshape=(None, args.n_boids, n_feat_x), dtype='float32',
+                                   chunks=(256, args.n_boids, n_feat_x), compression='gzip', compression_opts=4)
+        ds_y    = f.create_dataset('y',     shape=(0, args.n_boids, n_feat_y),
+                                   maxshape=(None, args.n_boids, n_feat_y), dtype='float32',
+                                   chunks=(256, args.n_boids, n_feat_y), compression='gzip', compression_opts=4)
+        ds_arow = f.create_dataset('a_row', shape=(0, max_edges), maxshape=(None, max_edges),
+                                   dtype='int32', chunks=(256, max_edges), fillvalue=-1,
+                                   compression='gzip', compression_opts=4)
+        ds_acol = f.create_dataset('a_col', shape=(0, max_edges), maxshape=(None, max_edges),
+                                   dtype='int32', chunks=(256, max_edges), fillvalue=-1,
+                                   compression='gzip', compression_opts=4)
+        ds_alen = f.create_dataset('a_len', shape=(0,), maxshape=(None,), dtype='int32',
+                                   chunks=(1024,), compression='gzip', compression_opts=4)
 
-        for i in tqdm(range(args.unique), desc="Unique centers"):
-            center = np.array([np.random.uniform(args.x_min, args.x_max),
-                                np.random.uniform(args.y_min, args.y_max)], dtype=np.float32)
+        for xmn, xmx, ymn, ymx in tqdm(center_tasks, desc="Unique centers"):
+            # Sample one center; get_random_init handles bounds + exclusion + initialisation
+            _, _, _, center = boids.get_random_init(
+                args.n_boids, save_config=False,
+                bounds=(xmn, xmx, ymn, ymx),
+                exclusion_zone=exclusion_zone,
+            )
             all_centers.append(center)
 
-            for j in range(args.repeats):
-                history = boids.generate_trajectory(random_init=center, save_config=False)
+            for _ in range(args.repeats):
+                # Reuse the same center with fresh boid scatter for each repeat
+                positions, velocities, neighbors, _ = boids.get_random_init(
+                    args.n_boids, save_config=False, center=center
+                )
+                history = boids.generate_trajectory(
+                    random_init=(positions, velocities), save_config=False
+                )
                 samples = history_to_samples(history)
                 n = len(samples)
+                all_traj_lengths.append(n)
 
                 x_buf    = np.zeros((n, args.n_boids, n_feat_x), dtype=np.float32)
                 y_buf    = np.zeros((n, args.n_boids, n_feat_y), dtype=np.float32)
@@ -95,30 +141,57 @@ def main():
                 for k, (x, a, y) in enumerate(samples):
                     x_buf[k] = x
                     y_buf[k] = y
-                    length = a.nnz
-                    arow_buf[k, :length] = a.row
-                    acol_buf[k, :length] = a.col
-                    alen_buf[k] = length
+                    nnz = a.nnz
+                    arow_buf[k, :nnz] = a.row
+                    acol_buf[k, :nnz] = a.col
+                    alen_buf[k] = nnz
 
                 cur = ds_x.shape[0]
-                for ds, buf in [(ds_x, x_buf), (ds_y, y_buf), (ds_arow, arow_buf), (ds_acol, acol_buf), (ds_alen, alen_buf)]:
+                for ds, buf in [(ds_x, x_buf), (ds_y, y_buf),
+                                (ds_arow, arow_buf), (ds_acol, acol_buf), (ds_alen, alen_buf)]:
                     ds.resize(cur + n, axis=0)
                     ds[cur:cur + n] = buf
 
                 del history, samples, x_buf, y_buf, arow_buf, acol_buf, alen_buf
 
         centers_arr = np.stack(all_centers, axis=0)
-        f.create_dataset('centers', data=centers_arr)
-        f.attrs['unique_reps'] = args.unique
-        f.attrs['repeats']     = args.repeats
-        f.attrs['n_boids']     = args.n_boids
-        f.attrs['max_edges']   = max_edges
-
+        f.create_dataset('centers',      data=centers_arr)
+        f.create_dataset('traj_lengths', data=np.array(all_traj_lengths, dtype=np.int32))
+        f.attrs['unique_reps']  = total_unique
+        f.attrs['repeats']      = args.repeats
+        f.attrs['n_boids']      = args.n_boids
+        f.attrs['max_edges']    = max_edges
+        f.attrs['sample_mode']  = args.sample_mode
+        if exclusion_zone is not None:
+            f.attrs['goal_exclusion_size'] = args.goal_exclusion_size
         total = ds_x.shape[0]
 
     print(f"\n✅ Saved {total} samples to '{args.output}'")
-    print(f"   centers: {centers_arr.shape}")
+    print(f"   centers: {centers_arr.shape}  |  traj lengths: "
+          f"min={min(all_traj_lengths)} max={max(all_traj_lengths)} mean={int(np.mean(all_traj_lengths))}")
     print(f"   File size: ~{os.path.getsize(args.output) / 1e6:.1f} MB")
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.scatter(centers_arr[:, 0], centers_arr[:, 1],
+               c='blue', marker='*', s=80, alpha=0.7, label=f'{total_unique} centers')
+    ax.scatter(boids.goal_positions[:, 0], boids.goal_positions[:, 1],
+               c='red', marker='*', s=200, zorder=5, label='Goals')
+    if exclusion_zone is not None:
+        ex_x, ex_y = exclusion_zone.exterior.xy
+        ax.fill(ex_x, ex_y, alpha=0.15, color='red',
+                label=f'Exclusion (r={args.goal_exclusion_size})')
+        ax.plot(ex_x, ex_y, color='red', lw=1.0)
+    ax.set_xlim(-5.5, 5.5); ax.set_ylim(-5.5, 5.5)
+    ax.axhline(0, color='gray', lw=0.5, ls='--')
+    ax.axvline(0, color='gray', lw=0.5, ls='--')
+    ax.set_xlabel("X"); ax.set_ylabel("Y")
+    ax.set_title(f"{args.sample_mode} — {total_unique} unique centers")
+    ax.set_aspect('equal'); ax.legend(fontsize=8)
+    plt.tight_layout()
+    plot_path = args.output.replace('.h5', '_centers.pdf')
+    plt.savefig(plot_path); plt.close()
+    print(f"   Center plot: {plot_path}")
+
 
 if __name__ == "__main__":
     main()
