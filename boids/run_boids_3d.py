@@ -104,6 +104,7 @@ def print_run_parameters_3d(args, upweight, critical_distance, distance_weight, 
     print(f"Learning rate:        {args.lr}")
     print(f"Batch size:           {args.batch_size}")
     print(f"Multi-GPU:            {args.multi_gpu}")
+    print(f"Cloud optimized:      {args.cloud_optimized}")
     print(
         f"Execution:            "
         f"{'eager (debug)' if args.eager_training else 'compiled graph'}; "
@@ -738,6 +739,8 @@ def _build_chunk_worker_command_3d(
         cmd.append("--eager_training")
     if args.multi_gpu:
         cmd.append("--multi_gpu")
+    if args.cloud_optimized:
+        cmd.append("--cloud_optimized")
     if args.chunk_epochs is not None:
         cmd.extend(["--chunk_epochs", str(args.chunk_epochs)])
     if args.init_weights:
@@ -1328,6 +1331,187 @@ def fit_mirrored_worker_3d(
 
     return train_steps
 
+
+def fit_cloud_mirrored_worker_3d(
+    model,
+    strategy,
+    train_data,
+    train_local_steps,
+    n_epochs,
+    callbacks,
+    global_node_count,
+    steps_per_execution,
+    val_data=None,
+    val_local_steps=0,
+):
+    """Cloud-only distributed loop with compiled multi-step execution.
+
+    The input datasets already contain complete per-replica disjoint graph
+    batches. ``distribute_datasets_from_function`` dequeues one such batch for
+    every replica without splitting its node or adjacency tensors. Multiple
+    optimizer steps then execute inside one ``tf.function`` call, avoiding the
+    Python dispatch and device-to-host synchronization performed per step by
+    the compatibility multi-GPU loop above.
+    """
+    replicas = strategy.num_replicas_in_sync
+    train_steps = train_local_steps // replicas
+    if train_steps < 1:
+        raise ValueError(
+            f"Need at least {replicas} local train batches for {replicas} GPUs."
+        )
+    dropped_train = train_local_steps - train_steps * replicas
+    if dropped_train:
+        print(
+            f">>> Cloud optimized: dropping {dropped_train} incomplete local "
+            "batch(es) per epoch to keep replicas synchronized."
+        )
+
+    val_steps = val_local_steps // replicas if val_data is not None else 0
+    if val_data is not None and val_steps < 1:
+        raise ValueError(
+            f"Need at least {replicas} local validation batches for "
+            f"{replicas} GPUs."
+        )
+
+    # The source datasets are already batched at the per-replica size. This API
+    # distributes whole dataset elements instead of slicing a disjoint graph's
+    # node dimension as experimental_distribute_dataset would do.
+    distributed_train_data = strategy.distribute_datasets_from_function(
+        lambda _input_context: train_data
+    )
+    distributed_val_data = None
+    if val_data is not None:
+        distributed_val_data = strategy.distribute_datasets_from_function(
+            lambda _input_context: val_data
+        )
+
+    def replica_train_step(batch):
+        inputs, targets = batch
+        with tf.GradientTape() as tape:
+            predictions = model(inputs, training=True)
+            per_node_loss = custom_weighted_mse_3d(targets, predictions)
+            local_loss_sum = tf.reduce_sum(per_node_loss)
+            local_node_count = tf.cast(tf.size(per_node_loss), tf.float32)
+            loss = local_loss_sum / tf.cast(global_node_count, tf.float32)
+        gradients = tape.gradient(loss, model.trainable_variables)
+        model.optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+        return local_loss_sum, local_node_count
+
+    def replica_validation_step(batch):
+        inputs, targets = batch
+        predictions = model(inputs, training=False)
+        per_node_loss = custom_weighted_mse_3d(targets, predictions)
+        return (
+            tf.reduce_sum(per_node_loss),
+            tf.cast(tf.size(per_node_loss), tf.float32),
+        )
+
+    @tf.function(reduce_retracing=True)
+    def distributed_train_block(iterator, block_steps):
+        total_loss = tf.constant(0.0, dtype=tf.float32)
+        total_nodes = tf.constant(0.0, dtype=tf.float32)
+        for _ in tf.range(block_steps):
+            loss_sums, node_counts = strategy.run(
+                replica_train_step, args=(next(iterator),)
+            )
+            total_loss += strategy.reduce(
+                tf.distribute.ReduceOp.SUM, loss_sums, axis=None
+            )
+            total_nodes += strategy.reduce(
+                tf.distribute.ReduceOp.SUM, node_counts, axis=None
+            )
+        return total_loss, total_nodes
+
+    @tf.function(reduce_retracing=True)
+    def distributed_validation_block(iterator, block_steps):
+        total_loss = tf.constant(0.0, dtype=tf.float32)
+        total_nodes = tf.constant(0.0, dtype=tf.float32)
+        for _ in tf.range(block_steps):
+            loss_sums, node_counts = strategy.run(
+                replica_validation_step, args=(next(iterator),)
+            )
+            total_loss += strategy.reduce(
+                tf.distribute.ReduceOp.SUM, loss_sums, axis=None
+            )
+            total_nodes += strategy.reduce(
+                tf.distribute.ReduceOp.SUM, node_counts, axis=None
+            )
+        return total_loss, total_nodes
+
+    callback_list = tf.keras.callbacks.CallbackList(
+        callbacks,
+        add_history=False,
+        add_progbar=False,
+        model=model,
+        epochs=n_epochs,
+        steps=train_steps,
+        verbose=1,
+        metrics=["loss"] + (["val_loss"] if val_data is not None else []),
+    )
+    execution_steps = max(1, min(int(steps_per_execution), train_steps))
+    print(
+        f">>> Cloud optimized execution: {replicas} replicas, "
+        f"{train_steps} global steps/epoch, "
+        f"{execution_steps} compiled steps/dispatch.",
+        flush=True,
+    )
+
+    model.stop_training = False
+    callback_list.on_train_begin()
+    train_iterator = iter(distributed_train_data)
+    try:
+        for epoch in range(n_epochs):
+            if model.stop_training:
+                break
+            epoch_t0 = time.time()
+            callback_list.on_epoch_begin(epoch)
+            epoch_loss_sum = 0.0
+            epoch_node_count = 0.0
+
+            for block_start in range(0, train_steps, execution_steps):
+                block_steps = min(execution_steps, train_steps - block_start)
+                loss_sum, node_count = distributed_train_block(
+                    train_iterator, tf.constant(block_steps, dtype=tf.int32)
+                )
+                # One host synchronization per compiled block, never per step.
+                epoch_loss_sum += float(loss_sum.numpy())
+                epoch_node_count += float(node_count.numpy())
+
+            logs = {"loss": epoch_loss_sum / max(epoch_node_count, 1.0)}
+            if distributed_val_data is not None:
+                val_iterator = iter(distributed_val_data)
+                val_loss_sum = 0.0
+                val_node_count = 0.0
+                val_execution_steps = max(1, min(execution_steps, val_steps))
+                for block_start in range(0, val_steps, val_execution_steps):
+                    block_steps = min(
+                        val_execution_steps, val_steps - block_start
+                    )
+                    loss_sum, node_count = distributed_validation_block(
+                        val_iterator,
+                        tf.constant(block_steps, dtype=tf.int32),
+                    )
+                    val_loss_sum += float(loss_sum.numpy())
+                    val_node_count += float(node_count.numpy())
+                logs["val_loss"] = val_loss_sum / max(val_node_count, 1.0)
+
+            callback_list.on_epoch_end(epoch, logs)
+            learning_rate = float(
+                tf.keras.backend.get_value(model.optimizer.learning_rate)
+            )
+            summary = (
+                f"Epoch {epoch + 1}/{n_epochs} - "
+                f"{time.time() - epoch_t0:.1f}s - loss: {logs['loss']:.6g}"
+            )
+            if "val_loss" in logs:
+                summary += f" - val_loss: {logs['val_loss']:.6g}"
+            summary += f" - lr: {learning_rate:.6g}"
+            print(summary, flush=True)
+    finally:
+        callback_list.on_train_end()
+
+    return train_steps
+
 ####################################################################################
 # Configuration
 ####################################################################################
@@ -1430,6 +1614,15 @@ parser.add_argument(
         "training. --batch_size remains the global batch size."
     ),
 )
+parser.add_argument(
+    "--cloud_optimized",
+    action="store_true",
+    help=(
+        "Opt-in cloud multi-GPU execution path: distribute complete graph "
+        "batches through tf.data and compile multiple optimizer steps per "
+        "Python dispatch. Requires --multi_gpu. Local/default paths are unchanged."
+    ),
+)
 parser.add_argument("--chunk_size", default=100, type=int)
 parser.add_argument("--chunk_patience", default=15, type=int)
 parser.add_argument("--best_after_epoch", default=50, type=int,
@@ -1506,6 +1699,10 @@ if args.min_lr > args.lr:
     raise ValueError("--min_lr cannot exceed --lr.")
 if args.steps_per_execution < 1:
     raise ValueError("--steps_per_execution must be at least 1.")
+if args.cloud_optimized and not args.multi_gpu:
+    raise ValueError("--cloud_optimized requires --multi_gpu.")
+if args.cloud_optimized and args.eager_training:
+    raise ValueError("--cloud_optimized cannot be combined with --eager_training.")
 if args.multi_gpu:
     if len(physical_devices) < 2:
         raise ValueError(
@@ -1701,7 +1898,15 @@ if args._chunk_worker:
         val_kwargs = {}
 
     if args.multi_gpu:
-        fit_mirrored_worker_3d(
+        mirrored_fit = (
+            fit_cloud_mirrored_worker_3d
+            if args.cloud_optimized
+            else fit_mirrored_worker_3d
+        )
+        mirrored_kwargs = {}
+        if args.cloud_optimized:
+            mirrored_kwargs["steps_per_execution"] = args.steps_per_execution
+        mirrored_fit(
             model,
             strategy,
             train_data,
@@ -1711,6 +1916,7 @@ if args._chunk_worker:
             global_node_count=args.batch_size * args._n_boids_cache,
             val_data=val_data,
             val_local_steps=(loader_va.steps_per_epoch if use_val else 0),
+            **mirrored_kwargs,
         )
     else:
         model.fit(
