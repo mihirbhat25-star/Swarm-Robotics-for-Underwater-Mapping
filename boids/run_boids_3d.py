@@ -8,7 +8,11 @@ import sys
 import json
 import subprocess
 import tempfile
+import atexit
+import shutil
+import time
 import warnings
+from contextlib import ExitStack
 warnings.filterwarnings('ignore')
 import joblib
 import matplotlib.pyplot as plt
@@ -17,10 +21,14 @@ import tensorflow as tf
 from spektral.data import DisjointLoader
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
-from boids.evaluate_boids_3d import evaluate_3d
 from boids.forward import forward
 from models.gnn_ca_simple_boids_3d import GNNCASimpleBoids3D
-from modules.boids_3d import make_dataset_3d, load_chunk_from_cache_3d, Boids3D
+from modules.boids_3d import (
+    BOIDS_GOAL_POSITIONS_3D,
+    Boids3D,
+    load_chunk_from_cache_3d,
+    make_dataset_3d,
+)
 import h5py
 import scipy.sparse as sp
 import psutil
@@ -92,6 +100,11 @@ def print_run_parameters_3d(args, upweight, critical_distance, distance_weight, 
     print(f"Noise config:         {noise_config or ''}")
     print(f"Learning rate:        {args.lr}")
     print(f"Batch size:           {args.batch_size}")
+    print(
+        f"Execution:            "
+        f"{'eager (debug)' if args.eager_training else 'compiled graph'}; "
+        f"steps_per_execution={args.steps_per_execution}"
+    )
     print(f"Epochs:               {args.epochs} (early stop patience: {args.es_patience})")
     print(f"Visualization mode:   {args.viz_mode}")
     print("="*70 + "\n")
@@ -99,7 +112,9 @@ def print_run_parameters_3d(args, upweight, critical_distance, distance_weight, 
 def custom_weighted_mse_3d(y_true, y_pred):
     """
     Custom weighted MSE loss for 3D GNCA.
-    y_true is [current_state (6D), next_state (6D), current_goal (3D)].
+    y_true is [current_state (6D), next_state (6D), current_goal (3D), graph_id].
+    Weighting uses distance to the nearest waypoint so the departure turn
+    remains emphasized immediately after the active-goal label switches.
     y_pred is predicted next_state (6D).
     """
     n_features = tf.shape(y_pred)[-1]  # Should be 6
@@ -109,15 +124,36 @@ def custom_weighted_mse_3d(y_true, y_pred):
     mse = tf.reduce_mean(tf.square(next_state - y_pred), axis=-1)
 
     if UPWEIGHT_NEAR_GOAL:
-        avg_pos = tf.reduce_mean(current_state[..., :3], axis=-2)
-        current_goal = y_true[..., 2*n_features:]
-        avg_goal = tf.reduce_mean(current_goal, axis=-2)
-        dist_to_goal = tf.norm(avg_pos - avg_goal, axis=-1)
-        goal_weight = tf.where(dist_to_goal < args.critical_distance, args.distance_weight, 1.0)
+        graph_ids = tf.cast(y_true[..., 15], tf.int32)
+        n_graphs = tf.reduce_max(graph_ids) + 1
+        avg_pos = tf.math.unsorted_segment_mean(
+            current_state[..., :3], graph_ids, n_graphs
+        )
+        goals = tf.cast(BOIDS_GOAL_POSITIONS_3D, avg_pos.dtype)
+        dist_to_goals = tf.norm(
+            avg_pos[:, None, :] - goals[None, :, :],
+            axis=-1,
+        )
+        dist_to_goal = tf.reduce_min(dist_to_goals, axis=1)
+        graph_weight = tf.where(
+            dist_to_goal < args.critical_distance,
+            tf.cast(args.distance_weight, mse.dtype),
+            tf.ones_like(dist_to_goal, dtype=mse.dtype),
+        )
+        goal_weight = tf.gather(graph_weight, graph_ids)
     else:
         goal_weight = 1.0
 
     return mse * goal_weight
+
+
+def add_graph_ids_to_targets_3d(inputs, targets):
+    """Append Spektral's graph id to each node target for graph-wise loss."""
+    graph_ids = tf.cast(inputs[2], targets.dtype)
+    targets = tf.concat([targets, graph_ids[:, None]], axis=-1)
+    targets = tf.ensure_shape(targets, [None, 16])
+    return inputs, targets
+
 
 class BestAfterEpochCallback3D(tf.keras.callbacks.Callback):
     """Saves weights whenever val_loss improves after min_epoch."""
@@ -137,6 +173,33 @@ class BestAfterEpochCallback3D(tf.keras.callbacks.Callback):
                 self.model.save_weights(self.save_path)
                 print(f"\n💾 New best val_loss after epoch 50: {val_loss:.6f} at epoch {self.best_epoch}")
 
+
+class BestTrainingStateCallback3D(tf.keras.callbacks.Callback):
+    """Checkpoint the complete model and optimizer state at the best epoch."""
+
+    def __init__(self, checkpoint_manager, monitor="val_loss", min_delta=0.0):
+        super().__init__()
+        self.checkpoint_manager = checkpoint_manager
+        self.monitor = monitor
+        self.min_delta = min_delta
+        self.best = float("inf")
+        self.best_epoch = None
+
+    def on_epoch_end(self, epoch, logs=None):
+        value = (logs or {}).get(self.monitor)
+        if value is None:
+            return
+        value = float(value)
+        if value < self.best - self.min_delta:
+            self.best = value
+            self.best_epoch = epoch + 1
+            path = self.checkpoint_manager.save()
+            print(
+                f"\n💾 Saved best complete training state at epoch "
+                f"{self.best_epoch}: {self.monitor}={value:.6g} ({path})"
+            )
+
+
 def _build_model_3d(lr):
     """Construct and compile a fresh GNNCASimpleBoids3D."""
     m = GNNCASimpleBoids3D(
@@ -148,14 +211,427 @@ def _build_model_3d(lr):
         aggregate="mean",
     )
     loss_fn = lambda y_true, y_pred: custom_weighted_mse_3d(y_true, y_pred)
-    m.compile(optimizer=Adam(learning_rate=lr), loss=loss_fn, run_eagerly=True)
+    m.compile(
+        optimizer=Adam(learning_rate=lr),
+        loss=loss_fn,
+        run_eagerly=args.eager_training,
+        steps_per_execution=args.steps_per_execution,
+    )
     return m
 
 
-def run_chunked_3d(cache_path, boundaries, n_boids_cache, all_flat_indices,
-                   data_va, run_tag, chunk_size, chunk_patience,
+def _build_model_variables_3d(model, n_boids):
+    """Run a dummy forward pass so Keras variables exist before load_weights."""
+    x_dummy = tf.zeros((n_boids, 6), dtype=tf.float32)
+    a_dummy = tf.SparseTensor(
+        indices=tf.zeros((0, 2), dtype=tf.int64),
+        values=tf.zeros((0,), dtype=tf.float32),
+        dense_shape=(n_boids, n_boids),
+    )
+    model([x_dummy, tf.sparse.reorder(a_dummy), tf.constant(0)], training=False)
+
+
+def make_validation_dataset_3d(args):
+    """Generate validation trajectories from the same octants used for training."""
+    if args.train_octants is None:
+        return make_dataset_3d(
+            unique_reps=args.va_set_size,
+            repeat_reps=1,
+            save_config=False,
+            n_boids=args.n_boids,
+            n_jobs=1,
+            random_init=True,
+            perception=args.perception,
+        )
+
+    from boids.generate_boids_cache_3d import OCTANTS, build_exclusion_zone_3d
+
+    sampler = Boids3D(n_boids=args.n_boids, perception=args.perception)
+    exclusion_zone = build_exclusion_zone_3d(sampler.goal_positions, 0.5)
+    centers = []
+    n_octants = len(args.train_octants)
+    base = args.va_set_size // n_octants
+    remainder = args.va_set_size % n_octants
+
+    for i, octant in enumerate(args.train_octants):
+        xmn, xmx, ymn, ymx, zmn, zmx, _ = OCTANTS[octant]
+        take = base + (1 if i < remainder else 0)
+        for _ in range(take):
+            _, _, _, center = sampler.get_random_init(
+                args.n_boids,
+                save_config=False,
+                bounds=(xmn, xmx, ymn, ymx, zmn, zmx),
+                exclusion_zone=exclusion_zone,
+            )
+            centers.append(np.array(center, dtype=np.float32))
+
+    print(f">>> Validation centers: {len(centers)} fresh centers from train_octants {args.train_octants}")
+    return make_dataset_3d(
+        unique_reps=len(centers),
+        repeat_reps=1,
+        save_config=False,
+        n_boids=args.n_boids,
+        n_jobs=1,
+        random_init=centers,
+        perception=args.perception,
+    )
+
+
+def save_dataset_npz_3d(dataset, path, n_boids):
+    """Serialize a small Spektral 3D dataset for subprocess validation."""
+    graphs = list(dataset.graphs)
+    max_edges = max((g.a.nnz for g in graphs), default=0)
+    x = np.stack([g.x for g in graphs], axis=0).astype(np.float32)
+    y = np.stack([g.y for g in graphs], axis=0).astype(np.float32)
+    a_row = np.full((len(graphs), max_edges), -1, dtype=np.int32)
+    a_col = np.full((len(graphs), max_edges), -1, dtype=np.int32)
+    a_len = np.zeros(len(graphs), dtype=np.int32)
+
+    for i, g in enumerate(graphs):
+        a = g.a.tocoo()
+        nnz = a.nnz
+        a_row[i, :nnz] = a.row
+        a_col[i, :nnz] = a.col
+        a_len[i] = nnz
+
+    np.savez_compressed(
+        path,
+        x=x,
+        y=y,
+        a_row=a_row,
+        a_col=a_col,
+        a_len=a_len,
+        n_boids=np.array([n_boids], dtype=np.int32),
+    )
+
+
+def make_disjoint_batch_3d(
+    x_list, y_list, row_list, col_list, len_list, n_boids, compact=False
+):
+    """Pack per-timestep cached arrays into one disjoint sparse mini-batch."""
+    batch_size = len(x_list)
+    x = np.concatenate(x_list, axis=0).astype(np.float32)
+    y = np.concatenate(y_list, axis=0).astype(np.float32)
+
+    edge_rows = []
+    edge_cols = []
+    for b, (rows, cols, nnz) in enumerate(zip(row_list, col_list, len_list)):
+        nnz = int(nnz)
+        if nnz <= 0:
+            continue
+        offset = b * n_boids
+        edge_rows.append(rows[:nnz].astype(np.int64) + offset)
+        edge_cols.append(cols[:nnz].astype(np.int64) + offset)
+
+    if edge_rows:
+        indices = np.stack([np.concatenate(edge_rows), np.concatenate(edge_cols)], axis=1)
+        # Cache COO entries are row-major sorted. Graph offsets increase with
+        # batch order, so concatenation remains SparseTensor-compatible without
+        # an expensive global lexsort for every mini-batch.
+        if compact:
+            return x, y, indices
+        values = np.ones(indices.shape[0], dtype=np.float32)
+    else:
+        indices = np.zeros((0, 2), dtype=np.int64)
+        if compact:
+            return x, y, indices
+        values = np.zeros((0,), dtype=np.float32)
+
+    n_nodes = batch_size * n_boids
+    dense_shape = np.array([n_nodes, n_nodes], dtype=np.int64)
+    step_i = np.repeat(np.arange(batch_size), n_boids).astype(np.int64)
+    return (x, indices, values, dense_shape, step_i), y
+
+
+def batch_to_tf_sparse_3d(batch):
+    """Convert a compact NumPy disjoint batch into model-ready TensorFlow inputs."""
+    (x, indices, values, dense_shape, step_i), y = batch
+    adj = tf.SparseTensor(indices=indices, values=values, dense_shape=dense_shape)
+    return (x, adj, step_i), y
+
+
+def _load_adaptive_cached_samples_3d(
+    f, start, end, timestep_stride, near_goal_radius
+):
+    """Load selected states, targets, and their cached current-state graphs."""
+    if timestep_stride <= 1 or near_goal_radius <= 0:
+        selection = slice(start, end, timestep_stride)
+        return (
+            f["x"][selection],
+            f["y"][selection],
+            f["a_row"][selection],
+            f["a_col"][selection],
+            f["a_len"][selection],
+        )
+
+    x_full = f["x"][start:end]
+    y_full = f["y"][start:end]
+    mean_pos = x_full[:, :, :3].mean(axis=1)
+    dist_to_goal = np.min(
+        np.linalg.norm(
+            mean_pos[:, None, :] - BOIDS_GOAL_POSITIONS_3D[None, :, :],
+            axis=-1,
+        ),
+        axis=1,
+    )
+
+    keep = np.zeros(end - start, dtype=bool)
+    keep[::timestep_stride] = True
+    keep |= dist_to_goal < near_goal_radius
+    absolute_indices = np.flatnonzero(keep) + start
+    return (
+        x_full[keep],
+        y_full[keep],
+        f["a_row"][absolute_indices],
+        f["a_col"][absolute_indices],
+        f["a_len"][absolute_indices],
+    )
+
+
+def _validate_cached_adjacency_3d(f, sample_indices, perception):
+    """Fail fast if a cache graph is not aligned with x or uses another radius."""
+    for sample_idx in sample_indices:
+        sample_idx = int(sample_idx)
+        x = f["x"][sample_idx]
+        nnz = int(f["a_len"][sample_idx])
+        cached = set(zip(
+            f["a_row"][sample_idx, :nnz].tolist(),
+            f["a_col"][sample_idx, :nnz].tolist(),
+        ))
+
+        positions = x[:, :3]
+        distances = np.linalg.norm(
+            positions[:, None, :] - positions[None, :, :], axis=-1
+        )
+        neighbors = distances < perception
+        np.fill_diagonal(neighbors, False)
+        row, col = np.nonzero(neighbors)
+        expected = set(zip(row.tolist(), col.tolist()))
+        if cached != expected:
+            raise ValueError(
+                "Cached adjacency does not match the current state at sample "
+                f"{sample_idx} for perception={perception}. Use a compatible "
+                "cache; training will not silently use a stale graph."
+            )
+        cached_pairs = np.column_stack((
+            f["a_row"][sample_idx, :nnz],
+            f["a_col"][sample_idx, :nnz],
+        ))
+        if nnz > 1:
+            order = np.lexsort((cached_pairs[:, 1], cached_pairs[:, 0]))
+            if not np.array_equal(order, np.arange(nnz)):
+                raise ValueError(
+                    f"Cached adjacency at sample {sample_idx} is not row-major "
+                    "sorted and cannot use the optimized sparse packing path."
+                )
+
+
+def write_cached_chunk_shards_3d(
+    cache_paths,
+    trajectory_refs,
+    boundaries_by_cache,
+    n_boids,
+    batch_size,
+    output_dir,
+    timestep_stride=1,
+    near_goal_radius=1.0,
+    perception=0.1,
+    shuffle_buffer_size=4096,
+    batches_per_shard=16,
+):
+    """Write shuffled disjoint batches into compact multi-batch shards.
+
+    Trajectory order is randomized first, then individual timesteps pass through
+    a bounded shuffle buffer before packing.  This prevents the optimizer from
+    receiving thousands of adjacent states from one trajectory in sequence.
+    Cached current-state adjacency is reused instead of rebuilding an O(N^2)
+    distance matrix for every sample. Sparse values and shapes are reconstructed
+    while loading, and int32 indices are stored on disk to reduce temporary data.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    shard_paths = []
+    shard_batches = []
+    total_batches = 0
+    x_batch, y_batch, row_batch, col_batch, len_batch = [], [], [], [], []
+    shuffle_buffer = []
+    shuffle_buffer_size = max(batch_size, int(shuffle_buffer_size))
+    batches_per_shard = max(1, int(batches_per_shard))
+    rng = np.random.default_rng()
+
+    def flush_shard():
+        nonlocal shard_batches
+        if not shard_batches:
+            return
+
+        node_lengths = np.asarray(
+            [len(batch[0]) for batch in shard_batches], dtype=np.int64
+        )
+        edge_lengths = np.asarray(
+            [len(batch[2]) for batch in shard_batches], dtype=np.int64
+        )
+        node_offsets = np.concatenate([
+            np.zeros(1, dtype=np.int64), np.cumsum(node_lengths)
+        ])
+        edge_offsets = np.concatenate([
+            np.zeros(1, dtype=np.int64), np.cumsum(edge_lengths)
+        ])
+        path = os.path.join(output_dir, f"shard_{len(shard_paths):05d}.npz")
+        np.savez(
+            path,
+            x=np.concatenate([batch[0] for batch in shard_batches], axis=0),
+            y=np.concatenate([batch[1] for batch in shard_batches], axis=0),
+            indices=np.concatenate(
+                [batch[2] for batch in shard_batches], axis=0
+            ).astype(np.int32, copy=False),
+            node_offsets=node_offsets,
+            edge_offsets=edge_offsets,
+            n_boids=np.asarray(n_boids, dtype=np.int32),
+        )
+        shard_paths.append(path)
+        shard_batches = []
+
+    def flush_batch():
+        nonlocal total_batches, x_batch, y_batch, row_batch, col_batch, len_batch
+        x, y, indices = make_disjoint_batch_3d(
+            x_batch,
+            y_batch,
+            row_batch,
+            col_batch,
+            len_batch,
+            n_boids,
+            compact=True,
+        )
+        shard_batches.append((x, y, indices))
+        total_batches += 1
+        x_batch, y_batch, row_batch, col_batch, len_batch = [], [], [], [], []
+        if len(shard_batches) >= batches_per_shard:
+            flush_shard()
+
+    def emit_sample(sample):
+        x, y, row, col = sample
+        x_batch.append(x)
+        y_batch.append(y)
+        row_batch.append(row)
+        col_batch.append(col)
+        len_batch.append(len(row))
+        if len(x_batch) == batch_size:
+            flush_batch()
+
+    def emit_random_buffered_sample():
+        sample_idx = int(rng.integers(len(shuffle_buffer)))
+        sample = shuffle_buffer[sample_idx]
+        shuffle_buffer[sample_idx] = shuffle_buffer[-1]
+        shuffle_buffer.pop()
+        emit_sample(sample)
+
+    with ExitStack() as stack:
+        caches = [stack.enter_context(h5py.File(path, "r")) for path in cache_paths]
+        refs = np.asarray(trajectory_refs, dtype=np.int64).reshape(-1, 2)
+        for cache_idx, f in enumerate(caches):
+            cache_refs = refs[refs[:, 0] == cache_idx, 1]
+            if len(cache_refs) == 0:
+                continue
+            boundaries = boundaries_by_cache[cache_idx]
+            probe_refs = cache_refs[np.linspace(
+                0, len(cache_refs) - 1, num=min(3, len(cache_refs)), dtype=int
+            )]
+            probe_samples = [int(boundaries[int(ref)]) for ref in probe_refs]
+            _validate_cached_adjacency_3d(f, probe_samples, perception)
+
+        trajectory_order = rng.permutation(refs)
+        for cache_idx, flat_idx in trajectory_order:
+            f = caches[int(cache_idx)]
+            boundaries = boundaries_by_cache[int(cache_idx)]
+            start = int(boundaries[int(flat_idx)])
+            end = int(boundaries[int(flat_idx) + 1])
+            x_c, y_c, row_c, col_c, len_c = _load_adaptive_cached_samples_3d(
+                f, start, end, timestep_stride, near_goal_radius
+            )
+            # Randomize individual timesteps before they enter the cross-
+            # trajectory buffer; adjacent expert states must not remain an
+            # optimizer batch merely because they share a trajectory.
+            for k in rng.permutation(len(x_c)):
+                nnz = int(len_c[k])
+                row = row_c[k, :nnz]
+                col = col_c[k, :nnz]
+                # Copy the sample so buffered views do not keep an entire
+                # trajectory-sized HDF5 slice alive in RAM.
+                shuffle_buffer.append((
+                    x_c[k].copy(),
+                    y_c[k].copy(),
+                    row.copy(),
+                    col.copy(),
+                ))
+                if len(shuffle_buffer) >= shuffle_buffer_size:
+                    emit_random_buffered_sample()
+            del x_c, y_c, row_c, col_c, len_c
+
+    while shuffle_buffer:
+        emit_random_buffered_sample()
+
+    if x_batch:
+        flush_batch()
+    flush_shard()
+    return shard_paths, max(1, total_batches)
+
+
+def dataset_from_batch_shards_3d(shard_paths):
+    """Create a repeatable dataset while opening each shard only once per epoch."""
+    def generator():
+        # from_generator is restarted by repeat(), so this is a new random
+        # shard/batch order without retaining the full chunk in RAM.
+        for path in np.random.permutation(shard_paths):
+            with np.load(path) as shard:
+                # Materialize each uncompressed NPZ member once. Re-indexing an
+                # NpzFile member inside the batch loop would reopen the ZIP
+                # member and reload the entire shard for every mini-batch.
+                x_all = shard["x"]
+                y_all = shard["y"]
+                indices_all = shard["indices"]
+                node_offsets = shard["node_offsets"]
+                edge_offsets = shard["edge_offsets"]
+                batch_order = np.random.permutation(len(node_offsets) - 1)
+                n_boids = int(shard["n_boids"])
+                for batch_idx in batch_order:
+                    node_start = int(node_offsets[batch_idx])
+                    node_end = int(node_offsets[batch_idx + 1])
+                    edge_start = int(edge_offsets[batch_idx])
+                    edge_end = int(edge_offsets[batch_idx + 1])
+                    n_nodes = node_end - node_start
+                    graph_count = n_nodes // n_boids
+                    yield batch_to_tf_sparse_3d((
+                        (
+                            x_all[node_start:node_end],
+                            indices_all[edge_start:edge_end].astype(
+                                np.int64, copy=False
+                            ),
+                            np.ones(edge_end - edge_start, dtype=np.float32),
+                            np.asarray([n_nodes, n_nodes], dtype=np.int64),
+                            np.repeat(
+                                np.arange(graph_count, dtype=np.int64), n_boids
+                            ),
+                        ),
+                        y_all[node_start:node_end],
+                    ))
+
+    output_signature = (
+        (
+            tf.TensorSpec(shape=(None, 6), dtype=tf.float32),
+            tf.SparseTensorSpec(shape=(None, None), dtype=tf.float32),
+            tf.TensorSpec(shape=(None,), dtype=tf.int64),
+        ),
+        tf.TensorSpec(shape=(None, 15), dtype=tf.float32),
+    )
+    return tf.data.Dataset.from_generator(
+        generator, output_signature=output_signature
+    ).repeat()
+
+
+def run_chunked_3d(cache_paths, boundaries_by_cache, n_boids_cache,
+                   all_trajectory_refs,
+                   run_tag, chunk_size, chunk_patience,
                    octant_buckets=None):
-    """Chunked training mirroring 2D: get_weights/set_weights + clear_session in-process."""
+    """Train balanced chunks in isolated workers while carrying model state and LR."""
     checkpoint_path = f"saved_models/best_weights_3d_{run_tag}"
     os.makedirs("saved_models", exist_ok=True)
 
@@ -165,96 +641,147 @@ def run_chunked_3d(cache_path, boundaries, n_boids_cache, all_flat_indices,
     # ── Build balanced chunks ────────────────────────────────────────────────
     if octant_buckets and len(octant_buckets) > 1:
         active = {o: np.array(idxs) for o, idxs in octant_buckets.items() if len(idxs) > 0}
-        n_active = len(active)
-        n_per_o  = chunk_size // n_active
-        remainder = chunk_size % n_active
         for o in active:
             np.random.shuffle(active[o])
         pointers = {o: 0 for o in active}
-        chunks, current = [], []
+        chunks, chunk_mixes = [], []
         while True:
-            added = 0
-            for i, o in enumerate(active):
-                take = n_per_o + (1 if i < remainder else 0)
-                p = pointers[o]
-                batch = active[o][p:p + take]
-                current.extend(batch.tolist())
-                pointers[o] += take
-                added += len(batch)
-            if added == 0:
+            remaining = {o: len(active[o]) - pointers[o] for o in active}
+            total_remaining = sum(remaining.values())
+            if total_remaining == 0:
                 break
-            if len(current) >= chunk_size:
-                chunks.append(np.array(current[:chunk_size]))
-                current = current[chunk_size:]
-        if current:
-            chunks.append(np.array(current))
+
+            current_size = min(chunk_size, total_remaining)
+            exact = {
+                o: current_size * remaining[o] / total_remaining
+                for o in active
+            }
+            allocation = {
+                o: min(remaining[o], int(np.floor(exact[o])))
+                for o in active
+            }
+            unassigned = current_size - sum(allocation.values())
+            while unassigned > 0:
+                candidates = [
+                    o for o in active
+                    if allocation[o] < remaining[o]
+                ]
+                if not candidates:
+                    raise RuntimeError("Could not allocate a complete replay chunk.")
+                chosen = max(
+                    candidates,
+                    key=lambda o: (exact[o] - allocation[o], remaining[o]),
+                )
+                allocation[chosen] += 1
+                unassigned -= 1
+
+            current = []
+            for o in active:
+                take = allocation[o]
+                start = pointers[o]
+                current.extend(active[o][start:start + take].tolist())
+                pointers[o] += take
+            np.random.shuffle(current)
+            chunks.append(np.array(current, dtype=np.int64))
+            chunk_mixes.append({o: allocation[o] for o in active})
         n_chunks = len(chunks)
-        print(f">>> Chunked training: {n_chunks} balanced chunks ({n_per_o} per octant × {n_active} octants)")
+        requested_mix = {o: len(active[o]) for o in active}
+        print(
+            f">>> Chunked training: {n_chunks} proportional balanced chunks; "
+            f"requested octant totals {requested_mix}"
+        )
     else:
-        n_chunks = max(1, len(all_flat_indices) // chunk_size)
-        chunks = np.array_split(all_flat_indices, n_chunks)
+        n_chunks = max(1, len(all_trajectory_refs) // chunk_size)
+        chunks = np.array_split(all_trajectory_refs, n_chunks)
+        chunk_mixes = None
         print(f">>> Chunked training: {n_chunks} chunks of ~{chunk_size} trajectories each")
 
     def _mem_mb():
         return psutil.Process(os.getpid()).memory_info().rss / 1e6
 
-    saved_weights_np = None
-    saved_lr = args.lr
-
-    for chunk_idx, chunk_flat in enumerate(chunks):
-        print(f"\n{'='*60}")
-        print(f"  Chunk {chunk_idx+1}/{n_chunks} | {len(chunk_flat)} trajectories | RAM: {_mem_mb():.0f} MB")
-        print(f"{'='*60}")
-
-        tf.keras.backend.clear_session()
-        gc.collect()
-
-        model = _build_model_3d(saved_lr)
-        data_chunk = load_chunk_from_cache_3d(
-            cache_path, chunk_flat, boundaries, n_boids_cache,
-            timestep_stride=stride, near_goal_radius=near_goal_r,
+    with tempfile.TemporaryDirectory(prefix="gnca_3d_chunks_") as tmpdir:
+        boundaries_file = os.path.join(tmpdir, "boundaries.npz")
+        cache_paths_file = os.path.join(tmpdir, "cache_paths.json")
+        training_state_dir = os.path.join(tmpdir, "training_state")
+        np.savez(
+            boundaries_file,
+            **{
+                f"cache_{cache_idx}": boundaries
+                for cache_idx, boundaries in enumerate(boundaries_by_cache)
+            },
         )
-        loader_tr = DisjointLoader(data_chunk, node_level=True, batch_size=args.batch_size)
-        loader_va = DisjointLoader(data_va,    node_level=True, batch_size=args.batch_size)
+        with open(cache_paths_file, "w", encoding="utf-8") as f:
+            json.dump([os.path.abspath(path) for path in cache_paths], f)
 
-        if saved_weights_np is not None:
-            model.fit(loader_tr.load(), steps_per_epoch=1, epochs=1, verbose=0)
-            model.set_weights(saved_weights_np)
-            loader_tr = DisjointLoader(data_chunk, node_level=True, batch_size=args.batch_size)
-            loader_va = DisjointLoader(data_va,    node_level=True, batch_size=args.batch_size)
+        for chunk_idx, chunk_flat in enumerate(chunks):
+            chunk_file = os.path.join(tmpdir, f"chunk_{chunk_idx:04d}.json")
+            val_npz_file = os.path.join(tmpdir, f"validation_{chunk_idx:04d}.npz")
+            with open(chunk_file, "w", encoding="utf-8") as f:
+                json.dump(np.asarray(chunk_flat, dtype=np.int64).tolist(), f)
 
-        n_epochs = args.chunk_epochs if args.chunk_epochs is not None else 10_000
-        if args.chunk_epochs is not None:
-            cbs = []
-            val_kwargs = {}
-        else:
-            cbs = [
-                EarlyStopping(monitor='val_loss', patience=chunk_patience,
-                              restore_best_weights=True, verbose=1),
-                ReduceLROnPlateau(monitor='val_loss', patience=args.lr_patience,
-                                  min_delta=1e-8, verbose=1),
+            print(f"\n{'='*60}")
+            print(f"  Chunk {chunk_idx+1}/{n_chunks} | {len(chunk_flat)} trajectories | RAM: {_mem_mb():.0f} MB")
+            print(f"{'='*60}")
+            if chunk_mixes is not None:
+                print(f">>> Chunk octant mix: {chunk_mixes[chunk_idx]}")
+            print(f">>> Generating fresh validation set for chunk {chunk_idx+1}/{n_chunks} ({args.va_set_size} centers)...")
+            data_va_chunk = make_validation_dataset_3d(args)
+            save_dataset_npz_3d(data_va_chunk, val_npz_file, n_boids_cache)
+            del data_va_chunk
+            gc.collect()
+
+            cmd = [
+                sys.executable,
+                "-m",
+                "boids.run_boids_3d",
+                "--_chunk_worker",
+                "--_chunk_idx", str(chunk_idx),
+                "--_chunk_indices_file", chunk_file,
+                "--_cache_paths_file", cache_paths_file,
+                "--_checkpoint_path", checkpoint_path,
+                "--_n_boids_cache", str(n_boids_cache),
+                "--_boundaries_file", boundaries_file,
+                "--_val_npz_file", val_npz_file,
+                "--_training_state_dir", training_state_dir,
+                "--lr", str(args.lr),
+                "--batch_size", str(args.batch_size),
+                "--epochs", "10000",
+                "--es_patience", str(chunk_patience),
+                "--lr_patience", str(args.lr_patience),
+                "--lr_red_factor", str(args.lr_red_factor),
+                "--min_lr", str(args.min_lr),
+                "--n_boids", str(args.n_boids),
+                "--loss_type", args.loss_type,
+                "--critical_distance", str(args.critical_distance),
+                "--distance_weight", str(args.distance_weight),
+                "--timestep_stride", str(stride),
+                "--near_goal_radius", str(near_goal_r),
+                "--perception", str(args.perception),
+                "--shuffle_buffer_size", str(args.shuffle_buffer_size),
+                "--packed_shard_batches", str(args.packed_shard_batches),
+                "--steps_per_execution", str(args.steps_per_execution),
             ]
-            val_kwargs = {'validation_data': loader_va.load(),
-                          'validation_steps': loader_va.steps_per_epoch}
+            if args.eager_training:
+                cmd.append("--eager_training")
+            if args.chunk_epochs is not None:
+                cmd.extend(["--chunk_epochs", str(args.chunk_epochs)])
+            if args.init_weights:
+                cmd.extend(["--init_weights", args.init_weights])
 
-        model.fit(loader_tr.load(), steps_per_epoch=loader_tr.steps_per_epoch,
-                  epochs=n_epochs, callbacks=cbs, **val_kwargs)
+            result = subprocess.run(cmd)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Chunk worker {chunk_idx + 1}/{n_chunks} failed with "
+                    f"exit code {result.returncode}"
+                )
+            if os.path.exists(val_npz_file):
+                os.remove(val_npz_file)
+            gc.collect()
+            print(f"  Parent RAM after chunk process exited: {_mem_mb():.0f} MB")
 
-        saved_weights_np = model.get_weights()
-        saved_lr = float(tf.keras.backend.get_value(model.optimizer.learning_rate))
-
-        del data_chunk, loader_tr, loader_va, model
-        gc.collect()
-        print(f"  RAM after cleanup: {_mem_mb():.0f} MB")
-
-    # Reconstruct final model
-    tf.keras.backend.clear_session()
-    gc.collect()
-    final_model = _build_model_3d(saved_lr)
-    loader_va_build = DisjointLoader(data_va, node_level=True, batch_size=args.batch_size)
-    final_model.fit(loader_va_build.load(), steps_per_epoch=1, epochs=1, verbose=0)
-    del loader_va_build
-    final_model.set_weights(saved_weights_np)
+    final_model = _build_model_3d(args.lr)
+    _build_model_variables_3d(final_model, n_boids_cache)
+    final_model.load_weights(checkpoint_path).expect_partial()
     final_model.save_weights(checkpoint_path)
     print(f"Saved final weights to {checkpoint_path}")
     return final_model
@@ -271,7 +798,16 @@ def run(data_tr, data_va, run_tag=""):
     )
     optimizer = Adam(learning_rate=args.lr)
     loss_fn = lambda y_true, y_pred: custom_weighted_mse_3d(y_true, y_pred)
-    model.compile(optimizer=optimizer, loss=loss_fn, run_eagerly=True)
+    model.compile(
+        optimizer=optimizer,
+        loss=loss_fn,
+        run_eagerly=args.eager_training,
+        steps_per_execution=args.steps_per_execution,
+    )
+    if args.init_weights:
+        _build_model_variables_3d(model, args.n_boids)
+        model.load_weights(args.init_weights).expect_partial()
+        print(f">>> Initialized model from weights: {args.init_weights}")
 
     loader_tr = DisjointLoader(data_tr, node_level=True, batch_size=args.batch_size)
     loader_va = DisjointLoader(data_va, node_level=True, batch_size=args.batch_size)
@@ -280,14 +816,15 @@ def run(data_tr, data_va, run_tag=""):
     best_after50_cb = BestAfterEpochCallback3D(save_path=checkpoint_path, min_epoch=args.best_after_epoch)
 
     history = model.fit(
-        loader_tr.load(),
+        loader_tr.load().map(add_graph_ids_to_targets_3d),
         steps_per_epoch=loader_tr.steps_per_epoch,
         epochs=args.epochs,
-        validation_data=loader_va.load(),
+        validation_data=loader_va.load().map(add_graph_ids_to_targets_3d),
         validation_steps=loader_va.steps_per_epoch,
         callbacks=[
             EarlyStopping(patience=args.es_patience, restore_best_weights=True, verbose=1),
-            ReduceLROnPlateau(patience=args.lr_patience, min_delta=1e-8, verbose=1),
+            ReduceLROnPlateau(patience=args.lr_patience, factor=args.lr_red_factor,
+                              min_lr=args.min_lr, min_delta=1e-8, verbose=1),
             best_after50_cb,
         ],
     )
@@ -304,11 +841,22 @@ parser.add_argument("--epochs", default=1000000, type=int)
 parser.add_argument("--chunk_epochs", default=None, type=int,
                    help="Fixed epochs per chunk (overrides early stopping). Use for debugging.")
 parser.add_argument("--es_patience", default=12, type=int)
-parser.add_argument("--lr_patience", default=10, type=int)
+parser.add_argument("--lr_patience", default=5, type=int,
+                   help="Epochs without improvement before reducing LR; keep below chunk_patience.")
 parser.add_argument("--lr_red_factor", default=0.1, type=float)
+parser.add_argument("--min_lr", default=1e-6, type=float,
+                   help="Minimum learning-rate floor for ReduceLROnPlateau.")
 parser.add_argument("--n_boids", default=100, type=int)
 parser.add_argument("--tr_set_unique", default=20, type=int)
-parser.add_argument("--tr_set_repeats", default=50, type=int)
+parser.add_argument(
+    "--tr_set_repeats",
+    default=50,
+    type=int,
+    help=(
+        "Training exposures per selected center. If this exceeds the cache's "
+        "repeat count, cached trajectories are cycled for reinforcement."
+    ),
+)
 parser.add_argument("--va_set_size", default=10, type=int)
 parser.add_argument("--te_set_size", default=30, type=int)
 parser.add_argument("--loss_type", default="oldl", choices=["oldl", "newl"],
@@ -318,27 +866,66 @@ parser.add_argument("--distance_weight", default=2.5, type=float)
 parser.add_argument("--viz_mode", default="tubular", choices=["tubular", "per_boid", "multi_tubular", "individual"])
 # ── Chunk worker args (internal use, passed by run_chunked_3d subprocess) ──
 parser.add_argument("--_chunk_worker", action="store_true", default=False)
+parser.add_argument("--_chunk_idx", default=0, type=int)
 parser.add_argument("--_chunk_indices_file", default=None)
-parser.add_argument("--_cache_path", default=None)
+parser.add_argument("--_cache_paths_file", default=None)
 parser.add_argument("--_checkpoint_path", default=None)
 parser.add_argument("--_n_boids_cache", default=None, type=int)
 parser.add_argument("--_boundaries_file", default=None)
 parser.add_argument("--_val_indices_file", default=None)
 parser.add_argument("--_val_npz_file", default=None)
+parser.add_argument("--_training_state_dir", default=None)
 parser.add_argument("--noise_tag", default="", type=str)
 parser.add_argument("--init_centers_npz", default="", type=str)
-parser.add_argument("--boids_cache", default="", type=str)
+parser.add_argument(
+    "--boids_cache",
+    nargs="+",
+    default=None,
+    help="One or more compatible HDF5 caches used directly during chunked training.",
+)
+parser.add_argument("--init_weights", default="", type=str,
+                   help="Optional checkpoint prefix to initialize training from.")
 parser.add_argument("--timestep_stride", default=1, type=int)
 parser.add_argument("--near_goal_radius", default=1.0, type=float)
+parser.add_argument("--perception", default=0.1, type=float,
+                   help="Neighbor radius required of cached adjacency matrices.")
+parser.add_argument("--shuffle_buffer_size", default=4096, type=int,
+                   help="Number of individual timesteps mixed before packed batching.")
+parser.add_argument("--packed_shard_batches", default=16, type=int,
+                   help="Number of packed mini-batches stored in each temporary shard.")
+parser.add_argument("--steps_per_execution", default=10, type=int,
+                   help="Compiled optimizer steps run per Keras/Python dispatch.")
+parser.add_argument("--eager_training", action="store_true",
+                   help="Debug training eagerly instead of using the faster compiled graph.")
 parser.add_argument("--chunk_size", default=100, type=int)
 parser.add_argument("--chunk_patience", default=15, type=int)
 parser.add_argument("--best_after_epoch", default=50, type=int,
                    help="Non-chunked only: save best val_loss checkpoint after this epoch (default: 50).")
 parser.add_argument("--train_octants", type=int, nargs="+", default=None)
+parser.add_argument(
+    "--octant_unique_counts",
+    type=int,
+    nargs="+",
+    default=None,
+    help=(
+        "Optional unique-center count for each --train_octants entry. "
+        "Use this for focus-octant training with balanced replay."
+    ),
+)
 parser.add_argument("--viz_n_centers", default=50, type=int)
 parser.add_argument("--viz_centers_source", default="trained", choices=["trained", "unseen_cache", "random", "fresh_octant"])
 parser.add_argument("--skip_trained_viz", action="store_true", default=False,
                    help="Skip computing trajectories from trained centers during evaluation.")
+parser.add_argument("--skip_evaluation", action="store_true", default=False,
+                   help="Skip post-training evaluation/visualization.")
+parser.add_argument("--eval_centers_per_octant", default=10, type=int,
+                   help="Fresh unseen centers sampled per evaluated octant after training.")
+parser.add_argument("--eval_output_dir", default="", type=str,
+                   help="Post-training inference directory. Defaults to inference_3d_<run_tag>.")
+parser.add_argument("--eval_max_steps", default=3000, type=int)
+parser.add_argument("--eval_success_threshold", default=0.5, type=float)
+parser.add_argument("--eval_max_success_r", default=2.0, type=float)
+parser.add_argument("--eval_seed", default=None, type=int)
 
 
 ####################################################################################
@@ -346,16 +933,83 @@ parser.add_argument("--skip_trained_viz", action="store_true", default=False,
 ####################################################################################
 args = parser.parse_args()
 
+if args.tr_set_repeats < 1:
+    raise ValueError("--tr_set_repeats must be at least 1.")
+if args.train_octants is not None and len(set(args.train_octants)) != len(args.train_octants):
+    raise ValueError("--train_octants must not contain duplicates.")
+if args.octant_unique_counts is not None:
+    if args.train_octants is None:
+        raise ValueError("--octant_unique_counts requires --train_octants.")
+    if len(args.octant_unique_counts) != len(args.train_octants):
+        raise ValueError(
+            "--octant_unique_counts must provide one count per --train_octants entry."
+        )
+    if any(count < 1 for count in args.octant_unique_counts):
+        raise ValueError("Every --octant_unique_counts value must be positive.")
+    if sum(args.octant_unique_counts) != args.tr_set_unique:
+        raise ValueError(
+            "The sum of --octant_unique_counts must equal --tr_set_unique."
+        )
+if args.min_lr <= 0:
+    raise ValueError("--min_lr must be greater than 0.")
+if args.min_lr > args.lr:
+    raise ValueError("--min_lr cannot exceed --lr.")
+if args.steps_per_execution < 1:
+    raise ValueError("--steps_per_execution must be at least 1.")
+
+if (
+    not args._chunk_worker
+    and args.chunk_size > 0
+    and args.chunk_epochs is None
+    and args.lr_patience >= args.chunk_patience
+):
+    raise ValueError(
+        "--lr_patience must be smaller than --chunk_patience so the reduced "
+        "learning rate is used before early stopping."
+    )
+
 # ── Chunk worker mode (subprocess per chunk) ─────────────────────────────────
 if args._chunk_worker:
     UPWEIGHT_NEAR_GOAL = (args.loss_type == "newl")
-    chunk_flat = np.array(json.load(open(args._chunk_indices_file)))
-    boundaries = np.load(args._boundaries_file)
-    data_chunk = load_chunk_from_cache_3d(
-        args._cache_path, chunk_flat, boundaries, args._n_boids_cache,
-        timestep_stride=args.timestep_stride, near_goal_radius=args.near_goal_radius,
+    setup_t0 = time.time()
+    with open(args._chunk_indices_file, encoding="utf-8") as f:
+        chunk_refs = np.asarray(json.load(f), dtype=np.int64).reshape(-1, 2)
+    with open(args._cache_paths_file, encoding="utf-8") as f:
+        worker_cache_paths = json.load(f)
+    with np.load(args._boundaries_file) as boundary_data:
+        boundaries_by_cache = [
+            boundary_data[f"cache_{cache_idx}"]
+            for cache_idx in range(len(worker_cache_paths))
+        ]
+
+    worker_tmpdir = tempfile.mkdtemp(prefix="gnca_3d_worker_batches_")
+    atexit.register(shutil.rmtree, worker_tmpdir, ignore_errors=True)
+    print(
+        f">>> Worker setup: {len(chunk_refs)} trajectories from "
+        f"{len(worker_cache_paths)} cache(s), "
+        f"batch_size={args.batch_size}, stride={args.timestep_stride}, "
+        f"near_goal_radius={args.near_goal_radius}",
+        flush=True,
     )
-    loader_tr = DisjointLoader(data_chunk, node_level=True, batch_size=args.batch_size)
+    print(">>> Worker setup: writing compact train batch shards...", flush=True)
+    train_shard_paths, train_steps = write_cached_chunk_shards_3d(
+        worker_cache_paths, chunk_refs, boundaries_by_cache, args._n_boids_cache,
+        args.batch_size,
+        os.path.join(worker_tmpdir, "train_batches"),
+        timestep_stride=args.timestep_stride, near_goal_radius=args.near_goal_radius,
+        perception=args.perception, shuffle_buffer_size=args.shuffle_buffer_size,
+        batches_per_shard=args.packed_shard_batches,
+    )
+    print(
+        f">>> Worker setup: wrote {train_steps} train batches in "
+        f"{len(train_shard_paths)} compact shards in "
+        f"{time.time() - setup_t0:.1f}s",
+        flush=True,
+    )
+    train_data = dataset_from_batch_shards_3d(train_shard_paths).map(
+        add_graph_ids_to_targets_3d,
+        num_parallel_calls=tf.data.AUTOTUNE,
+    ).prefetch(tf.data.AUTOTUNE)
 
     # Load validation data from serialized npz if provided and not fixed-epoch mode
     use_val = (args.chunk_epochs is None) and (args._val_npz_file is not None)
@@ -374,9 +1028,42 @@ if args._chunk_worker:
         data_val = BoidsDataset3D(_va_graphs)
         loader_va = DisjointLoader(data_val, node_level=True, batch_size=args.batch_size)
 
+    if args._training_state_dir is None:
+        raise RuntimeError("Chunk worker requires --_training_state_dir")
+
     model = _build_model_3d(args.lr)
-    if os.path.exists(args._checkpoint_path + ".index"):
-        model.load_weights(args._checkpoint_path).expect_partial()
+    _build_model_variables_3d(model, args._n_boids_cache)
+    training_checkpoint = tf.train.Checkpoint(
+        model=model,
+        optimizer=model.optimizer,
+    )
+    training_state_manager = tf.train.CheckpointManager(
+        training_checkpoint,
+        args._training_state_dir,
+        max_to_keep=1,
+    )
+
+    if args._chunk_idx > 0:
+        if training_state_manager.latest_checkpoint is None:
+            raise RuntimeError(
+                f"No complete training-state checkpoint available for chunk "
+                f"{args._chunk_idx + 1}"
+            )
+        training_checkpoint.restore(
+            training_state_manager.latest_checkpoint
+        ).expect_partial()
+        restored_lr = float(tf.keras.backend.get_value(model.optimizer.learning_rate))
+        restored_step = int(tf.keras.backend.get_value(model.optimizer.iterations))
+        print(
+            f">>> Worker restored model + Adam state from "
+            f"{training_state_manager.latest_checkpoint} "
+            f"(lr={restored_lr:g}, optimizer_step={restored_step})"
+        )
+    elif args.init_weights:
+        model.load_weights(args.init_weights).expect_partial()
+        print(f">>> Worker initialized from seed weights: {args.init_weights}")
+    elif args._chunk_idx == 0 and os.path.exists(args._checkpoint_path + ".index"):
+        print(f">>> Worker starting fresh for chunk 1; ignoring stale checkpoint: {args._checkpoint_path}")
     n_epochs = args.chunk_epochs if args.chunk_epochs is not None else args.epochs
 
     if args.chunk_epochs is not None:
@@ -384,28 +1071,61 @@ if args._chunk_worker:
         cbs = []
         val_kwargs = {}
     elif use_val:
+        best_state_cb = BestTrainingStateCallback3D(
+            training_state_manager,
+            monitor="val_loss",
+        )
         cbs = [
-            EarlyStopping(monitor='val_loss', patience=args.es_patience,
-                          restore_best_weights=True, verbose=1),
+            best_state_cb,
             ReduceLROnPlateau(monitor='val_loss', patience=args.lr_patience,
+                              factor=args.lr_red_factor, min_lr=args.min_lr,
                               min_delta=1e-8, verbose=1),
+            EarlyStopping(monitor='val_loss', patience=args.es_patience,
+                          restore_best_weights=False, verbose=1),
         ]
-        val_kwargs = {'validation_data': loader_va.load(),
+        val_kwargs = {'validation_data': loader_va.load().map(add_graph_ids_to_targets_3d),
                       'validation_steps': loader_va.steps_per_epoch}
     else:
+        best_state_cb = BestTrainingStateCallback3D(
+            training_state_manager,
+            monitor="loss",
+        )
         cbs = [
-            EarlyStopping(monitor='loss', patience=args.es_patience,
-                          restore_best_weights=True, verbose=1),
+            best_state_cb,
             ReduceLROnPlateau(monitor='loss', patience=args.lr_patience,
+                              factor=args.lr_red_factor, min_lr=args.min_lr,
                               min_delta=1e-8, verbose=1),
+            EarlyStopping(monitor='loss', patience=args.es_patience,
+                          restore_best_weights=False, verbose=1),
         ]
         val_kwargs = {}
 
     model.fit(
-        loader_tr.load(), steps_per_epoch=loader_tr.steps_per_epoch,
+        train_data, steps_per_epoch=train_steps,
         epochs=n_epochs, callbacks=cbs, **val_kwargs,
     )
+
+    if args.chunk_epochs is not None:
+        training_state_manager.save()
+    elif best_state_cb.best_epoch is None:
+        raise RuntimeError("Chunk did not produce a checkpointable training metric")
+    else:
+        training_checkpoint.restore(
+            training_state_manager.latest_checkpoint
+        ).expect_partial()
+        print(
+            f">>> Restored best complete state from epoch "
+            f"{best_state_cb.best_epoch} ({best_state_cb.monitor}={best_state_cb.best:.6g})"
+        )
+
     model.save_weights(args._checkpoint_path)
+    final_lr = float(tf.keras.backend.get_value(model.optimizer.learning_rate))
+    final_step = int(tf.keras.backend.get_value(model.optimizer.iterations))
+    print(
+        f">>> Worker checkpoint: lr={final_lr:g}, optimizer_step={final_step}",
+        flush=True,
+    )
+    shutil.rmtree(worker_tmpdir, ignore_errors=True)
     sys.exit(0)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -419,11 +1139,17 @@ noise_config = args.noise_tag
 train_init_centers = load_init_centers_from_npz(args.init_centers_npz)
 effective_unique_reps = len(train_init_centers) if train_init_centers is not None else args.tr_set_unique
 
-boids_cache = args.boids_cache if args.boids_cache else None
-if boids_cache:
-    with h5py.File(boids_cache, 'r') as _f:
-        cache_total_unique = int(_f.attrs["unique_reps"])
-    print(f">>> Using precomputed 3D cache: {boids_cache} ({cache_total_unique} total unique centers, training on {effective_unique_reps})")
+boids_caches = args.boids_cache or []
+if boids_caches:
+    cache_total_unique = 0
+    for cache_path in boids_caches:
+        with h5py.File(cache_path, "r") as cache_file:
+            cache_total_unique += int(cache_file.attrs["unique_reps"])
+    print(
+        f">>> Using {len(boids_caches)} precomputed 3D cache(s): "
+        f"{cache_total_unique} total unique centers available, "
+        f"training on {effective_unique_reps}"
+    )
 
 # Build run tag
 run_tag = build_run_tag_3d(
@@ -438,32 +1164,78 @@ run_tag = build_run_tag_3d(
 # Print parameters
 print_run_parameters_3d(args, UPWEIGHT_NEAR_GOAL, args.critical_distance, args.distance_weight, noise_config, run_tag)
 
-# Validation set (always fresh random)
-print(f"\n>>> Generating validation set ({args.va_set_size} centers)...")
-data_va = make_dataset_3d(
-    unique_reps=args.va_set_size,
-    repeat_reps=1,
-    save_config=False,
-    n_boids=args.n_boids,
-    n_jobs=1,
-    random_init=True,
-)
+use_chunked = args.chunk_size > 0 and bool(boids_caches)
+data_va = None
 
-use_chunked = args.chunk_size > 0 and boids_cache is not None
+if not use_chunked and len(boids_caches) > 1:
+    raise ValueError("Multiple --boids_cache files currently require chunked training.")
+
+if not use_chunked:
+    # Validation set
+    print(f"\n>>> Generating validation set ({args.va_set_size} centers)...")
+    data_va = make_validation_dataset_3d(args)
 
 if use_chunked:
-    print(f"\n>>> Chunked training from cache: {boids_cache}")
-    with h5py.File(boids_cache, 'r') as _f:
-        n_boids_cache   = int(_f.attrs['n_boids'])
-        cache_unique    = int(_f.attrs['unique_reps'])
-        cache_repeats   = int(_f.attrs['repeats'])
-        if 'traj_lengths' in _f:
-            boundaries = np.concatenate([[0], np.cumsum(_f['traj_lengths'][:])])
-        else:
-            total_s = _f['x'].shape[0]
-            spt = total_s // (cache_unique * cache_repeats)
-            boundaries = np.arange(cache_unique * cache_repeats + 1) * spt
-        centers_all = _f['centers'][:]
+    print(f"\n>>> Chunked training directly from caches: {boids_caches}")
+    boundaries_by_cache = []
+    cache_repeats_by_cache = []
+    center_cache_ids = []
+    center_local_indices = []
+    center_arrays = []
+    n_boids_cache = None
+
+    for cache_idx, cache_path in enumerate(boids_caches):
+        with h5py.File(cache_path, "r") as cache_file:
+            this_n_boids = int(cache_file.attrs["n_boids"])
+            cache_unique = int(cache_file.attrs["unique_reps"])
+            cache_repeats = int(cache_file.attrs["repeats"])
+            if cache_repeats < 1:
+                raise ValueError(
+                    f"Cache '{cache_path}' must contain at least one trajectory per center."
+                )
+            if n_boids_cache is None:
+                n_boids_cache = this_n_boids
+            elif this_n_boids != n_boids_cache:
+                raise ValueError(
+                    f"Cache '{cache_path}' has {this_n_boids} boids; "
+                    f"expected {n_boids_cache}."
+                )
+
+            if "traj_lengths" in cache_file:
+                boundaries = np.concatenate(
+                    [[0], np.cumsum(cache_file["traj_lengths"][:], dtype=np.int64)]
+                )
+            else:
+                total_samples = cache_file["x"].shape[0]
+                samples_per_trajectory = total_samples // (cache_unique * cache_repeats)
+                boundaries = (
+                    np.arange(cache_unique * cache_repeats + 1, dtype=np.int64)
+                    * samples_per_trajectory
+                )
+
+            centers = cache_file["centers"][:]
+            if len(centers) != cache_unique:
+                raise ValueError(
+                    f"Cache '{cache_path}' center count does not match unique_reps."
+                )
+
+        boundaries_by_cache.append(boundaries)
+        cache_repeats_by_cache.append(cache_repeats)
+        center_arrays.append(centers)
+        center_cache_ids.extend([cache_idx] * cache_unique)
+        center_local_indices.extend(range(cache_unique))
+
+        if args.tr_set_repeats > cache_repeats:
+            print(
+                f">>> Training-time reinforcement for '{cache_path}': requesting "
+                f"{args.tr_set_repeats} exposures from {cache_repeats} cached "
+                "trajectory/trajectories per center; cached trajectories will be cycled."
+            )
+
+    centers_all = np.concatenate(center_arrays, axis=0)
+    center_cache_ids = np.asarray(center_cache_ids, dtype=np.int64)
+    center_local_indices = np.asarray(center_local_indices, dtype=np.int64)
+    cache_unique_total = len(centers_all)
 
     # Filter by octants if requested
     if args.train_octants is not None:
@@ -473,34 +1245,77 @@ if use_chunked:
                 if xmn <= c[0] < xmx and ymn <= c[1] < ymx and zmn <= c[2] < zmx:
                     return oi
             return -1
-        keep_mask = np.array([_center_octant(centers_all[i]) in args.train_octants
-                              for i in range(cache_unique)])
-        train_center_indices = np.where(keep_mask)[0]
-        # Subsample to effective_unique_reps if requested
-        if effective_unique_reps < len(train_center_indices):
-            train_center_indices = np.random.choice(train_center_indices, size=effective_unique_reps, replace=False)
+        center_buckets = {o: [] for o in args.train_octants}
+        for ci in range(cache_unique_total):
+            oi = _center_octant(centers_all[ci])
+            if oi in center_buckets:
+                center_buckets[oi].append(ci)
+
+        if args.octant_unique_counts is not None:
+            requested_counts = dict(zip(args.train_octants, args.octant_unique_counts))
+        else:
+            n_per_o = effective_unique_reps // len(args.train_octants)
+            remainder = effective_unique_reps % len(args.train_octants)
+            requested_counts = {
+                o: n_per_o + (1 if i < remainder else 0)
+                for i, o in enumerate(args.train_octants)
+            }
+        selected_center_indices = []
+        selected_counts = {}
+        for i, o in enumerate(args.train_octants):
+            bucket = np.array(center_buckets[o], dtype=np.int64)
+            np.random.shuffle(bucket)
+            take = requested_counts[o]
+            if take > len(bucket):
+                raise ValueError(
+                    f"Requested {take} unique centers from octant {o}, "
+                    f"but cache only has {len(bucket)}."
+                )
+            picked = bucket[:take]
+            selected_center_indices.extend(picked.tolist())
+            selected_counts[o] = len(picked)
+
+        train_center_indices = np.array(selected_center_indices, dtype=np.int64)
+        np.random.shuffle(train_center_indices)
+        print(f">>> Balanced unique center selection by octant: {selected_counts}")
+
         octant_buckets = {o: [] for o in args.train_octants}
         for ci in train_center_indices:
             oi = _center_octant(centers_all[ci])
-            for ri in range(cache_repeats):
-                octant_buckets[oi].append(ci * cache_repeats + ri)
+            cache_idx = int(center_cache_ids[ci])
+            local_center_idx = int(center_local_indices[ci])
+            cache_repeats = cache_repeats_by_cache[cache_idx]
+            for exposure_idx in range(args.tr_set_repeats):
+                cached_repeat_idx = exposure_idx % cache_repeats
+                octant_buckets[oi].append(
+                    (cache_idx, local_center_idx * cache_repeats + cached_repeat_idx)
+                )
     else:
-        train_center_indices = np.arange(min(cache_unique, effective_unique_reps))
+        train_center_indices = np.arange(min(cache_unique_total, effective_unique_reps))
         octant_buckets = None
 
     boids_tr = Boids3D(n_boids=args.n_boids)
     boids_tr.rand_configs = [np.array(centers_all[i], dtype=np.float32) for i in train_center_indices]
 
-    all_flat_indices = np.array([
-        ci * cache_repeats + ri
-        for ci in train_center_indices
-        for ri in range(cache_repeats)
-    ])
-    np.random.shuffle(all_flat_indices)
+    all_trajectory_refs = []
+    for ci in train_center_indices:
+        cache_idx = int(center_cache_ids[ci])
+        local_center_idx = int(center_local_indices[ci])
+        cache_repeats = cache_repeats_by_cache[cache_idx]
+        for exposure_idx in range(args.tr_set_repeats):
+            all_trajectory_refs.append(
+                (
+                    cache_idx,
+                    local_center_idx * cache_repeats
+                    + (exposure_idx % cache_repeats),
+                )
+            )
+    all_trajectory_refs = np.asarray(all_trajectory_refs, dtype=np.int64)
+    np.random.shuffle(all_trajectory_refs)
 
     model = run_chunked_3d(
-        boids_cache, boundaries, n_boids_cache, all_flat_indices,
-        data_va, run_tag, args.chunk_size, args.chunk_patience,
+        boids_caches, boundaries_by_cache, n_boids_cache, all_trajectory_refs,
+        run_tag, args.chunk_size, args.chunk_patience,
         octant_buckets=octant_buckets
     )
     best_after50_cb = None
@@ -509,12 +1324,12 @@ else:
     data_tr, boids_tr = make_dataset_3d(
         unique_reps=effective_unique_reps,
         repeat_reps=args.tr_set_repeats,
-        save_config=train_init_centers is None and not boids_cache,
+        save_config=train_init_centers is None and not boids_caches,
         n_boids=args.n_boids,
         n_jobs=1,
         return_boids=True,
         random_init=train_init_centers if train_init_centers is not None else True,
-        boids_cache_npz=boids_cache,
+        boids_cache_npz=boids_caches[0] if boids_caches else None,
         timestep_stride=args.timestep_stride,
     )
     if train_init_centers is not None:
@@ -550,45 +1365,45 @@ if best_after50_cb is not None and best_after50_cb.best_epoch is not None:
     print(f"\n✅ Restoring best post-epoch-50 weights (epoch {best_after50_cb.best_epoch}, val_loss={best_after50_cb.best_val_loss:.6f})...")
     model.load_weights(checkpoint_path)
 
+if args.skip_evaluation:
+    print(">>> Skipping all post-training inference and visualization.")
+    sys.exit(0)
+
 ####################################################################################
 # Evaluation
 ####################################################################################
-max_trajectory_len = 3000
+eval_octants = args.train_octants if args.train_octants is not None else list(range(8))
+eval_output_dir = args.eval_output_dir or f"inference_3d_{run_tag}"
+eval_cmd = [
+    sys.executable,
+    "-m",
+    "boids.run_inference_3d",
+    "--run_tag",
+    run_tag,
+    "--octants",
+    *[str(octant) for octant in eval_octants],
+    "--centers_per_octant",
+    str(args.eval_centers_per_octant),
+    "--n_boids",
+    str(args.n_boids),
+    "--max_steps",
+    str(args.eval_max_steps),
+    "--success_threshold",
+    str(args.eval_success_threshold),
+    "--max_success_r",
+    str(args.eval_max_success_r),
+    "--output_dir",
+    eval_output_dir,
+    "--save_multi",
+    "--save_individual",
+]
+if args.eval_seed is not None:
+    eval_cmd.extend(["--seed", str(args.eval_seed)])
 
-# Assemble test centers for visualization
-if args.viz_centers_source == "trained":
-    test_centers = boids_tr.rand_configs[:args.viz_n_centers] if boids_tr.rand_configs else None
-    print(f">>> Viz test centers: {len(test_centers) if test_centers else 0} trained centers")
-elif args.viz_centers_source == "unseen_cache":
-    if not boids_tr.unseen_configs:
-        print("⚠️ No unseen_cache centers available. Falling back to random.")
-        test_centers = None
-    else:
-        test_centers = boids_tr.unseen_configs[:args.viz_n_centers]
-        print(f">>> Viz test centers: {len(test_centers)} unseen cache centers")
-elif args.viz_centers_source == "fresh_octant":
-    from boids.generate_boids_cache_3d import OCTANTS, build_exclusion_zone_3d
-    _boids_tmp = Boids3D(n_boids=args.n_boids)
-    _excl = build_exclusion_zone_3d(_boids_tmp.goal_positions, 0.5)
-    _octant_list = args.train_octants if args.train_octants is not None else list(range(8))
-    _n_per_oct = max(1, args.viz_n_centers // len(_octant_list))
-    test_centers = []
-    for _oi in _octant_list:
-        _xmn, _xmx, _ymn, _ymx, _zmn, _zmx, _ = OCTANTS[_oi]
-        _bounds = (_xmn, _xmx, _ymn, _ymx, _zmn, _zmx)
-        _q_centers = []
-        while len(_q_centers) < _n_per_oct:
-            _, _, _, _c = _boids_tmp.get_random_init(args.n_boids, save_config=False,
-                                                      bounds=_bounds, exclusion_zone=_excl)
-            _q_centers.append(_c)
-        test_centers.extend(_q_centers)
-    print(f">>> Viz test centers: {len(test_centers)} fresh octant centers ({_n_per_oct} per octant)")
-else:
-    test_centers = None
-    print(f">>> Viz test centers: random (fresh)")
-
-evaluate_3d(model, max_trajectory_len, args.n_boids,
-            saved_boids=boids_tr,
-            run_tag=run_tag, viz_mode=args.viz_mode,
-            test_centers=test_centers,
-            skip_trained_viz=args.skip_trained_viz)
+print(
+    f">>> Running post-training inference on {args.eval_centers_per_octant} "
+    f"fresh unseen centers per octant {eval_octants}."
+)
+print(f">>> Inference outputs: {eval_output_dir}")
+subprocess.run(eval_cmd, check=True)
+sys.exit(0)

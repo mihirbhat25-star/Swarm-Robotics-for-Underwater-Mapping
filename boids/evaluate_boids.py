@@ -4,20 +4,15 @@ Imports visualization functions from visualize_boids.
 """
 
 import matplotlib.pyplot as plt
-from matplotlib.animation import Animation, FFMpegWriter
 import nolds
 import numpy as np
 import os
 import tensorflow as tf
 from spektral.data import DisjointLoader
-from spektral.layers import ops
-from tensorflow.keras.models import load_model
 from modules.boids import make_dataset
 from modules.boids import Boids
-from shapely.geometry import LineString
-import random
 
-from boids.visualize_boids import save_tubular_triplet, _plot_per_boid, _plot_multi_tubular, _get_tube_exterior, _plot_individual_ranked
+from boids.visualize_boids import save_tubular_triplet, _plot_per_boid, _plot_multi_tubular, _plot_individual_ranked
 
 @tf.function(experimental_relax_shapes=True)
 def forward(model, x, a, i, training=None):

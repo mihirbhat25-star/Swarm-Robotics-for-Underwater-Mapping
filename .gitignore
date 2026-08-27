@@ -15,6 +15,7 @@ config.txt
 experimentation/
 
 # Generated and cached outputs
+chunk_tmp/
 results/
 saved_boids_tr/
 saved_datasets/

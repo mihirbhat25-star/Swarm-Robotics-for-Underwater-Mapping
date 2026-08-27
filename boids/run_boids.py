@@ -2,19 +2,33 @@
 Trains the GNCA to imitate the Boids algorithm.
 """
 import argparse
+import atexit
 import gc
 import os
+import sys
+import json
+import shutil
+import subprocess
+import tempfile
 import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
+import scipy.sparse as sp
 from spektral.data import DisjointLoader
+from spektral.data import Graph
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
 from boids.evaluate_boids import evaluate
 from boids.forward import forward
 from models.gnn_ca_simple_boids import GNNCASimpleBoids
-from modules.boids import make_dataset, Boids, load_chunk_from_cache
+from modules.boids import (
+    BOIDS_GOAL_POSITIONS,
+    Boids,
+    BoidsDataset,
+    load_chunk_from_cache,
+    make_dataset,
+)
 from modules.callbacks import ComplexityCallback
 import h5py
 import psutil
@@ -46,56 +60,44 @@ def load_init_centers_from_npz(npz_path):
     print(f"✅ Loaded {len(centers)} initial start centers from {npz_path}")
     return [np.array(c, dtype=np.float32) for c in centers]
 
-def confirm_centers_match_reference(candidate_centers, reference_path):
-    """Print a debug confirmation showing whether candidate centers match a reference run."""
-    if not candidate_centers:
-        print("⚠️ No candidate centers available for reference comparison.")
-        return
-    if not reference_path or not os.path.exists(reference_path):
-        print(f"⚠️ Reference centers file not found for comparison: {reference_path}")
-        return
-
-    if reference_path.endswith(".npz"):
-        reference_cache = np.load(reference_path, allow_pickle=True)
-        if "centers" not in reference_cache.files:
-            print(f"⚠️ Reference NPZ '{reference_path}' does not contain centers. Available keys: {reference_cache.files}")
-            return
-        reference_centers = np.array(reference_cache["centers"], dtype=np.float32)
-    else:
-        reference_boids = joblib.load(reference_path)
-        reference_centers = np.array(getattr(reference_boids, "rand_configs", []), dtype=np.float32)
-    candidate_arr = np.array(candidate_centers, dtype=np.float32)
-
-    if reference_centers.size == 0:
-        print(f"⚠️ Reference file '{reference_path}' does not contain rand_configs.")
-        return
-
-    same_shape = candidate_arr.shape == reference_centers.shape
-    same_values = same_shape and np.allclose(candidate_arr, reference_centers)
-    max_abs_diff = float(np.max(np.abs(candidate_arr - reference_centers))) if same_shape else float("nan")
-
-    print(
-        f"🔎 Center comparison vs '{reference_path}': "
-        f"same_shape={same_shape}, same_values={same_values}, max_abs_diff={max_abs_diff:.8f}"
-    )
-
 def custom_weighted_mse(y_true, y_pred):
-    # y_true is [current_state, next_state, current_goal_pos], y_pred is predicted next_state
+    # y_true is [current_state, next_state, current_goal_pos, graph_id].
+    # Weighting uses distance to the nearest waypoint so the departure turn
+    # remains emphasized immediately after the active-goal label switches.
     n_features = tf.shape(y_pred)[-1]
     current_state = y_true[..., :n_features]
     next_state = y_true[..., n_features:2*n_features]
-    # Current goal position is the last 2 columns (broadcast to all nodes, same value per timestep)
-    current_goal = y_true[..., 2*n_features:]
     mse = tf.reduce_mean(tf.square(next_state - y_pred), axis=-1)
 
-    # Compute average position and extract current goal (same for all nodes)
-    avg_pos = tf.reduce_mean(current_state[..., :2], axis=-2)
-    avg_goal = tf.reduce_mean(current_goal, axis=-2)  # all nodes share same goal value
-    dist_to_goal = tf.norm(avg_pos - avg_goal, axis=-1)
-
-    # Weight by the configured factor if within the configured critical distance of the goal.
-    goal_weight = tf.where(dist_to_goal < args.critical_distance, args.distance_weight, 1.0) if UPWEIGHT else 1.0
+    if UPWEIGHT:
+        graph_ids = tf.cast(y_true[..., 10], tf.int32)
+        n_graphs = tf.reduce_max(graph_ids) + 1
+        avg_pos = tf.math.unsorted_segment_mean(
+            current_state[..., :2], graph_ids, n_graphs
+        )
+        goals = tf.cast(BOIDS_GOAL_POSITIONS, avg_pos.dtype)
+        dist_to_goals = tf.norm(
+            avg_pos[:, None, :] - goals[None, :, :],
+            axis=-1,
+        )
+        dist_to_goal = tf.reduce_min(dist_to_goals, axis=1)
+        graph_weight = tf.where(
+            dist_to_goal < args.critical_distance,
+            tf.cast(args.distance_weight, mse.dtype),
+            tf.ones_like(dist_to_goal, dtype=mse.dtype),
+        )
+        goal_weight = tf.gather(graph_weight, graph_ids)
+    else:
+        goal_weight = 1.0
     return mse * goal_weight
+
+
+def add_graph_ids_to_targets(inputs, targets):
+    """Append Spektral's disjoint graph id for graph-specific loss weights."""
+    graph_ids = tf.cast(inputs[2], targets.dtype)
+    targets = tf.concat([targets, graph_ids[:, None]], axis=-1)
+    targets = tf.ensure_shape(targets, [None, 11])
+    return inputs, targets
 
 
 def build_run_tag(unique_reps, tr_repeats, upweight, critical_distance, distance_weight, noise_config):
@@ -159,6 +161,230 @@ def _build_model(lr):
     )
     m.compile(optimizer=Adam(learning_rate=lr), loss=custom_weighted_mse, run_eagerly=True)
     return m
+
+
+def _build_model_variables(model, n_boids):
+    """Run a dummy forward pass so Keras variables exist before load_weights."""
+    x_dummy = tf.zeros((n_boids, 4), dtype=tf.float32)
+    a_dummy = tf.SparseTensor(
+        indices=tf.zeros((0, 2), dtype=tf.int64),
+        values=tf.zeros((0,), dtype=tf.float32),
+        dense_shape=(n_boids, n_boids),
+    )
+    model([x_dummy, tf.sparse.reorder(a_dummy), tf.constant(0)], training=False)
+
+
+def save_dataset_npz(dataset, path, n_boids):
+    """Serialize a small Spektral dataset for subprocess validation."""
+    graphs = list(dataset.graphs)
+    max_edges = max((g.a.nnz for g in graphs), default=0)
+    x = np.stack([g.x for g in graphs], axis=0).astype(np.float32)
+    y = np.stack([g.y for g in graphs], axis=0).astype(np.float32)
+    a_row = np.full((len(graphs), max_edges), -1, dtype=np.int32)
+    a_col = np.full((len(graphs), max_edges), -1, dtype=np.int32)
+    a_len = np.zeros(len(graphs), dtype=np.int32)
+
+    for i, g in enumerate(graphs):
+        a = g.a.tocoo()
+        nnz = a.nnz
+        a_row[i, :nnz] = a.row
+        a_col[i, :nnz] = a.col
+        a_len[i] = nnz
+
+    np.savez_compressed(
+        path,
+        x=x,
+        y=y,
+        a_row=a_row,
+        a_col=a_col,
+        a_len=a_len,
+        n_boids=np.array([n_boids], dtype=np.int32),
+    )
+
+
+def load_dataset_npz(path):
+    """Rebuild a BoidsDataset from a serialized validation NPZ."""
+    data = np.load(path)
+    x, y = data["x"], data["y"]
+    a_row, a_col, a_len = data["a_row"], data["a_col"], data["a_len"]
+    n_boids = int(data["n_boids"][0])
+    graphs = []
+    for i in range(len(x)):
+        nnz = int(a_len[i])
+        a = sp.coo_matrix(
+            (np.ones(nnz, dtype=np.float32), (a_row[i, :nnz], a_col[i, :nnz])),
+            shape=(n_boids, n_boids),
+        )
+        graphs.append(Graph(x=x[i], a=a, y=y[i]))
+    return BoidsDataset(graphs)
+
+
+def make_disjoint_batch(x_list, y_list, row_list, col_list, len_list, n_boids):
+    """Pack per-timestep cached arrays into one disjoint sparse mini-batch."""
+    batch_size = len(x_list)
+    x = np.concatenate(x_list, axis=0).astype(np.float32)
+    y = np.concatenate(y_list, axis=0).astype(np.float32)
+
+    edge_rows = []
+    edge_cols = []
+    for b, (rows, cols, nnz) in enumerate(zip(row_list, col_list, len_list)):
+        nnz = int(nnz)
+        if nnz <= 0:
+            continue
+        offset = b * n_boids
+        edge_rows.append(rows[:nnz].astype(np.int64) + offset)
+        edge_cols.append(cols[:nnz].astype(np.int64) + offset)
+
+    if edge_rows:
+        indices = np.stack([np.concatenate(edge_rows), np.concatenate(edge_cols)], axis=1)
+        order = np.lexsort((indices[:, 1], indices[:, 0]))
+        indices = indices[order]
+        values = np.ones(indices.shape[0], dtype=np.float32)
+    else:
+        indices = np.zeros((0, 2), dtype=np.int64)
+        values = np.zeros((0,), dtype=np.float32)
+
+    n_nodes = batch_size * n_boids
+    dense_shape = np.array([n_nodes, n_nodes], dtype=np.int64)
+    step_i = np.repeat(np.arange(batch_size), n_boids).astype(np.int64)
+    return (x, indices, values, dense_shape, step_i), y
+
+
+def batch_to_tf_sparse(batch):
+    """Convert a compact NumPy disjoint batch into model-ready TensorFlow inputs."""
+    (x, indices, values, dense_shape, step_i), y = batch
+    adj = tf.SparseTensor(indices=indices, values=values, dense_shape=dense_shape)
+    return (x, adj, step_i), y
+
+
+def _load_adaptive_xy(f, start, end, timestep_stride, near_goal_radius):
+    """Load selected states/targets without trusting the cached adjacency."""
+    if timestep_stride <= 1 or near_goal_radius <= 0:
+        return f["x"][start:end:timestep_stride], f["y"][start:end:timestep_stride]
+
+    x_full = f["x"][start:end]
+    y_full = f["y"][start:end]
+    mean_pos = x_full[:, :, :2].mean(axis=1)
+    dist_to_goal = np.min(
+        np.linalg.norm(
+            mean_pos[:, None, :] - BOIDS_GOAL_POSITIONS[None, :, :],
+            axis=-1,
+        ),
+        axis=1,
+    )
+
+    keep = np.zeros(end - start, dtype=bool)
+    keep[::timestep_stride] = True
+    keep |= dist_to_goal < near_goal_radius
+    return x_full[keep], y_full[keep]
+
+
+def _adjacency_indices_from_state(x, perception):
+    """Rebuild the graph from the current positions in one cached sample."""
+    positions = x[:, :2]
+    distances = np.linalg.norm(
+        positions[:, None, :] - positions[None, :, :], axis=-1
+    )
+    neighbors = distances < perception
+    np.fill_diagonal(neighbors, False)
+    return np.nonzero(neighbors)
+
+
+def write_cached_chunk_batches(cache_path, flat_indices, boundaries, n_boids, batch_size,
+                               output_dir, timestep_stride=1, near_goal_radius=1.0,
+                               perception=0.1, shuffle_buffer_size=4096):
+    """Write sample-shuffled disjoint batches with adjacency rebuilt from x."""
+    os.makedirs(output_dir, exist_ok=True)
+    batch_paths = []
+    x_batch, y_batch, row_batch, col_batch, len_batch = [], [], [], [], []
+    shuffle_buffer = []
+    shuffle_buffer_size = max(batch_size, int(shuffle_buffer_size))
+    rng = np.random.default_rng()
+
+    def flush_batch():
+        nonlocal x_batch, y_batch, row_batch, col_batch, len_batch
+        batch = make_disjoint_batch(
+            x_batch, y_batch, row_batch, col_batch, len_batch, n_boids
+        )
+        (x, indices, values, dense_shape, step_i), y = batch
+        path = os.path.join(output_dir, f"batch_{len(batch_paths):05d}.npz")
+        np.savez(
+            path,
+            x=x,
+            indices=indices,
+            values=values,
+            dense_shape=dense_shape,
+            step_i=step_i,
+            y=y,
+        )
+        batch_paths.append(path)
+        x_batch, y_batch, row_batch, col_batch, len_batch = [], [], [], [], []
+
+    def emit_sample(sample):
+        x, y, row, col = sample
+        x_batch.append(x)
+        y_batch.append(y)
+        row_batch.append(row)
+        col_batch.append(col)
+        len_batch.append(len(row))
+        if len(x_batch) == batch_size:
+            flush_batch()
+
+    def emit_random_buffered_sample():
+        sample_idx = int(rng.integers(len(shuffle_buffer)))
+        sample = shuffle_buffer[sample_idx]
+        shuffle_buffer[sample_idx] = shuffle_buffer[-1]
+        shuffle_buffer.pop()
+        emit_sample(sample)
+
+    with h5py.File(cache_path, "r") as f:
+        trajectory_order = rng.permutation(np.array(flat_indices, dtype=np.int64))
+        for flat_idx in trajectory_order:
+            start = int(boundaries[flat_idx])
+            end = int(boundaries[flat_idx + 1])
+            x_c, y_c = _load_adaptive_xy(
+                f, start, end, timestep_stride, near_goal_radius
+            )
+            for k in rng.permutation(len(x_c)):
+                row, col = _adjacency_indices_from_state(x_c[k], perception)
+                shuffle_buffer.append((x_c[k].copy(), y_c[k].copy(), row, col))
+                if len(shuffle_buffer) >= shuffle_buffer_size:
+                    emit_random_buffered_sample()
+            del x_c, y_c
+
+    while shuffle_buffer:
+        emit_random_buffered_sample()
+
+    if x_batch:
+        flush_batch()
+    return batch_paths, max(1, len(batch_paths))
+
+
+def dataset_from_batch_files(batch_paths):
+    """Create a repeatable tf.data dataset from compact disjoint batch files."""
+    def generator():
+        for path in np.random.permutation(batch_paths):
+            with np.load(path) as batch:
+                yield batch_to_tf_sparse((
+                    (
+                        batch["x"],
+                        batch["indices"],
+                        batch["values"],
+                        batch["dense_shape"],
+                        batch["step_i"],
+                    ),
+                    batch["y"],
+                ))
+
+    output_signature = (
+        (
+            tf.TensorSpec(shape=(None, 4), dtype=tf.float32),
+            tf.SparseTensorSpec(shape=(None, None), dtype=tf.float32),
+            tf.TensorSpec(shape=(None,), dtype=tf.int64),
+        ),
+        tf.TensorSpec(shape=(None, 10), dtype=tf.float32),
+    )
+    return tf.data.Dataset.from_generator(generator, output_signature=output_signature).repeat()
 
 
 def run_chunked(boids_cache_path, flat_traj_indices, boundaries, cache_info, data_va, run_tag):
@@ -257,7 +483,12 @@ def run_chunked(boids_cache_path, flat_traj_indices, boundaries, cache_info, dat
 
         if saved_weights_np is not None:
             # Build the model with 1 step, then overwrite with saved weights.
-            model.fit(loader_tr.load(), steps_per_epoch=1, epochs=1, verbose=0)
+            model.fit(
+                loader_tr.load().map(add_graph_ids_to_targets),
+                steps_per_epoch=1,
+                epochs=1,
+                verbose=0,
+            )
             model.set_weights(saved_weights_np)
             # Recreate loaders — generators were exhausted by the build step.
             loader_tr = DisjointLoader(chunk_data, node_level=True, batch_size=args.batch_size)
@@ -265,10 +496,10 @@ def run_chunked(boids_cache_path, flat_traj_indices, boundaries, cache_info, dat
 
         # ── 3 & 4. Train until val_loss plateaus ─────────────────────────
         h = model.fit(
-            loader_tr.load(),
+            loader_tr.load().map(add_graph_ids_to_targets),
             steps_per_epoch=loader_tr.steps_per_epoch,
             epochs=10_000,
-            validation_data=loader_va.load(),
+            validation_data=loader_va.load().map(add_graph_ids_to_targets),
             validation_steps=loader_va.steps_per_epoch,
             callbacks=[
                 EarlyStopping(
@@ -301,9 +532,14 @@ def run_chunked(boids_cache_path, flat_traj_indices, boundaries, cache_info, dat
     gc.collect()
     final_model = _build_model(saved_lr)
     checkpoint_path = f"saved_models/best_weights_{run_tag}"
-    # Build via one val batch then set weights
+    # Build via one validation batch then set weights.
     loader_va_build = DisjointLoader(data_va, node_level=True, batch_size=args.batch_size)
-    final_model.fit(loader_va_build.load(), steps_per_epoch=1, epochs=1, verbose=0)
+    final_model.fit(
+        loader_va_build.load().map(add_graph_ids_to_targets),
+        steps_per_epoch=1,
+        epochs=1,
+        verbose=0,
+    )
     del loader_va_build
     final_model.set_weights(saved_weights_np)
     final_model.save_weights(checkpoint_path)   # persist to disk for post-training restore
@@ -311,6 +547,136 @@ def run_chunked(boids_cache_path, flat_traj_indices, boundaries, cache_info, dat
     print(f"\n✅ Chunked training done ({n_chunks} chunks). "
           f"Final model = last chunk's best weights.")
     return _HistoryProxy({'loss': last_chunk_losses}), final_model, _BestInfo(n_chunks, float('nan'))
+
+
+def run_chunked_subprocess(boids_cache_path, flat_traj_indices, boundaries, cache_info, data_va, run_tag):
+    """Chunked 2D training with one subprocess per chunk to release RAM."""
+    chunk_size = args.chunk_size
+    chunk_patience = args.chunk_patience
+    n_boids_c = cache_info['n_boids']
+    stride = cache_info['timestep_stride']
+    near_goal_radius = cache_info.get('near_goal_radius', 1.0)
+    cache_repeats = cache_info.get('cache_repeats', 1)
+    centers = cache_info.get('centers', None)
+    checkpoint_path = f"saved_models/best_weights_{run_tag}"
+
+    from boids.generate_boids_cache import QUADRANTS
+
+    def _center_quadrant(flat_idx):
+        if centers is None:
+            return 0
+        ci = int(flat_idx) // cache_repeats
+        cx, cy = centers[ci]
+        for q, (xmn, xmx, ymn, ymx, _) in enumerate(QUADRANTS):
+            if xmn <= cx <= xmx and ymn <= cy <= ymx:
+                return q
+        return 0
+
+    q_buckets = [[] for _ in range(4)]
+    for fi in flat_traj_indices:
+        q_buckets[_center_quadrant(fi)].append(fi)
+    for q in range(4):
+        np.random.shuffle(q_buckets[q])
+
+    active_quads = [q for q in range(4) if q_buckets[q]]
+    n_per_q = chunk_size // len(active_quads) if active_quads else chunk_size
+    remainder = chunk_size % len(active_quads) if active_quads else 0
+    q_ptrs = [0, 0, 0, 0]
+    chunks = []
+    while any(q_ptrs[q] < len(q_buckets[q]) for q in active_quads):
+        chunk = []
+        for i, q in enumerate(active_quads):
+            take = n_per_q + (1 if i < remainder else 0)
+            end = min(q_ptrs[q] + take, len(q_buckets[q]))
+            chunk.extend(q_buckets[q][q_ptrs[q]:end])
+            q_ptrs[q] = end
+        if chunk:
+            chunks.append(np.array(chunk, dtype=np.int64))
+
+    print(f"\n>>> Chunked training: {sum(len(c) for c in chunks)} trajectories, "
+          f"chunk_size={chunk_size} ({len(chunks)} balanced chunks), "
+          f"chunk_patience={chunk_patience} (subprocess per chunk)")
+
+    current_lr = args.lr
+    with tempfile.TemporaryDirectory(prefix="gnca_2d_chunks_") as tmpdir:
+        boundaries_file = os.path.join(tmpdir, "boundaries.npy")
+        val_npz_file = os.path.join(tmpdir, "validation.npz")
+        lr_state_file = os.path.join(tmpdir, "learning_rate.npy")
+        np.save(boundaries_file, boundaries)
+        save_dataset_npz(data_va, val_npz_file, n_boids_c)
+
+        for chunk_num, chunk_idxs in enumerate(chunks, start=1):
+            q_counts = [0, 0, 0, 0]
+            for fi in chunk_idxs:
+                q_counts[_center_quadrant(fi)] += 1
+            q_summary = "  ".join(f"{QUADRANTS[q][4]}:{q_counts[q]}" for q in range(4))
+
+            chunk_file = os.path.join(tmpdir, f"chunk_{chunk_num:04d}.json")
+            with open(chunk_file, "w", encoding="utf-8") as f:
+                json.dump([int(i) for i in chunk_idxs], f)
+
+            try:
+                rss_mb = psutil.Process().memory_info().rss / 1e6
+            except ImportError:
+                rss_mb = float("nan")
+            print(f"\n--- Chunk {chunk_num}/{len(chunks)}  [{q_summary}] | parent RAM: {rss_mb:.0f} MB ---")
+
+            cmd = [
+                sys.executable,
+                "-m",
+                "boids.run_boids",
+                "--_chunk_worker",
+                "--_chunk_indices_file", chunk_file,
+                "--_cache_path", boids_cache_path,
+                "--_checkpoint_path", checkpoint_path,
+                "--_n_boids_cache", str(n_boids_c),
+                "--_boundaries_file", boundaries_file,
+                "--_val_npz_file", val_npz_file,
+                "--_lr_state_file", lr_state_file,
+                "--lr", str(current_lr),
+                "--batch_size", str(args.batch_size),
+                "--epochs", "10000",
+                "--es_patience", str(chunk_patience),
+                "--lr_patience", str(args.lr_patience),
+                "--n_boids", str(args.n_boids),
+                "--loss_type", args.loss_type,
+                "--critical_distance", str(args.critical_distance),
+                "--distance_weight", str(args.distance_weight),
+                "--timestep_stride", str(stride),
+                "--near_goal_radius", str(near_goal_radius),
+                "--perception", str(args.perception),
+                "--shuffle_buffer_size", str(args.shuffle_buffer_size),
+            ]
+            result = subprocess.run(cmd)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"2D chunk worker {chunk_num}/{len(chunks)} failed with exit code {result.returncode}"
+                )
+            if not os.path.exists(lr_state_file):
+                raise RuntimeError(
+                    f"2D chunk worker {chunk_num}/{len(chunks)} did not save its learning rate"
+                )
+            current_lr = float(np.load(lr_state_file))
+            print(f"  Learning rate carried to next chunk: {current_lr:g}")
+            gc.collect()
+            try:
+                rss_mb = psutil.Process().memory_info().rss / 1e6
+                print(f"  Parent RAM after chunk process exited: {rss_mb:.0f} MB")
+            except ImportError:
+                pass
+
+    final_model = _build_model(current_lr)
+    loader_va_build = DisjointLoader(data_va, node_level=True, batch_size=args.batch_size)
+    final_model.fit(
+        loader_va_build.load().map(add_graph_ids_to_targets),
+        steps_per_epoch=1,
+        epochs=1,
+        verbose=0,
+    )
+    del loader_va_build
+    final_model.load_weights(checkpoint_path).expect_partial()
+    print(f"\nâœ… Chunked training done ({len(chunks)} chunks). Final model = last chunk's best weights.")
+    return _HistoryProxy({'loss': []}), final_model, _BestInfo(len(chunks), float('nan'))
 
 
 def run(data_tr, data_va, run_tag):
@@ -333,10 +699,10 @@ def run(data_tr, data_va, run_tag):
     best_after50_cb = BestAfterEpochCallback(save_path=checkpoint_path, min_epoch=args.best_after_epoch)
 
     history = model.fit(
-        loader_tr.load(),
+        loader_tr.load().map(add_graph_ids_to_targets),
         steps_per_epoch=loader_tr.steps_per_epoch,
         epochs=args.epochs, # Modified to use args
-        validation_data=loader_va.load(),
+        validation_data=loader_va.load().map(add_graph_ids_to_targets),
         validation_steps=loader_va.steps_per_epoch,
         callbacks=[
             EarlyStopping(
@@ -454,6 +820,18 @@ parser.add_argument(
          "Set to 0 to disable.",
 )
 parser.add_argument(
+    "--perception",
+    default=0.1,
+    type=float,
+    help="Neighbor radius used when rebuilding cached adjacency matrices.",
+)
+parser.add_argument(
+    "--shuffle_buffer_size",
+    default=4096,
+    type=int,
+    help="Number of individual timesteps mixed before packed batching.",
+)
+parser.add_argument(
     "--viz_n_centers",
     default=50,
     type=int,
@@ -483,6 +861,14 @@ parser.add_argument(
     choices=["tubular", "per_boid", "multi_tubular", "individual"],
     help="Visualization mode: 'tubular' (mean + tube), 'per_boid' (one run, all boids), 'multi_tubular' (multiple tubes), 'individual' (ranked PDFs).",
 )
+parser.add_argument("--_chunk_worker", action="store_true", default=False)
+parser.add_argument("--_chunk_indices_file", default=None)
+parser.add_argument("--_cache_path", default=None)
+parser.add_argument("--_checkpoint_path", default=None)
+parser.add_argument("--_n_boids_cache", default=None, type=int)
+parser.add_argument("--_boundaries_file", default=None)
+parser.add_argument("--_val_npz_file", default=None)
+parser.add_argument("--_lr_state_file", default=None)
 parser.add_argument(
     "--viz_n_show",
     default=None,
@@ -533,6 +919,12 @@ parser.add_argument(
     help="Buffer radius around the goal triangle for excluding test center sampling. "
          "Should match the exclusion size used when generating the cache (default: 0.2).",
 )
+parser.add_argument(
+    "--skip_evaluation",
+    action="store_true",
+    default=False,
+    help="Skip post-training inference and visualization after saving outputs.",
+)
 
 ####################################################################################
 # Training
@@ -545,10 +937,72 @@ print(
     f"\n>>> Loss config: {args.loss_type} (UPWEIGHT={UPWEIGHT}, critical_distance={args.critical_distance}, distance_weight={args.distance_weight})"
 )
 
+if args._chunk_worker:
+    chunk_flat = np.array(json.load(open(args._chunk_indices_file)), dtype=np.int64)
+    boundaries = np.load(args._boundaries_file)
+
+    worker_tmpdir = tempfile.mkdtemp(prefix="gnca_2d_worker_batches_")
+    atexit.register(shutil.rmtree, worker_tmpdir, ignore_errors=True)
+    print(
+        f">>> Worker setup: {len(chunk_flat)} trajectories, "
+        f"batch_size={args.batch_size}, stride={args.timestep_stride}, "
+        f"near_goal_radius={args.near_goal_radius}",
+        flush=True,
+    )
+    print(">>> Worker setup: writing compact train batch files...", flush=True)
+    train_batch_paths, train_steps = write_cached_chunk_batches(
+        args._cache_path,
+        chunk_flat,
+        boundaries,
+        args._n_boids_cache,
+        args.batch_size,
+        os.path.join(worker_tmpdir, "train_batches"),
+        timestep_stride=args.timestep_stride,
+        near_goal_radius=args.near_goal_radius,
+        perception=args.perception,
+        shuffle_buffer_size=args.shuffle_buffer_size,
+    )
+    print(
+        f">>> Worker setup: wrote {len(train_batch_paths)} train batches "
+        f"({train_steps} steps)",
+        flush=True,
+    )
+    train_data = dataset_from_batch_files(train_batch_paths).map(add_graph_ids_to_targets)
+    data_val = load_dataset_npz(args._val_npz_file)
+
+    model = _build_model(args.lr)
+    loader_va = DisjointLoader(data_val, node_level=True, batch_size=args.batch_size)
+
+    if os.path.exists(args._checkpoint_path + ".index"):
+        _build_model_variables(model, args._n_boids_cache)
+        model.load_weights(args._checkpoint_path).expect_partial()
+        loader_va = DisjointLoader(data_val, node_level=True, batch_size=args.batch_size)
+        print(f">>> Worker initialized from stage checkpoint: {args._checkpoint_path}")
+
+    model.fit(
+        train_data,
+        steps_per_epoch=train_steps,
+        epochs=args.epochs,
+        validation_data=loader_va.load().map(add_graph_ids_to_targets),
+        validation_steps=loader_va.steps_per_epoch,
+        callbacks=[
+            EarlyStopping(monitor='val_loss', patience=args.es_patience,
+                          restore_best_weights=True, verbose=1),
+            ReduceLROnPlateau(monitor='val_loss', patience=args.lr_patience,
+                              min_delta=1e-8, verbose=1),
+        ],
+    )
+    model.save_weights(args._checkpoint_path)
+    if args._lr_state_file is None:
+        raise RuntimeError("2D chunk worker requires --_lr_state_file")
+    final_lr = float(tf.keras.backend.get_value(model.optimizer.learning_rate))
+    np.save(args._lr_state_file, np.array(final_lr, dtype=np.float64))
+    print(f">>> Worker final learning rate: {final_lr:g}", flush=True)
+    shutil.rmtree(worker_tmpdir, ignore_errors=True)
+    sys.exit(0)
+
 noise_config = args.noise_tag
 train_init_centers = load_init_centers_from_npz(args.init_centers_npz)
-if train_init_centers is not None:
-    confirm_centers_match_reference(train_init_centers, args.init_centers_npz)
 effective_unique_reps = len(train_init_centers) if train_init_centers is not None else args.tr_set_unique
 run_tag = build_run_tag(
     unique_reps=effective_unique_reps,
@@ -636,7 +1090,7 @@ if use_chunked:
           f"{_n_train} unique × {_n_reps} reps = {len(_flat_traj_idxs)} trajectories, "
           f"chunk_size={args.chunk_size}, chunk_patience={args.chunk_patience}")
 
-    history, model, best_after50_cb = run_chunked(
+    history, model, best_after50_cb = run_chunked_subprocess(
         boids_cache, _flat_traj_idxs, _boundaries, _cache_info, data_va, run_tag
     )
 
@@ -684,6 +1138,10 @@ if best_after50_cb.best_epoch is not None:
     model.load_weights(checkpoint_path)
 else:
     print(f"\n⚠️ No best-weights checkpoint found. Using early-stopped model.")
+
+if args.skip_evaluation:
+    print(">>> Skipping all post-training inference and visualization.")
+    sys.exit(0)
 
 ####################################################################################
 # Evaluation

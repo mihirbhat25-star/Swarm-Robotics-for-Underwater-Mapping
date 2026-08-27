@@ -9,6 +9,34 @@ import tensorflow as tf
 import h5py
 
 
+BOIDS_GOAL_POSITIONS_3D = np.array(
+    [[-4.0, -4.0, -4.0], [4.0, 4.0, 4.0]],
+    dtype=np.float32,
+)
+NEAREST_CCW_POLICY = "nearest_then_counterclockwise_xy"
+FIXED_ORDER_POLICY = "fixed_waypoint_order"
+
+
+def nearest_then_counterclockwise_order(goal_positions, start_position):
+    """Order waypoints nearest-first, then counterclockwise in the XY plane."""
+    goals = np.asarray(goal_positions)
+    start = np.asarray(start_position)
+    if goals.ndim != 2 or len(goals) == 0 or goals.shape[1] < 2:
+        raise ValueError("goal_positions must have shape (N, D) with D >= 2.")
+    if start.shape != (goals.shape[1],):
+        raise ValueError(
+            f"start_position must have shape ({goals.shape[1]},), got {start.shape}."
+        )
+
+    nearest_idx = int(np.argmin(np.linalg.norm(goals - start[None, :], axis=1)))
+    center_xy = np.mean(goals[:, :2], axis=0)
+    relative_xy = goals[:, :2] - center_xy[None, :]
+    angles = np.mod(np.arctan2(relative_xy[:, 1], relative_xy[:, 0]), 2 * np.pi)
+    ccw_order = np.argsort(angles, kind="stable")
+    nearest_position = int(np.flatnonzero(ccw_order == nearest_idx)[0])
+    return np.roll(ccw_order, -nearest_position).astype(np.int64)
+
+
 def _in_exclusion_zone_3d(center, exclusion_zone):
     """Return True if center is within capsule exclusion zone."""
     if exclusion_zone is None:
@@ -46,7 +74,8 @@ class Boids3D:
         limits=True,
         show=False,
         pos_noise=0.000,  # Max magnitude of bounded uniform noise added to positions at each step
-        vel_noise=0.0000  # Max magnitude of bounded uniform noise added to velocities at each step
+        vel_noise=0.0000,  # Max magnitude of bounded uniform noise added to velocities at each step
+        waypoint_order_policy=NEAREST_CCW_POLICY,
     ):
         self.min_speed = min_speed
         self.max_speed = max_speed
@@ -67,7 +96,15 @@ class Boids3D:
         # 3D canvas: [xmin, ymin, zmin, xmax, ymax, zmax]
         self.borders = canvas_scale * np.array([-5, -5, -5, 5, 5, 5])
         self.center = (self.borders[3:] + self.borders[:3]) / 2
-        self.goal_positions = np.array([[-4, -4, -4], [4, 4, 4]])  # Two goals at opposite ends of the canvas diagonal
+        self.canonical_goal_positions = BOIDS_GOAL_POSITIONS_3D.copy()
+        self.goal_positions = self.canonical_goal_positions.copy()
+        self.goal_order = np.arange(len(self.goal_positions), dtype=np.int64)
+        if waypoint_order_policy not in (NEAREST_CCW_POLICY, FIXED_ORDER_POLICY):
+            raise ValueError(
+                "waypoint_order_policy must be either "
+                f"'{NEAREST_CCW_POLICY}' or '{FIXED_ORDER_POLICY}'."
+            )
+        self.waypoint_order_policy = waypoint_order_policy
         self.current_goal = 0
         self.reached_goal = False
         self.loiter_timer = 0
@@ -150,6 +187,8 @@ class Boids3D:
             positions, velocities = random_init
             neighbors = self.get_neighbors(positions)
 
+        self._set_goal_order_from_positions(positions)
+
         history = {
             "positions": [positions],
             "velocities": [velocities],
@@ -161,15 +200,22 @@ class Boids3D:
 
         while True:
             output = self.update_boids(positions, velocities, return_accel=return_accel)
-            positions, velocities, neighbors = output[:3]
+            positions, velocities, _ = output[:3]
+            # update_boids() uses the pre-update graph to compute the expert
+            # dynamics.  A training sample at the new state, however, must be
+            # paired with the graph of that new state.  Storing the graph
+            # returned by update_boids() made every sample after t=0 use the
+            # previous timestep's adjacency matrix.
+            neighbors = self.get_neighbors(positions)
             history["positions"].append(positions)
             history["velocities"].append(velocities)
             history["neighbors"].append(neighbors)
-            history["goal_positions"].append(self.goal_positions[self.current_goal].copy())
             if return_accel:
                 history["accelerations"].append(output[3])
-            prev_goal = self.current_goal
             self.update_goal(positions)
+            # The goal stored with state x_t must be the goal used to produce
+            # x_{t+1}. Update the goal before labeling the newly appended state.
+            history["goal_positions"].append(self.goal_positions[self.current_goal].copy())
             if self.check_termination():
                 break
 
@@ -180,6 +226,22 @@ class Boids3D:
             history["accelerations"] = np.array(history["accelerations"])
 
         return history
+
+    def _set_goal_order_from_positions(self, positions):
+        """Apply the configured fixed or nearest-then-CCW waypoint policy."""
+        if self.waypoint_order_policy == FIXED_ORDER_POLICY:
+            self.goal_order = np.arange(
+                len(self.canonical_goal_positions), dtype=np.int64
+            )
+            self.goal_positions = self.canonical_goal_positions.copy()
+            return
+
+        initial_flock_centroid = np.mean(positions, axis=0)
+        self.goal_order = nearest_then_counterclockwise_order(
+            self.canonical_goal_positions,
+            initial_flock_centroid,
+        )
+        self.goal_positions = self.canonical_goal_positions[self.goal_order].copy()
 
     def avoid_borders(self, positions):
         """Steer boids away from 3D boundaries."""
@@ -234,7 +296,7 @@ class Boids3D:
     def update_goal(self, positions):
         goal_vec = self.goal_positions[self.current_goal] - positions
         goal_dist = np.linalg.norm(goal_vec, axis=-1)
-        if np.mean(goal_dist) < 0.5 and not self.reached_goal:
+        if np.mean(goal_dist) < 0.25 and not self.reached_goal:
             self.reached_goal = True
         if self.reached_goal:
             self.current_goal = (self.current_goal + 1) % len(self.goal_positions)
@@ -393,8 +455,13 @@ def _load_adaptive_stride_3d(f, start, end, timestep_stride, near_goal_radius):
     y_full = f['y'][start:end]   # (T, n_boids, 15)
 
     mean_pos = x_full[:, :, :3].mean(axis=1)   # (T, 3)
-    y_goal   = y_full[:, 0, 12:15]             # (T, 3)
-    dist     = np.linalg.norm(mean_pos - y_goal, axis=1)  # (T,)
+    dist = np.min(
+        np.linalg.norm(
+            mean_pos[:, None, :] - BOIDS_GOAL_POSITIONS_3D[None, :, :],
+            axis=-1,
+        ),
+        axis=1,
+    )
 
     T = end - start
     strided = np.zeros(T, dtype=bool)
@@ -461,7 +528,9 @@ def make_dataset_3d(unique_reps, repeat_reps, save_config, trajectory_len=None, 
             boids.unseen_configs = [np.array(centers[i], dtype=np.float32) for i in unseen_indices]
             print(f"✅ Loaded cache: {n_train} training centers, {len(unseen_indices)} unseen centers, timestep_stride={timestep_stride}")
 
-            n_reps = min(repeat_reps, cache_repeats)
+            if cache_repeats < 1:
+                raise ValueError("Cache must contain at least one trajectory per center.")
+            n_reps = repeat_reps
 
             if 'traj_lengths' in f:
                 traj_lengths = f['traj_lengths'][:]
@@ -473,7 +542,8 @@ def make_dataset_3d(unique_reps, repeat_reps, save_config, trajectory_len=None, 
 
             for traj_i in train_indices:
                 for rep_j in range(n_reps):
-                    flat_idx = traj_i * cache_repeats + rep_j
+                    cached_repeat_idx = rep_j % cache_repeats
+                    flat_idx = traj_i * cache_repeats + cached_repeat_idx
                     start = int(boundaries[flat_idx])
                     end   = int(boundaries[flat_idx + 1])
                     x_chunk    = f['x'][start:end:timestep_stride]

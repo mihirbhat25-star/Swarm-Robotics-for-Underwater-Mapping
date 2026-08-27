@@ -27,7 +27,12 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from modules.boids_3d import Boids3D, history_to_samples_3d
+from modules.boids_3d import (
+    Boids3D,
+    FIXED_ORDER_POLICY,
+    NEAREST_CCW_POLICY,
+    history_to_samples_3d,
+)
 
 # 8 octants: (x_min, x_max, y_min, y_max, z_min, z_max, label)
 OCTANTS = [
@@ -77,8 +82,8 @@ def main():
     parser.add_argument("--unique",   type=int,   default=50)
     parser.add_argument("--repeats",  type=int,   default=5)
     parser.add_argument("--n_boids",  type=int,   default=100)
-    parser.add_argument("--pos_noise", type=float, default=0.004)
-    parser.add_argument("--vel_noise", type=float, default=0.0005)
+    parser.add_argument("--pos_noise", type=float, default=0.000)
+    parser.add_argument("--vel_noise", type=float, default=0.0000)
     parser.add_argument("--output",   type=str,   default=None)
     parser.add_argument("--noise_tag", type=str,  default="")
     parser.add_argument("--sample_mode", default="octant",
@@ -89,6 +94,17 @@ def main():
                         help="Sphere radius around each goal to exclude from center sampling.")
     parser.add_argument("--octants", type=int, nargs="+", default=None,
                         help="Which octants to sample from (0-7). Default: all 8.")
+    parser.add_argument(
+        "--goal_order",
+        choices=["nearest_ccw", "fixed"],
+        default="nearest_ccw",
+        help=(
+            "Waypoint-order policy: 'nearest_ccw' starts at the waypoint nearest "
+            "the initial flock centroid and then follows the remaining order; "
+            "'fixed' preserves the original canonical order "
+            "(-4,-4,-4) -> (4,4,4). Default: nearest_ccw."
+        ),
+    )
     # Legacy fixed-bounds args
     parser.add_argument("--x_min", type=float, default=-5.0)
     parser.add_argument("--x_max", type=float, default=0.0)
@@ -98,7 +114,17 @@ def main():
     parser.add_argument("--z_max", type=float, default=0.0)
     args = parser.parse_args()
 
-    boids = Boids3D(n_boids=args.n_boids, pos_noise=args.pos_noise, vel_noise=args.vel_noise)
+    waypoint_order_policy = (
+        NEAREST_CCW_POLICY
+        if args.goal_order == "nearest_ccw"
+        else FIXED_ORDER_POLICY
+    )
+    boids = Boids3D(
+        n_boids=args.n_boids,
+        pos_noise=args.pos_noise,
+        vel_noise=args.vel_noise,
+        waypoint_order_policy=waypoint_order_policy,
+    )
     exclusion_zone = build_exclusion_zone_3d(boids.goal_positions, args.goal_exclusion_size)
 
     if args.sample_mode == "octant":
@@ -127,7 +153,8 @@ def main():
     print(f"\n>>> Sample mode: {args.sample_mode} | {total_unique} unique × {args.repeats} repeats = {total_unique * args.repeats} trajectories")
     if exclusion_zone:
         print(f">>> Exclusion: capsule of radius {args.goal_exclusion_size} along goal-to-goal segment")
-    print(f">>> Output: {args.output}\n")
+    print(f">>> Output: {args.output}")
+    print(f">>> Waypoint order: {boids.waypoint_order_policy}\n")
 
     max_edges = args.n_boids * (args.n_boids - 1)
     n_feat_x, n_feat_y = 6, 15
@@ -148,12 +175,10 @@ def main():
             all_centers.append(center)
 
             for _ in range(args.repeats):
-                positions, velocities, neighbors, _ = boids.get_random_init(
-                    args.n_boids, save_config=False, center=center
-                )
-                history = boids.generate_trajectory(
-                    random_init=(positions, velocities), save_config=False
-                )
+                # Match the older cache-generation behavior: pass the center
+                # directly and let Boids3D.generate_trajectory create the
+                # repeated clump initialization internally.
+                history = boids.generate_trajectory(random_init=center, save_config=False)
                 samples = history_to_samples_3d(history)
                 n = len(samples)
                 all_traj_lengths.append(n)
@@ -186,7 +211,10 @@ def main():
         f.attrs['repeats']      = args.repeats
         f.attrs['n_boids']      = args.n_boids
         f.attrs['max_edges']    = max_edges
+        f.attrs['perception']   = boids.perception
+        f.attrs['adjacency_alignment'] = 'current_state'
         f.attrs['sample_mode']  = args.sample_mode
+        f.attrs['waypoint_order_policy'] = boids.waypoint_order_policy
         if exclusion_zone:
             f.attrs['goal_exclusion_size'] = args.goal_exclusion_size
         total = ds_x.shape[0]
@@ -206,95 +234,6 @@ def main():
     plot_path = args.output.replace('.h5', '_centers.pdf')
     plt.savefig(plot_path); plt.close()
     print(f"   Centers plot: {plot_path}")
-
-
-if __name__ == "__main__":
-    main()
-    parser.add_argument("--y_min", type=float, default=-5.0)
-    parser.add_argument("--y_max", type=float, default=-2.5)
-    parser.add_argument("--z_min", type=float, default=-2.5)
-    parser.add_argument("--z_max", type=float, default=0.0)
-    parser.add_argument("--noise_tag", type=str, default="",
-                        help="Label to append to filename (e.g. 'nw_2'). Does not change noise values.")
-    args = parser.parse_args()
-
-    if args.output is None:
-        noise_suffix = f"_{args.noise_tag}" if args.noise_tag else ""
-        args.output = (
-            f"boids_cache_3d_{args.unique}x{args.repeats}"
-            f"_x{args.x_min}_{args.x_max}"
-            f"_y{args.y_min}_{args.y_max}"
-            f"_z{args.z_min}_{args.z_max}{noise_suffix}.h5"
-        )
-
-    print(f"\n>>> Generating {args.unique} unique × {args.repeats} repeats = {args.unique * args.repeats} 3D trajectories")
-    print(f">>> n_boids={args.n_boids}, pos_noise={args.pos_noise}, vel_noise={args.vel_noise}")
-    print(f">>> Sampling centers from x=[{args.x_min},{args.x_max}], y=[{args.y_min},{args.y_max}], z=[{args.z_min},{args.z_max}]")
-    print(f">>> Output: {args.output}\n")
-
-    boids = Boids3D(n_boids=args.n_boids, pos_noise=args.pos_noise, vel_noise=args.vel_noise)
-
-    # Theoretical max edges: n*(n-1)
-    max_edges = args.n_boids * (args.n_boids - 1)
-    n_feat_x = 6   # pos_x, pos_y, pos_z, vel_x, vel_y, vel_z
-    n_feat_y = 15  # cur_state(6) + next_state(6) + goal(3)
-    print(f">>> max_edges={max_edges}, x_feat={n_feat_x}, y_feat={n_feat_y}\n")
-
-    all_centers = []
-
-    with h5py.File(args.output, 'w') as f:
-        ds_x    = f.create_dataset('x',     shape=(0, args.n_boids, n_feat_x), maxshape=(None, args.n_boids, n_feat_x), dtype='float32', chunks=(256, args.n_boids, n_feat_x), compression='gzip', compression_opts=4)
-        ds_y    = f.create_dataset('y',     shape=(0, args.n_boids, n_feat_y), maxshape=(None, args.n_boids, n_feat_y), dtype='float32', chunks=(256, args.n_boids, n_feat_y), compression='gzip', compression_opts=4)
-        ds_arow = f.create_dataset('a_row', shape=(0, max_edges), maxshape=(None, max_edges), dtype='int32', chunks=(256, max_edges), fillvalue=-1, compression='gzip', compression_opts=4)
-        ds_acol = f.create_dataset('a_col', shape=(0, max_edges), maxshape=(None, max_edges), dtype='int32', chunks=(256, max_edges), fillvalue=-1, compression='gzip', compression_opts=4)
-        ds_alen = f.create_dataset('a_len', shape=(0,), maxshape=(None,), dtype='int32', chunks=(1024,), compression='gzip', compression_opts=4)
-
-        for i in tqdm(range(args.unique), desc="Unique centers"):
-            center = np.array([
-                np.random.uniform(args.x_min, args.x_max),
-                np.random.uniform(args.y_min, args.y_max),
-                np.random.uniform(args.z_min, args.z_max),
-            ], dtype=np.float32)
-            all_centers.append(center)
-
-            for j in range(args.repeats):
-                history = boids.generate_trajectory(random_init=center, save_config=False)
-                samples = history_to_samples_3d(history)
-                n = len(samples)
-
-                x_buf    = np.zeros((n, args.n_boids, n_feat_x), dtype=np.float32)
-                y_buf    = np.zeros((n, args.n_boids, n_feat_y), dtype=np.float32)
-                arow_buf = np.full((n, max_edges), -1, dtype=np.int32)
-                acol_buf = np.full((n, max_edges), -1, dtype=np.int32)
-                alen_buf = np.zeros(n, dtype=np.int32)
-
-                for k, (x, a, y) in enumerate(samples):
-                    x_buf[k] = x
-                    y_buf[k] = y
-                    length = a.nnz
-                    arow_buf[k, :length] = a.row
-                    acol_buf[k, :length] = a.col
-                    alen_buf[k] = length
-
-                cur = ds_x.shape[0]
-                for ds, buf in [(ds_x, x_buf), (ds_y, y_buf), (ds_arow, arow_buf), (ds_acol, acol_buf), (ds_alen, alen_buf)]:
-                    ds.resize(cur + n, axis=0)
-                    ds[cur:cur + n] = buf
-
-                del history, samples, x_buf, y_buf, arow_buf, acol_buf, alen_buf
-
-        centers_arr = np.stack(all_centers, axis=0)
-        f.create_dataset('centers', data=centers_arr)
-        f.attrs['unique_reps'] = args.unique
-        f.attrs['repeats']     = args.repeats
-        f.attrs['n_boids']     = args.n_boids
-        f.attrs['max_edges']   = max_edges
-
-        total = ds_x.shape[0]
-
-    print(f"\n✅ Saved {total} samples to '{args.output}'")
-    print(f"   centers: {centers_arr.shape}")
-    print(f"   File size: ~{os.path.getsize(args.output) / 1e6:.1f} MB")
 
 
 if __name__ == "__main__":

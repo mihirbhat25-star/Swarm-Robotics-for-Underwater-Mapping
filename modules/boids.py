@@ -1,13 +1,40 @@
 import numpy as np
 import scipy.sparse as sp
-from joblib import Parallel, delayed
 from matplotlib import pyplot as plt
 from shapely.geometry import Point
 from spektral import utils
 from spektral.data import Dataset, Graph
 from tqdm import tqdm
-import tensorflow as tf
 import h5py
+
+
+BOIDS_GOAL_POSITIONS = np.array(
+    [[3.0, -3.0], [3.0, 3.0], [0.0, 0.0]],
+    dtype=np.float32,
+)
+NEAREST_CCW_POLICY = "nearest_then_counterclockwise_xy"
+FIXED_ORDER_POLICY = "fixed_waypoint_order"
+
+
+def nearest_then_counterclockwise_order(goal_positions, start_position):
+    """Order waypoints nearest-first, then counterclockwise in the XY plane."""
+    goals = np.asarray(goal_positions)
+    start = np.asarray(start_position)
+    if goals.ndim != 2 or len(goals) == 0 or goals.shape[1] < 2:
+        raise ValueError("goal_positions must have shape (N, D) with D >= 2.")
+    if start.shape != (goals.shape[1],):
+        raise ValueError(
+            f"start_position must have shape ({goals.shape[1]},), got {start.shape}."
+        )
+
+    nearest_idx = int(np.argmin(np.linalg.norm(goals - start[None, :], axis=1)))
+    center_xy = np.mean(goals[:, :2], axis=0)
+    relative_xy = goals[:, :2] - center_xy[None, :]
+    angles = np.mod(np.arctan2(relative_xy[:, 1], relative_xy[:, 0]), 2 * np.pi)
+    ccw_order = np.argsort(angles, kind="stable")
+    nearest_position = int(np.flatnonzero(ccw_order == nearest_idx)[0])
+    return np.roll(ccw_order, -nearest_position).astype(np.int64)
+
 
 class Boids:
     def __init__(
@@ -26,7 +53,8 @@ class Boids:
         limits=True,  # If True, enforce speed and turn limits
         show=False,
         pos_noise=0.000,  # Max magnitude of bounded uniform noise added to positions at each step
-        vel_noise=0.0000  # Max magnitude of bounded uniform noise added to velocities at each step
+        vel_noise=0.0000,  # Max magnitude of bounded uniform noise added to velocities at each step
+        waypoint_order_policy=NEAREST_CCW_POLICY,
     ):
         self.min_speed = min_speed
         self.max_speed = max_speed
@@ -45,7 +73,15 @@ class Boids:
 
         self.borders = canvas_scale * np.array([-5, -5, 5, 5])  # Hard borders of canvas
         self.center = (self.borders[2:] + self.borders[:2]) / 2  # Center of the canvas
-        self.goal_positions = np.array([[3.0, -3.0], [3.0, 3.0], [0.0, 0.0]])  # Set multiple goals in a triangular fashion at (3, -3), (3, 3) and (0, 0). Fix this if the canvas is [-5,5]^2.
+        self.canonical_goal_positions = BOIDS_GOAL_POSITIONS.copy()
+        self.goal_positions = self.canonical_goal_positions.copy()
+        self.goal_order = np.arange(len(self.goal_positions), dtype=np.int64)
+        if waypoint_order_policy not in (NEAREST_CCW_POLICY, FIXED_ORDER_POLICY):
+            raise ValueError(
+                "waypoint_order_policy must be either "
+                f"'{NEAREST_CCW_POLICY}' or '{FIXED_ORDER_POLICY}'."
+            )
+        self.waypoint_order_policy = waypoint_order_policy
         self.current_goal = 0
         self.reached_goal = False  # Flag to track if boids have reached the current goal
         self.loiter_timer = 0  # Timer to track how long boids have been loitering at the current goal
@@ -130,6 +166,8 @@ class Boids:
             ), "Expected random_init to have length 2 (positions, velocities) or a center (2,)"
             positions, velocities = random_init
             neighbors = self.get_neighbors(positions)
+
+        self._set_goal_order_from_positions(positions)
         history = {
             "positions": [positions],
             "velocities": [velocities],
@@ -140,16 +178,21 @@ class Boids:
             history["accelerations"] = []
         while True:
             output = self.update_boids(positions, velocities, return_accel=return_accel)
-            positions, velocities, neighbors = output[:3]
+            positions, velocities, _ = output[:3]
+            # The graph returned by update_boids() belongs to the pre-update
+            # positions.  Store the graph of the state being appended so that
+            # every training sample pairs x_t with A(x_t).
+            neighbors = self.get_neighbors(positions)
             history["positions"].append(positions)
             history["velocities"].append(velocities)
             history["neighbors"].append(neighbors)
-            history["goal_positions"].append(self.goal_positions[self.current_goal].copy())
             if return_accel:
                 history["accelerations"].append(output[3])
             self.update_goal(positions)
+            # The goal stored with state x_t must be the goal used to produce
+            # x_{t+1}. Update the goal before labeling the newly appended state.
+            history["goal_positions"].append(self.goal_positions[self.current_goal].copy())
             if self.check_termination():
-                # print("Trajectory generation terminating...")
                 break
 
         history["positions"] = np.array(history["positions"])
@@ -159,6 +202,22 @@ class Boids:
             history["accelerations"] = np.array(history["accelerations"])
 
         return history
+
+    def _set_goal_order_from_positions(self, positions):
+        """Apply the configured fixed or nearest-then-CCW waypoint policy."""
+        if self.waypoint_order_policy == FIXED_ORDER_POLICY:
+            self.goal_order = np.arange(
+                len(self.canonical_goal_positions), dtype=np.int64
+            )
+            self.goal_positions = self.canonical_goal_positions.copy()
+            return
+
+        initial_flock_centroid = np.mean(positions, axis=0)
+        self.goal_order = nearest_then_counterclockwise_order(
+            self.canonical_goal_positions,
+            initial_flock_centroid,
+        )
+        self.goal_positions = self.canonical_goal_positions[self.goal_order].copy()
 
     def avoid_borders(self, positions):
         """If a boid is within the external margins, steer it towards the centre"""
@@ -179,18 +238,6 @@ class Boids:
         # Exclude self-neighbors before converting to sparse
         np.fill_diagonal(neighbors_matrix, 0)
 
-        # Debug: print average number of neighbors per boid
-        # avg_neighbors = np.sum(neighbors_matrix, axis=1).mean()
-        # if avg_neighbors < 10 and self.print_neighbors_warning:
-            # print(f"[DEBUG] Problematic! Too low of neighbors: {avg_neighbors:.2f}.")
-            # self.print_neighbors_warning = False  # Only print once
-
-        # Also print debug to see if any boids are overlapping each other (which is bad)
-        # num_overlaps = np.sum(np.linalg.norm(positions[:, None, :] - positions[None, :, :], axis=-1) < 0.01) - self.n_boids  # Subtract self-count
-        # if num_overlaps > 0:
-        #     avg_overlap = np.mean(np.linalg.norm(positions[:, None, :] - positions[None, :, :], axis=-1)[np.linalg.norm(positions[:, None, :] - positions[None, :, :], axis=-1) < 0.01])
-        #     print(f"[DEBUG] Warning! {num_overlaps} pairs of boids are overlapping (distance < 0.01). The average distance of overlap is {avg_overlap:.4f}.")
-        
         # Convert to sparse matrix for return
         neighbors = sp.coo_matrix(neighbors_matrix, dtype=int)
         return neighbors
@@ -255,7 +302,6 @@ class Boids:
             self.reached_goal = True
 
         if self.reached_goal:
-            # print(f"[GOAL] Reached goal {self.current_goal} {self.goal_positions[self.current_goal]} at timestep {timestep}")
             self.current_goal = (self.current_goal + 1) % len(self.goal_positions)
             self.goals_completed += 1
             self.reached_goal = False
@@ -266,7 +312,6 @@ class Boids:
         """
         
         if self.goals_completed == len(self.goal_positions):  # Assuming multiple goals
-            # print("Termination condition met. All goals completed.")
             return True
         else:
             return False
@@ -348,7 +393,6 @@ class Boids:
         :param n_boids: int, number of boids
         """
         positions = np.full((n_boids, 2), -4.0) + self.init_scatter * np.random.rand(n_boids, 2)
-        # print(f"Using fixed initial configuration for trajectory generation.")
         # Set all boids to have the same initial velocity
         # Example: all boids move right at max_speed
         direction = np.array([1.0, 0.0])  # unit vector to the right
@@ -476,11 +520,10 @@ def make_dataset(unique_reps, repeat_reps, save_config, trajectory_len=None, ran
                     x_chunk, y_chunk, arow_chunk, acol_chunk, alen_chunk = \
                         _load_adaptive_stride(f, start, end, timestep_stride, near_goal_radius)
                     for k in range(len(x_chunk)):
-                        length = int(alen_chunk[k])
-                        row  = arow_chunk[k, :length]
-                        col  = acol_chunk[k, :length]
-                        data = np.ones(length, dtype=np.float32)
-                        a = sp.coo_matrix((data, (row, col)), shape=(n_boids_cache, n_boids_cache))
+                        # Existing caches contain the historical one-step
+                        # adjacency offset. Recompute from the current state so
+                        # they remain usable without regeneration.
+                        a = boids.get_neighbors(x_chunk[k, :, :2])
                         all_graphs.append(Graph(x=x_chunk[k], a=a, y=y_chunk[k]))
 
         dataset = BoidsDataset(all_graphs)
@@ -526,7 +569,7 @@ def _load_adaptive_stride(f, start, end, timestep_stride, near_goal_radius):
 
     Normal timesteps are loaded every `timestep_stride` steps.
     Timesteps where the flock's mean position is within `near_goal_radius`
-    of the current goal are always included (stride=1 in that window) so
+    of any goal are always included (stride=1 in that window) so
     goal-transition frames are never skipped.
 
     Args:
@@ -548,14 +591,19 @@ def _load_adaptive_stride(f, start, end, timestep_stride, near_goal_radius):
             f['a_len'][start:end:timestep_stride],
         )
 
-    # Load positions and current goal cheaply to detect near-goal timesteps.
-    # x: (T, n_boids, 4);  y[:, 0, 8:10] = current goal (same for all boids).
+    # Load positions to detect proximity to every waypoint, including the old
+    # waypoint immediately after the expert switches to the next one.
     x_full  = f['x'][start:end]       # (T, n_boids, 4)
     y_full  = f['y'][start:end]       # (T, n_boids, 10)
 
     mean_pos = x_full[:, :, :2].mean(axis=1)   # (T, 2)
-    y_goal   = y_full[:, 0, 8:10]              # (T, 2)
-    dist     = np.linalg.norm(mean_pos - y_goal, axis=1)  # (T,)
+    dist = np.min(
+        np.linalg.norm(
+            mean_pos[:, None, :] - BOIDS_GOAL_POSITIONS[None, :, :],
+            axis=-1,
+        ),
+        axis=1,
+    )
 
     T = end - start
     strided = np.zeros(T, dtype=bool)
@@ -573,7 +621,8 @@ def _load_adaptive_stride(f, start, end, timestep_stride, near_goal_radius):
 
 
 def load_chunk_from_cache(cache_path, flat_indices, boundaries, n_boids_cache,
-                          timestep_stride=1, near_goal_radius=1.0):
+                          timestep_stride=1, near_goal_radius=1.0,
+                          perception=0.1):
     """Load a subset of trajectories from an HDF5 cache into a BoidsDataset.
 
     Args:
@@ -597,12 +646,14 @@ def load_chunk_from_cache(cache_path, flat_indices, boundaries, n_boids_cache,
                 f, start, end, timestep_stride, near_goal_radius
             )
             for k in range(len(x_c)):
-                length = int(alen_c[k])
-                row  = arow_c[k, :length]
-                col  = acol_c[k, :length]
-                a = sp.coo_matrix(
-                    (np.ones(length, dtype=np.float32), (row, col)),
-                    shape=(n_boids_cache, n_boids_cache),
+                positions = x_c[k, :, :2]
+                neighbors = (
+                    np.linalg.norm(
+                        positions[:, None, :] - positions[None, :, :], axis=-1
+                    )
+                    < perception
                 )
+                np.fill_diagonal(neighbors, False)
+                a = sp.coo_matrix(neighbors, dtype=np.float32)
                 graphs.append(Graph(x=x_c[k], a=a, y=y_c[k]))
     return BoidsDataset(graphs)

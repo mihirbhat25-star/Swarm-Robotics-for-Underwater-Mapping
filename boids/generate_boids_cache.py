@@ -14,7 +14,12 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from modules.boids import Boids, history_to_samples
+from modules.boids import (
+    Boids,
+    FIXED_ORDER_POLICY,
+    NEAREST_CCW_POLICY,
+    history_to_samples,
+)
 
 # (xmin, xmax, ymin, ymax, label) for each quadrant
 QUADRANTS = [
@@ -51,9 +56,28 @@ def main():
     parser.add_argument("--quadrants", type=int, nargs="+", default=None,
                         help="Which quadrants to sample from (0=Q1, 1=Q2, 2=Q3, 3=Q4). "
                              "Default: all 4. E.g. '--quadrants 2 3' for Q3 and Q4 only.")
+    parser.add_argument(
+        "--goal_order",
+        choices=["nearest_ccw", "fixed"],
+        default="nearest_ccw",
+        help=(
+            "Waypoint-order policy: 'nearest_ccw' starts at the waypoint nearest "
+            "the initial flock centroid and then proceeds counterclockwise; "
+            "'fixed' preserves the original canonical order "
+            "(3,-3) -> (3,3) -> (0,0). Default: nearest_ccw."
+        ),
+    )
     args = parser.parse_args()
 
-    boids = Boids(n_boids=args.n_boids)
+    waypoint_order_policy = (
+        NEAREST_CCW_POLICY
+        if args.goal_order == "nearest_ccw"
+        else FIXED_ORDER_POLICY
+    )
+    boids = Boids(
+        n_boids=args.n_boids,
+        waypoint_order_policy=waypoint_order_policy,
+    )
 
     # Determine total unique centers and per-center bounds list
     if args.sample_mode == "quadrant":
@@ -89,7 +113,8 @@ def main():
           f"{total_unique} unique × {args.repeats} repeats = {total_unique * args.repeats} trajectories")
     if exclusion_zone is not None:
         print(f">>> Exclusion: goal triangle buffered by {args.goal_exclusion_size} units")
-    print(f">>> Output: {args.output}\n")
+    print(f">>> Output: {args.output}")
+    print(f">>> Waypoint order: {boids.waypoint_order_policy}\n")
 
     max_edges = args.n_boids * (args.n_boids - 1)
     n_feat_x, n_feat_y = 4, 10
@@ -162,6 +187,7 @@ def main():
         f.attrs['n_boids']      = args.n_boids
         f.attrs['max_edges']    = max_edges
         f.attrs['sample_mode']  = args.sample_mode
+        f.attrs['waypoint_order_policy'] = boids.waypoint_order_policy
         if exclusion_zone is not None:
             f.attrs['goal_exclusion_size'] = args.goal_exclusion_size
         total = ds_x.shape[0]
