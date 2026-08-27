@@ -56,6 +56,13 @@ class GNNCASimpleBoids3D(tf.keras.Model):
         diff_effect = self.mp_diff([pos, adj], training=training)
         mp_effect = self.mp([x_v, adj], training=training)
 
+        # Spektral's two message-passing implementations do not always return
+        # the same compute dtype under a mixed-precision policy. Normalize both
+        # residual branches to the state dtype before combining them. These are
+        # no-op casts in the existing/default float32 execution path.
+        diff_effect = tf.cast(diff_effect, vel.dtype)
+        mp_effect = tf.cast(mp_effect, vel.dtype)
+
         v_next = vel + mp_effect + diff_effect
         v_next = self.limits_model(v_next, training=training)
 
