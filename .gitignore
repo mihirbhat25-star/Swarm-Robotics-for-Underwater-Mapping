@@ -31,3 +31,7 @@ gnca_model*/
 
 # PDF outputs
 *.pdf
+
+# Local project overview assets
+/README.md
+/image.png
