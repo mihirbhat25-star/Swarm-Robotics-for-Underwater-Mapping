@@ -12,6 +12,7 @@ import atexit
 import shutil
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
 warnings.filterwarnings('ignore')
 import joblib
@@ -25,6 +26,8 @@ from boids.forward import forward
 from models.gnn_ca_simple_boids_3d import GNNCASimpleBoids3D
 from modules.boids_3d import (
     BOIDS_GOAL_POSITIONS_3D,
+    FIXED_ORDER_POLICY,
+    NEAREST_CCW_POLICY,
     Boids3D,
     load_chunk_from_cache_3d,
     make_dataset_3d,
@@ -231,6 +234,14 @@ def _build_model_variables_3d(model, n_boids):
     model([x_dummy, tf.sparse.reorder(a_dummy), tf.constant(0)], training=False)
 
 
+def _expert_waypoint_policy_3d(args):
+    return (
+        NEAREST_CCW_POLICY
+        if args.expert_goal_order == "nearest_ccw"
+        else FIXED_ORDER_POLICY
+    )
+
+
 def make_validation_dataset_3d(args):
     """Generate validation trajectories from the same octants used for training."""
     if args.train_octants is None:
@@ -242,12 +253,23 @@ def make_validation_dataset_3d(args):
             n_jobs=1,
             random_init=True,
             perception=args.perception,
+            pos_noise=args.expert_pos_noise,
+            vel_noise=args.expert_vel_noise,
+            waypoint_order_policy=_expert_waypoint_policy_3d(args),
         )
 
     from boids.generate_boids_cache_3d import OCTANTS, build_exclusion_zone_3d
 
-    sampler = Boids3D(n_boids=args.n_boids, perception=args.perception)
-    exclusion_zone = build_exclusion_zone_3d(sampler.goal_positions, 0.5)
+    sampler = Boids3D(
+        n_boids=args.n_boids,
+        perception=args.perception,
+        pos_noise=args.expert_pos_noise,
+        vel_noise=args.expert_vel_noise,
+        waypoint_order_policy=_expert_waypoint_policy_3d(args),
+    )
+    exclusion_zone = build_exclusion_zone_3d(
+        sampler.goal_positions, args.goal_exclusion_size
+    )
     centers = []
     n_octants = len(args.train_octants)
     base = args.va_set_size // n_octants
@@ -274,6 +296,9 @@ def make_validation_dataset_3d(args):
         n_jobs=1,
         random_init=centers,
         perception=args.perception,
+        pos_noise=args.expert_pos_noise,
+        vel_noise=args.expert_vel_noise,
+        waypoint_order_policy=_expert_waypoint_policy_3d(args),
     )
 
 
@@ -627,6 +652,209 @@ def dataset_from_batch_shards_3d(shard_paths):
     ).repeat()
 
 
+def _proportional_chunk_allocations_3d(total_counts, chunk_size):
+    """Allocate every chunk proportionally while preserving exact octant totals."""
+    remaining = {int(o): int(count) for o, count in total_counts.items()}
+    allocations = []
+    while sum(remaining.values()) > 0:
+        current_size = min(int(chunk_size), sum(remaining.values()))
+        total_remaining = sum(remaining.values())
+        exact = {
+            o: current_size * count / total_remaining
+            for o, count in remaining.items()
+        }
+        allocation = {
+            o: min(remaining[o], int(np.floor(exact[o])))
+            for o in remaining
+        }
+        unassigned = current_size - sum(allocation.values())
+        while unassigned > 0:
+            candidates = [
+                o for o in remaining if allocation[o] < remaining[o]
+            ]
+            chosen = max(
+                candidates,
+                key=lambda o: (exact[o] - allocation[o], remaining[o]),
+            )
+            allocation[chosen] += 1
+            unassigned -= 1
+        allocation = {o: count for o, count in allocation.items() if count}
+        allocations.append(allocation)
+        for o, count in allocation.items():
+            remaining[o] -= count
+    return allocations
+
+
+def _build_chunk_worker_command_3d(
+    chunk_idx,
+    chunk_file,
+    cache_paths_file,
+    checkpoint_path,
+    n_boids_cache,
+    boundaries_file,
+    val_npz_file,
+    training_state_dir,
+    chunk_patience,
+):
+    """Build the isolated worker command shared by cached and generated chunks."""
+    cmd = [
+        sys.executable,
+        "-m",
+        "boids.run_boids_3d",
+        "--_chunk_worker",
+        "--_chunk_idx", str(chunk_idx),
+        "--_chunk_indices_file", chunk_file,
+        "--_cache_paths_file", cache_paths_file,
+        "--_checkpoint_path", checkpoint_path,
+        "--_n_boids_cache", str(n_boids_cache),
+        "--_boundaries_file", boundaries_file,
+        "--_val_npz_file", val_npz_file,
+        "--_training_state_dir", training_state_dir,
+        "--lr", str(args.lr),
+        "--batch_size", str(args.batch_size),
+        "--epochs", "10000",
+        "--es_patience", str(chunk_patience),
+        "--lr_patience", str(args.lr_patience),
+        "--lr_red_factor", str(args.lr_red_factor),
+        "--min_lr", str(args.min_lr),
+        "--n_boids", str(args.n_boids),
+        "--loss_type", args.loss_type,
+        "--critical_distance", str(args.critical_distance),
+        "--distance_weight", str(args.distance_weight),
+        "--timestep_stride", str(args.timestep_stride),
+        "--near_goal_radius", str(args.near_goal_radius),
+        "--perception", str(args.perception),
+        "--shuffle_buffer_size", str(args.shuffle_buffer_size),
+        "--packed_shard_batches", str(args.packed_shard_batches),
+        "--steps_per_execution", str(args.steps_per_execution),
+        "--expert_goal_order", args.expert_goal_order,
+        "--goal_exclusion_size", str(args.goal_exclusion_size),
+        "--expert_pos_noise", str(args.expert_pos_noise),
+        "--expert_vel_noise", str(args.expert_vel_noise),
+    ]
+    if args.eager_training:
+        cmd.append("--eager_training")
+    if args.chunk_epochs is not None:
+        cmd.extend(["--chunk_epochs", str(args.chunk_epochs)])
+    if args.init_weights:
+        cmd.extend(["--init_weights", args.init_weights])
+    return cmd
+
+
+def _generate_chunk_cache_shards_3d(chunk_idx, octant_counts, output_dir):
+    """Generate one temporary cache shard per CPU task for a training chunk."""
+    total = sum(octant_counts.values())
+    workers = args.generation_workers
+    if workers <= 0:
+        workers = max(1, (os.cpu_count() or 2) - 2)
+    workers = max(1, min(workers, total))
+    target_task_size = max(1, int(np.ceil(total / workers)))
+
+    task_specs = []
+    for octant, count in sorted(octant_counts.items()):
+        n_tasks = max(1, int(np.ceil(count / target_task_size)))
+        task_counts = [len(part) for part in np.array_split(np.arange(count), n_tasks)]
+        for task_count in task_counts:
+            task_specs.append({"octant": int(octant), "count": int(task_count)})
+
+    def run_task(task_idx, spec):
+        seed = int(args.generation_seed + chunk_idx * 1_000_003 + task_idx)
+        path = os.path.join(output_dir, f"generated_{task_idx:04d}.h5")
+        cmd = [
+            sys.executable,
+            "-m",
+            "boids.generate_boids_cache_3d",
+            "--unique", str(spec["count"]),
+            "--repeats", "1",
+            "--n_boids", str(args.n_boids),
+            "--sample_mode", "octant",
+            "--octants", str(spec["octant"]),
+            "--goal_exclusion_size", str(args.goal_exclusion_size),
+            "--pos_noise", str(args.expert_pos_noise),
+            "--vel_noise", str(args.expert_vel_noise),
+            "--perception", str(args.perception),
+            "--goal_order", args.expert_goal_order,
+            "--seed", str(seed),
+            "--output", path,
+            "--skip_centers_plot",
+            "--quiet",
+        ]
+        env = os.environ.copy()
+        # Expert simulation is CPU-only. Hiding the GPU prevents dozens of
+        # generator processes from each creating a TensorFlow CUDA context.
+        env["CUDA_VISIBLE_DEVICES"] = ""
+        env["TF_CPP_MIN_LOG_LEVEL"] = "3"
+        for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+            env[name] = "1"
+        started = time.time()
+        result = subprocess.run(
+            cmd, env=env, text=True, capture_output=True
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Expert-generation task {task_idx} failed for octant "
+                f"{spec['octant']} (exit {result.returncode}).\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
+        return {
+            **spec,
+            "seed": seed,
+            "path": path,
+            "seconds": time.time() - started,
+        }
+
+    print(
+        f">>> Generating {total} expert trajectories across {len(task_specs)} "
+        f"tasks with up to {workers} concurrent CPU workers...",
+        flush=True,
+    )
+    completed = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(run_task, task_idx, spec): task_idx
+            for task_idx, spec in enumerate(task_specs)
+        }
+        for future in as_completed(futures):
+            record = future.result()
+            completed.append(record)
+            print(
+                f"  Generated {record['count']} octant-{record['octant']} "
+                f"trajectories in {record['seconds']:.1f}s",
+                flush=True,
+            )
+
+    completed.sort(key=lambda record: record["path"])
+    cache_paths = [record["path"] for record in completed]
+    boundaries_by_cache = []
+    trajectory_refs = []
+    centers = []
+    center_octants = []
+    for cache_idx, record in enumerate(completed):
+        with h5py.File(record["path"], "r") as cache_file:
+            if int(cache_file.attrs["n_boids"]) != args.n_boids:
+                raise ValueError("Generated cache n_boids does not match training.")
+            lengths = cache_file["traj_lengths"][:]
+            boundaries_by_cache.append(np.concatenate([
+                np.zeros(1, dtype=np.int64),
+                np.cumsum(lengths, dtype=np.int64),
+            ]))
+            shard_centers = cache_file["centers"][:].astype(np.float32)
+        trajectory_refs.extend((cache_idx, i) for i in range(len(lengths)))
+        centers.append(shard_centers)
+        center_octants.extend([record["octant"]] * len(shard_centers))
+
+    refs = np.asarray(trajectory_refs, dtype=np.int64)
+    np.random.shuffle(refs)
+    return (
+        cache_paths,
+        boundaries_by_cache,
+        refs,
+        np.concatenate(centers, axis=0),
+        np.asarray(center_octants, dtype=np.int8),
+        completed,
+    )
+
+
 def run_chunked_3d(cache_paths, boundaries_by_cache, n_boids_cache,
                    all_trajectory_refs,
                    run_tag, chunk_size, chunk_patience,
@@ -634,9 +862,6 @@ def run_chunked_3d(cache_paths, boundaries_by_cache, n_boids_cache,
     """Train balanced chunks in isolated workers while carrying model state and LR."""
     checkpoint_path = f"saved_models/best_weights_3d_{run_tag}"
     os.makedirs("saved_models", exist_ok=True)
-
-    stride      = args.timestep_stride
-    near_goal_r = args.near_goal_radius
 
     # ── Build balanced chunks ────────────────────────────────────────────────
     if octant_buckets and len(octant_buckets) > 1:
@@ -730,43 +955,17 @@ def run_chunked_3d(cache_paths, boundaries_by_cache, n_boids_cache,
             del data_va_chunk
             gc.collect()
 
-            cmd = [
-                sys.executable,
-                "-m",
-                "boids.run_boids_3d",
-                "--_chunk_worker",
-                "--_chunk_idx", str(chunk_idx),
-                "--_chunk_indices_file", chunk_file,
-                "--_cache_paths_file", cache_paths_file,
-                "--_checkpoint_path", checkpoint_path,
-                "--_n_boids_cache", str(n_boids_cache),
-                "--_boundaries_file", boundaries_file,
-                "--_val_npz_file", val_npz_file,
-                "--_training_state_dir", training_state_dir,
-                "--lr", str(args.lr),
-                "--batch_size", str(args.batch_size),
-                "--epochs", "10000",
-                "--es_patience", str(chunk_patience),
-                "--lr_patience", str(args.lr_patience),
-                "--lr_red_factor", str(args.lr_red_factor),
-                "--min_lr", str(args.min_lr),
-                "--n_boids", str(args.n_boids),
-                "--loss_type", args.loss_type,
-                "--critical_distance", str(args.critical_distance),
-                "--distance_weight", str(args.distance_weight),
-                "--timestep_stride", str(stride),
-                "--near_goal_radius", str(near_goal_r),
-                "--perception", str(args.perception),
-                "--shuffle_buffer_size", str(args.shuffle_buffer_size),
-                "--packed_shard_batches", str(args.packed_shard_batches),
-                "--steps_per_execution", str(args.steps_per_execution),
-            ]
-            if args.eager_training:
-                cmd.append("--eager_training")
-            if args.chunk_epochs is not None:
-                cmd.extend(["--chunk_epochs", str(args.chunk_epochs)])
-            if args.init_weights:
-                cmd.extend(["--init_weights", args.init_weights])
+            cmd = _build_chunk_worker_command_3d(
+                chunk_idx,
+                chunk_file,
+                cache_paths_file,
+                checkpoint_path,
+                n_boids_cache,
+                boundaries_file,
+                val_npz_file,
+                training_state_dir,
+                chunk_patience,
+            )
 
             result = subprocess.run(cmd)
             if result.returncode != 0:
@@ -785,6 +984,140 @@ def run_chunked_3d(cache_paths, boundaries_by_cache, n_boids_cache,
     final_model.save_weights(checkpoint_path)
     print(f"Saved final weights to {checkpoint_path}")
     return final_model
+
+
+def run_generated_chunked_3d(run_tag, requested_counts, chunk_size, chunk_patience):
+    """Generate, train, and delete one balanced expert chunk at a time."""
+    checkpoint_path = f"saved_models/best_weights_3d_{run_tag}"
+    os.makedirs("saved_models", exist_ok=True)
+    allocations = _proportional_chunk_allocations_3d(
+        requested_counts, chunk_size
+    )
+    n_chunks = len(allocations)
+    print(
+        f">>> On-the-fly chunked training: {n_chunks} chunks; "
+        f"requested octant totals {requested_counts}"
+    )
+
+    temp_root = args.on_the_fly_tmp_dir or None
+    if temp_root is not None:
+        os.makedirs(temp_root, exist_ok=True)
+    all_centers = []
+    all_center_octants = []
+    manifest_tasks = []
+
+    with tempfile.TemporaryDirectory(
+        prefix="gnca_3d_onthefly_", dir=temp_root
+    ) as tmpdir:
+        training_state_dir = os.path.join(tmpdir, "training_state")
+        for chunk_idx, chunk_mix in enumerate(allocations):
+            print(f"\n{'='*60}")
+            print(
+                f"  Chunk {chunk_idx + 1}/{n_chunks} | "
+                f"{sum(chunk_mix.values())} generated trajectories"
+            )
+            print(f"{'='*60}")
+            print(f">>> Chunk octant mix: {chunk_mix}")
+
+            with tempfile.TemporaryDirectory(
+                prefix=f"chunk_{chunk_idx:04d}_", dir=tmpdir
+            ) as chunk_dir:
+                generation_t0 = time.time()
+                (
+                    cache_paths,
+                    boundaries_by_cache,
+                    chunk_refs,
+                    chunk_centers,
+                    center_octants,
+                    task_records,
+                ) = _generate_chunk_cache_shards_3d(
+                    chunk_idx, chunk_mix, chunk_dir
+                )
+                print(
+                    f">>> Expert chunk ready in "
+                    f"{time.time() - generation_t0:.1f}s; beginning packing/training."
+                )
+                all_centers.append(chunk_centers)
+                all_center_octants.append(center_octants)
+                for record in task_records:
+                    manifest_tasks.append({
+                        "chunk": chunk_idx,
+                        "octant": record["octant"],
+                        "count": record["count"],
+                        "seed": record["seed"],
+                    })
+
+                boundaries_file = os.path.join(chunk_dir, "boundaries.npz")
+                cache_paths_file = os.path.join(chunk_dir, "cache_paths.json")
+                chunk_file = os.path.join(chunk_dir, "chunk.json")
+                val_npz_file = os.path.join(chunk_dir, "validation.npz")
+                np.savez(
+                    boundaries_file,
+                    **{
+                        f"cache_{cache_idx}": boundaries
+                        for cache_idx, boundaries in enumerate(boundaries_by_cache)
+                    },
+                )
+                with open(cache_paths_file, "w", encoding="utf-8") as f:
+                    json.dump([os.path.abspath(path) for path in cache_paths], f)
+                with open(chunk_file, "w", encoding="utf-8") as f:
+                    json.dump(chunk_refs.tolist(), f)
+
+                print(
+                    f">>> Generating fresh validation set for chunk "
+                    f"{chunk_idx + 1}/{n_chunks} ({args.va_set_size} centers)..."
+                )
+                data_va_chunk = make_validation_dataset_3d(args)
+                save_dataset_npz_3d(data_va_chunk, val_npz_file, args.n_boids)
+                del data_va_chunk
+                gc.collect()
+
+                cmd = _build_chunk_worker_command_3d(
+                    chunk_idx,
+                    chunk_file,
+                    cache_paths_file,
+                    checkpoint_path,
+                    args.n_boids,
+                    boundaries_file,
+                    val_npz_file,
+                    training_state_dir,
+                    chunk_patience,
+                )
+                result = subprocess.run(cmd)
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        f"Generated chunk worker {chunk_idx + 1}/{n_chunks} "
+                        f"failed with exit code {result.returncode}"
+                    )
+            gc.collect()
+            print(
+                f">>> Deleted temporary expert caches for chunk "
+                f"{chunk_idx + 1}/{n_chunks}."
+            )
+
+    final_model = _build_model_3d(args.lr)
+    _build_model_variables_3d(final_model, args.n_boids)
+    final_model.load_weights(checkpoint_path).expect_partial()
+    final_model.save_weights(checkpoint_path)
+    print(f"Saved final weights to {checkpoint_path}")
+    manifest = {
+        "mode": "on_the_fly",
+        "generation_seed": args.generation_seed,
+        "generation_workers": args.generation_workers,
+        "goal_order": args.expert_goal_order,
+        "goal_exclusion_size": args.goal_exclusion_size,
+        "pos_noise": args.expert_pos_noise,
+        "vel_noise": args.expert_vel_noise,
+        "perception": args.perception,
+        "octant_unique_counts": requested_counts,
+        "tasks": manifest_tasks,
+    }
+    return (
+        final_model,
+        np.concatenate(all_centers, axis=0),
+        np.concatenate(all_center_octants, axis=0),
+        manifest,
+    )
 
 
 def run(data_tr, data_va, run_tag=""):
@@ -883,6 +1216,34 @@ parser.add_argument(
     default=None,
     help="One or more compatible HDF5 caches used directly during chunked training.",
 )
+parser.add_argument(
+    "--generate_on_the_fly",
+    action="store_true",
+    help=(
+        "Generate each expert chunk in parallel into temporary local HDF5 "
+        "shards, train it, then delete it. Cannot be combined with --boids_cache."
+    ),
+)
+parser.add_argument(
+    "--generation_workers",
+    default=0,
+    type=int,
+    help="Concurrent expert-generation subprocesses; 0 uses CPU count minus two.",
+)
+parser.add_argument("--generation_seed", default=0, type=int)
+parser.add_argument(
+    "--on_the_fly_tmp_dir",
+    default="",
+    help="Temporary generation root. Empty uses the OS temporary directory (/tmp).",
+)
+parser.add_argument(
+    "--expert_goal_order",
+    choices=["nearest_ccw", "fixed"],
+    default="nearest_ccw",
+)
+parser.add_argument("--goal_exclusion_size", default=0.5, type=float)
+parser.add_argument("--expert_pos_noise", default=0.0, type=float)
+parser.add_argument("--expert_vel_noise", default=0.0, type=float)
 parser.add_argument("--init_weights", default="", type=str,
                    help="Optional checkpoint prefix to initialize training from.")
 parser.add_argument("--timestep_stride", default=1, type=int)
@@ -935,6 +1296,23 @@ args = parser.parse_args()
 
 if args.tr_set_repeats < 1:
     raise ValueError("--tr_set_repeats must be at least 1.")
+if args.generate_on_the_fly and args.boids_cache:
+    raise ValueError("--generate_on_the_fly cannot be combined with --boids_cache.")
+if args.generate_on_the_fly and args.tr_set_repeats != 1:
+    raise ValueError(
+        "On-the-fly generation currently requires --tr_set_repeats 1; "
+        "every generated trajectory is unique."
+    )
+if args.generate_on_the_fly and args.train_octants is None:
+    raise ValueError("--generate_on_the_fly requires explicit --train_octants.")
+if args.generate_on_the_fly and args.chunk_size <= 0:
+    raise ValueError("--generate_on_the_fly requires --chunk_size greater than 0.")
+if args.generate_on_the_fly and args.init_centers_npz:
+    raise ValueError(
+        "--generate_on_the_fly does not currently combine with --init_centers_npz."
+    )
+if args.generation_workers < 0:
+    raise ValueError("--generation_workers must be nonnegative.")
 if args.train_octants is not None and len(set(args.train_octants)) != len(args.train_octants):
     raise ValueError("--train_octants must not contain duplicates.")
 if args.octant_unique_counts is not None:
@@ -1164,8 +1542,11 @@ run_tag = build_run_tag_3d(
 # Print parameters
 print_run_parameters_3d(args, UPWEIGHT_NEAR_GOAL, args.critical_distance, args.distance_weight, noise_config, run_tag)
 
-use_chunked = args.chunk_size > 0 and bool(boids_caches)
+use_cached_chunked = args.chunk_size > 0 and bool(boids_caches)
+use_generated_chunked = args.chunk_size > 0 and args.generate_on_the_fly
+use_chunked = use_cached_chunked or use_generated_chunked
 data_va = None
+generation_manifest = None
 
 if not use_chunked and len(boids_caches) > 1:
     raise ValueError("Multiple --boids_cache files currently require chunked training.")
@@ -1175,7 +1556,46 @@ if not use_chunked:
     print(f"\n>>> Generating validation set ({args.va_set_size} centers)...")
     data_va = make_validation_dataset_3d(args)
 
-if use_chunked:
+if use_generated_chunked:
+    if args.octant_unique_counts is not None:
+        requested_counts = dict(
+            zip(args.train_octants, args.octant_unique_counts)
+        )
+    else:
+        n_per_o = effective_unique_reps // len(args.train_octants)
+        remainder = effective_unique_reps % len(args.train_octants)
+        requested_counts = {
+            o: n_per_o + (1 if i < remainder else 0)
+            for i, o in enumerate(args.train_octants)
+        }
+    print(
+        f"\n>>> Generating expert data one temporary chunk at a time: "
+        f"{requested_counts}"
+    )
+    (
+        model,
+        generated_centers,
+        generated_center_octants,
+        generation_manifest,
+    ) = run_generated_chunked_3d(
+        run_tag,
+        requested_counts,
+        args.chunk_size,
+        args.chunk_patience,
+    )
+    boids_tr = Boids3D(
+        n_boids=args.n_boids,
+        perception=args.perception,
+        pos_noise=args.expert_pos_noise,
+        vel_noise=args.expert_vel_noise,
+        waypoint_order_policy=_expert_waypoint_policy_3d(args),
+    )
+    boids_tr.rand_configs = [
+        np.asarray(center, dtype=np.float32) for center in generated_centers
+    ]
+    generation_manifest["center_octants"] = generated_center_octants.tolist()
+    best_after50_cb = None
+elif use_cached_chunked:
     print(f"\n>>> Chunked training directly from caches: {boids_caches}")
     boundaries_by_cache = []
     cache_repeats_by_cache = []
@@ -1331,6 +1751,10 @@ else:
         random_init=train_init_centers if train_init_centers is not None else True,
         boids_cache_npz=boids_caches[0] if boids_caches else None,
         timestep_stride=args.timestep_stride,
+        perception=args.perception,
+        pos_noise=args.expert_pos_noise,
+        vel_noise=args.expert_vel_noise,
+        waypoint_order_policy=_expert_waypoint_policy_3d(args),
     )
     if train_init_centers is not None:
         boids_tr.rand_configs = [np.array(c, dtype=np.float32) for c in train_init_centers]
@@ -1344,6 +1768,13 @@ os.makedirs("saved_history", exist_ok=True)
 model_save_path    = f"saved_models/gnca_model_3d_{run_tag}"
 boids_save_path    = f"saved_boids_tr/boids_tr_3d_{run_tag}.pkl"
 history_save_path  = f"saved_history/history_3d_{run_tag}.pkl"
+if generation_manifest is not None:
+    generation_manifest_path = (
+        f"saved_history/generation_manifest_3d_{run_tag}.json"
+    )
+    with open(generation_manifest_path, "w", encoding="utf-8") as f:
+        json.dump(generation_manifest, f, indent=2, sort_keys=True)
+    print(f"Saved generation manifest to {generation_manifest_path}")
 
 # Build model weights by running a dummy forward pass before saving
 _n = args.n_boids

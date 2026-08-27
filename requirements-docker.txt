@@ -9,3 +9,4 @@ networkx>=2.8,<4.0
 PyGSP>=0.5.1
 matplotlib>=3.7,<4.0
 shapely
+psutil

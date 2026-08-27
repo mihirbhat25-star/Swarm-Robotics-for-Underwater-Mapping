@@ -16,3 +16,4 @@ PyGSP==0.5.1
 # Visualization
 matplotlib==3.3.4
 shapely
+psutil

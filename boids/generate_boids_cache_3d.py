@@ -84,8 +84,12 @@ def main():
     parser.add_argument("--n_boids",  type=int,   default=100)
     parser.add_argument("--pos_noise", type=float, default=0.000)
     parser.add_argument("--vel_noise", type=float, default=0.0000)
+    parser.add_argument("--perception", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--output",   type=str,   default=None)
     parser.add_argument("--noise_tag", type=str,  default="")
+    parser.add_argument("--skip_centers_plot", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--sample_mode", default="octant",
                         choices=["octant", "full_canvas", "fixed_bounds"],
                         help="'octant' = --unique per octant; 'full_canvas' = [-5,5]³ with exclusion; "
@@ -114,6 +118,9 @@ def main():
     parser.add_argument("--z_max", type=float, default=0.0)
     args = parser.parse_args()
 
+    if args.seed is not None:
+        np.random.seed(args.seed)
+
     waypoint_order_policy = (
         NEAREST_CCW_POLICY
         if args.goal_order == "nearest_ccw"
@@ -123,6 +130,7 @@ def main():
         n_boids=args.n_boids,
         pos_noise=args.pos_noise,
         vel_noise=args.vel_noise,
+        perception=args.perception,
         waypoint_order_policy=waypoint_order_policy,
     )
     exclusion_zone = build_exclusion_zone_3d(boids.goal_positions, args.goal_exclusion_size)
@@ -167,7 +175,7 @@ def main():
         ds_acol = f.create_dataset('a_col', shape=(0, max_edges), maxshape=(None, max_edges), dtype='int32', chunks=(256, max_edges), fillvalue=-1, compression='gzip', compression_opts=4)
         ds_alen = f.create_dataset('a_len', shape=(0,), maxshape=(None,), dtype='int32', chunks=(1024,), compression='gzip', compression_opts=4)
 
-        for bounds in tqdm(center_tasks, desc="Unique centers"):
+        for bounds in tqdm(center_tasks, desc="Unique centers", disable=args.quiet):
             _, _, _, center = boids.get_random_init(
                 args.n_boids, save_config=False,
                 bounds=bounds, exclusion_zone=exclusion_zone,
@@ -215,6 +223,8 @@ def main():
         f.attrs['adjacency_alignment'] = 'current_state'
         f.attrs['sample_mode']  = args.sample_mode
         f.attrs['waypoint_order_policy'] = boids.waypoint_order_policy
+        if args.seed is not None:
+            f.attrs['generation_seed'] = args.seed
         if exclusion_zone:
             f.attrs['goal_exclusion_size'] = args.goal_exclusion_size
         total = ds_x.shape[0]
@@ -222,6 +232,9 @@ def main():
     print(f"\n✅ Saved {total} samples to '{args.output}'")
     print(f"   centers: {centers_arr.shape}  |  traj lengths: min={min(all_traj_lengths)} max={max(all_traj_lengths)} mean={int(np.mean(all_traj_lengths))}")
     print(f"   File size: ~{os.path.getsize(args.output) / 1e6:.1f} MB")
+
+    if args.skip_centers_plot:
+        return
 
     # Centers scatter plot (XY projection)
     fig = plt.figure(figsize=(7, 7))
