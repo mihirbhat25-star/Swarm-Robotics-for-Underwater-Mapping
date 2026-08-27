@@ -105,6 +105,8 @@ def print_run_parameters_3d(args, upweight, critical_distance, distance_weight, 
     print(f"Batch size:           {args.batch_size}")
     print(f"Multi-GPU:            {args.multi_gpu}")
     print(f"Cloud optimized:      {args.cloud_optimized}")
+    print(f"Cloud native data:    {args.cloud_native_dataset}")
+    print(f"Cloud BF16:           {args.cloud_bfloat16}")
     print(
         f"Execution:            "
         f"{'eager (debug)' if args.eager_training else 'compiled graph'}; "
@@ -122,6 +124,12 @@ def custom_weighted_mse_3d(y_true, y_pred):
     remains emphasized immediately after the active-goal label switches.
     y_pred is predicted next_state (6D).
     """
+    # BF16 is used only for cloud model compute. Keep target slicing, distance
+    # weighting, squared error, and loss reduction in float32 for stability.
+    if getattr(args, "cloud_bfloat16", False):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+
     n_features = tf.shape(y_pred)[-1]  # Should be 6
     current_state = y_true[..., :n_features]
     next_state = y_true[..., n_features:2*n_features]
@@ -655,6 +663,64 @@ def dataset_from_batch_shards_3d(shard_paths):
     ).repeat()
 
 
+def materialize_cloud_native_dataset_3d(
+    dataset,
+    steps,
+    output_dir,
+    shuffle_batches,
+):
+    """Serialize one finite epoch and reload it through native tf.data I/O.
+
+    Materialization pays the Python generator cost once per chunk. Training
+    epochs subsequently read TensorFlow's native saved-dataset representation,
+    so no Python callback is required for each sparse graph batch.
+    """
+    steps = int(steps)
+    if steps < 1:
+        raise ValueError("Native cloud dataset requires at least one batch.")
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+
+    finite_dataset = dataset.take(steps)
+    save_t0 = time.time()
+    print(
+        f">>> Cloud native dataset: materializing {steps} batches to "
+        f"{output_dir}...",
+        flush=True,
+    )
+    finite_dataset.save(output_dir, compression=None)
+
+    def reader_func(shard_datasets):
+        # Shuffle/interleave native shards in TensorFlow rather than opening
+        # NPZ members and yielding batches from Python during every epoch.
+        return shard_datasets.shuffle(1024).interleave(
+            lambda shard: shard,
+            num_parallel_calls=tf.data.AUTOTUNE,
+            deterministic=False,
+        )
+
+    native_dataset = tf.data.Dataset.load(
+        output_dir,
+        element_spec=finite_dataset.element_spec,
+        compression=None,
+        reader_func=reader_func,
+    )
+    if shuffle_batches and steps > 1:
+        # The examples inside every packed batch were already timestep-shuffled
+        # by the unchanged packer. A bounded native shuffle varies batch order
+        # across epochs without buffering an entire 70+ GB chunk in RAM.
+        native_dataset = native_dataset.shuffle(
+            min(256, steps),
+            reshuffle_each_iteration=True,
+        )
+    native_dataset = native_dataset.repeat().prefetch(tf.data.AUTOTUNE)
+    print(
+        f">>> Cloud native dataset ready in {time.time() - save_t0:.1f}s.",
+        flush=True,
+    )
+    return native_dataset
+
+
 def _proportional_chunk_allocations_3d(total_counts, chunk_size):
     """Allocate every chunk proportionally while preserving exact octant totals."""
     remaining = {int(o): int(count) for o, count in total_counts.items()}
@@ -741,6 +807,10 @@ def _build_chunk_worker_command_3d(
         cmd.append("--multi_gpu")
     if args.cloud_optimized:
         cmd.append("--cloud_optimized")
+    if args.cloud_native_dataset:
+        cmd.append("--cloud_native_dataset")
+    if args.cloud_bfloat16:
+        cmd.append("--cloud_bfloat16")
     if args.chunk_epochs is not None:
         cmd.extend(["--chunk_epochs", str(args.chunk_epochs)])
     if args.init_weights:
@@ -1623,6 +1693,24 @@ parser.add_argument(
         "Python dispatch. Requires --multi_gpu. Local/default paths are unchanged."
     ),
 )
+parser.add_argument(
+    "--cloud_native_dataset",
+    action="store_true",
+    help=(
+        "Cloud-only: materialize each packed chunk once with Dataset.save and "
+        "train from Dataset.load without a per-batch Python generator. Requires "
+        "--cloud_optimized and --multi_gpu."
+    ),
+)
+parser.add_argument(
+    "--cloud_bfloat16",
+    action="store_true",
+    help=(
+        "Cloud-only: use mixed_bfloat16 model compute with float32 variables, "
+        "optimizer state, targets, weighting, and loss. Requires "
+        "--cloud_optimized and --multi_gpu."
+    ),
+)
 parser.add_argument("--chunk_size", default=100, type=int)
 parser.add_argument("--chunk_patience", default=15, type=int)
 parser.add_argument("--best_after_epoch", default=50, type=int,
@@ -1703,6 +1791,18 @@ if args.cloud_optimized and not args.multi_gpu:
     raise ValueError("--cloud_optimized requires --multi_gpu.")
 if args.cloud_optimized and args.eager_training:
     raise ValueError("--cloud_optimized cannot be combined with --eager_training.")
+if args.cloud_native_dataset and not args.cloud_optimized:
+    raise ValueError("--cloud_native_dataset requires --cloud_optimized.")
+if args.cloud_bfloat16 and not args.cloud_optimized:
+    raise ValueError("--cloud_bfloat16 requires --cloud_optimized.")
+if args.cloud_bfloat16:
+    tf.keras.mixed_precision.set_global_policy("mixed_bfloat16")
+    policy = tf.keras.mixed_precision.global_policy()
+    print(
+        f">>> Cloud BF16 policy enabled: compute={policy.compute_dtype}, "
+        f"variables={policy.variable_dtype}; loss=float32.",
+        flush=True,
+    )
 if args.multi_gpu:
     if len(physical_devices) < 2:
         raise ValueError(
@@ -1785,6 +1885,13 @@ if args._chunk_worker:
         add_graph_ids_to_targets_3d,
         num_parallel_calls=tf.data.AUTOTUNE,
     ).prefetch(tf.data.AUTOTUNE)
+    if args.cloud_native_dataset:
+        train_data = materialize_cloud_native_dataset_3d(
+            train_data,
+            train_steps,
+            os.path.join(worker_tmpdir, "native_train_dataset"),
+            shuffle_batches=True,
+        )
 
     # Load validation data from serialized npz if provided and not fixed-epoch mode
     use_val = (args.chunk_epochs is None) and (args._val_npz_file is not None)
@@ -1877,6 +1984,13 @@ if args._chunk_worker:
                           restore_best_weights=False, verbose=1),
         ]
         val_data = loader_va.load().map(add_graph_ids_to_targets_3d)
+        if args.cloud_native_dataset:
+            val_data = materialize_cloud_native_dataset_3d(
+                val_data,
+                loader_va.steps_per_epoch,
+                os.path.join(worker_tmpdir, "native_validation_dataset"),
+                shuffle_batches=False,
+            )
         val_kwargs = {
             'validation_data': val_data,
             'validation_steps': loader_va.steps_per_epoch,
