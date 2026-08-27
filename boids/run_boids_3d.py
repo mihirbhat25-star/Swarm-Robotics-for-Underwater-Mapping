@@ -1517,7 +1517,13 @@ if args.multi_gpu:
             "--batch_size is the global batch size in multi-GPU mode and must "
             f"be divisible by {len(physical_devices)} visible GPUs."
         )
-    if args.chunk_size <= 0 or not (args.generate_on_the_fly or args.boids_cache):
+    # The parent process validates the external data source, then launches each
+    # isolated worker with an internal cache manifest rather than repeating
+    # --generate_on_the_fly/--boids_cache.  Do not reject that valid worker mode.
+    if not args._chunk_worker and (
+        args.chunk_size <= 0
+        or not (args.generate_on_the_fly or args.boids_cache)
+    ):
         raise ValueError(
             "--multi_gpu currently requires chunked training from either "
             "--generate_on_the_fly or --boids_cache."
