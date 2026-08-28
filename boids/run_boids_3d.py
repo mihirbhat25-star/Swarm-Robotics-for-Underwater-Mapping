@@ -102,6 +102,8 @@ def print_run_parameters_3d(args, upweight, critical_distance, distance_weight, 
         print(f"  Critical distance:  {critical_distance}")
         print(f"  Distance weight:    {distance_weight}")
     print(f"Training set:         {args.tr_set_unique} unique × {args.tr_set_repeats} repeats")
+    if args.run_tag_unique is not None:
+        print(f"Run-tag unique count: {args.run_tag_unique} (naming only)")
     print(f"Validation set:       {args.va_set_size} unique")
     print(f"Boids:                {args.n_boids}")
     print(f"Noise config:         {noise_config or ''}")
@@ -117,7 +119,11 @@ def print_run_parameters_3d(args, upweight, critical_distance, distance_weight, 
         f"{'eager (debug)' if args.eager_training else 'compiled graph'}; "
         f"steps_per_execution={args.steps_per_execution}"
     )
-    print(f"Epochs:               {args.epochs} (early stop patience: {args.es_patience})")
+    print(
+        f"Epochs:               {args.epochs} "
+        f"(early stop patience: {args.es_patience}, "
+        f"min_delta: {args.early_stopping_min_delta:g})"
+    )
     print(f"Visualization mode:   {args.viz_mode}")
     print("="*70 + "\n")
 
@@ -138,7 +144,7 @@ def custom_weighted_mse_3d(y_true, y_pred):
     n_features = tf.shape(y_pred)[-1]  # Should be 6
     current_state = y_true[..., :n_features]
     next_state = y_true[..., n_features:2*n_features]
-    
+
     mse = tf.reduce_mean(tf.square(next_state - y_pred), axis=-1)
 
     if UPWEIGHT_NEAR_GOAL:
@@ -1181,8 +1187,9 @@ def _build_chunk_worker_command_3d(
         "--_training_state_dir", training_state_dir,
         "--lr", str(args.lr),
         "--batch_size", str(args.batch_size),
-        "--epochs", "10000",
+        "--epochs", str(args.epochs),
         "--es_patience", str(chunk_patience),
+        "--early_stopping_min_delta", str(args.early_stopping_min_delta),
         "--lr_patience", str(args.lr_patience),
         "--lr_red_factor", str(args.lr_red_factor),
         "--min_lr", str(args.min_lr),
@@ -1749,7 +1756,12 @@ def run(data_tr, data_va, run_tag=""):
         validation_data=loader_va.load().map(add_graph_ids_to_targets_3d),
         validation_steps=loader_va.steps_per_epoch,
         callbacks=[
-            EarlyStopping(patience=args.es_patience, restore_best_weights=True, verbose=1),
+            EarlyStopping(
+                patience=args.es_patience,
+                min_delta=args.early_stopping_min_delta,
+                restore_best_weights=True,
+                verbose=1,
+            ),
             ReduceLROnPlateau(patience=args.lr_patience, factor=args.lr_red_factor,
                               min_lr=args.min_lr, min_delta=1e-8, verbose=1),
             best_after50_cb,
@@ -2109,6 +2121,15 @@ parser.add_argument("--epochs", default=1000000, type=int)
 parser.add_argument("--chunk_epochs", default=None, type=int,
                    help="Fixed epochs per chunk (overrides early stopping). Use for debugging.")
 parser.add_argument("--es_patience", default=12, type=int)
+parser.add_argument(
+    "--early_stopping_min_delta",
+    default=1e-8,
+    type=float,
+    help=(
+        "Minimum monitored-loss improvement required to reset early stopping. "
+        "Prevents tiny floating-point changes from extending a chunk indefinitely."
+    ),
+)
 parser.add_argument("--lr_patience", default=5, type=int,
                    help="Epochs without improvement before reducing LR; keep below chunk_patience.")
 parser.add_argument("--lr_red_factor", default=0.1, type=float)
@@ -2116,6 +2137,16 @@ parser.add_argument("--min_lr", default=1e-6, type=float,
                    help="Minimum learning-rate floor for ReduceLROnPlateau.")
 parser.add_argument("--n_boids", default=100, type=int)
 parser.add_argument("--tr_set_unique", default=20, type=int)
+parser.add_argument(
+    "--run_tag_unique",
+    default=None,
+    type=int,
+    help=(
+        "Optional naming-only unique count used in checkpoint/run tags. "
+        "It does not change sampling; --tr_set_unique remains the actual "
+        "number of trajectories in the training stage."
+    ),
+)
 parser.add_argument(
     "--tr_set_repeats",
     default=50,
@@ -2278,6 +2309,8 @@ args = parser.parse_args()
 
 if args.tr_set_repeats < 1:
     raise ValueError("--tr_set_repeats must be at least 1.")
+if args.run_tag_unique is not None and args.run_tag_unique < 1:
+    raise ValueError("--run_tag_unique must be at least 1 when provided.")
 if args.generate_on_the_fly and args.boids_cache:
     raise ValueError("--generate_on_the_fly cannot be combined with --boids_cache.")
 if args.generate_on_the_fly and args.tr_set_repeats != 1:
@@ -2312,6 +2345,8 @@ if args.octant_unique_counts is not None:
         )
 if args.min_lr <= 0:
     raise ValueError("--min_lr must be greater than 0.")
+if args.early_stopping_min_delta < 0:
+    raise ValueError("--early_stopping_min_delta must be nonnegative.")
 if args.min_lr > args.lr:
     raise ValueError("--min_lr cannot exceed --lr.")
 if args.steps_per_execution < 1:
@@ -2640,8 +2675,13 @@ if args._chunk_worker:
             ReduceLROnPlateau(monitor='val_loss', patience=args.lr_patience,
                               factor=args.lr_red_factor, min_lr=args.min_lr,
                               min_delta=1e-8, verbose=1),
-            EarlyStopping(monitor='val_loss', patience=args.es_patience,
-                          restore_best_weights=False, verbose=1),
+            EarlyStopping(
+                monitor='val_loss',
+                patience=args.es_patience,
+                min_delta=args.early_stopping_min_delta,
+                restore_best_weights=False,
+                verbose=1,
+            ),
         ]
         if not args.cloud_ram_dataset:
             val_data = loader_va.load().map(add_graph_ids_to_targets_3d)
@@ -2666,8 +2706,13 @@ if args._chunk_worker:
             ReduceLROnPlateau(monitor='loss', patience=args.lr_patience,
                               factor=args.lr_red_factor, min_lr=args.min_lr,
                               min_delta=1e-8, verbose=1),
-            EarlyStopping(monitor='loss', patience=args.es_patience,
-                          restore_best_weights=False, verbose=1),
+            EarlyStopping(
+                monitor='loss',
+                patience=args.es_patience,
+                min_delta=args.early_stopping_min_delta,
+                restore_best_weights=False,
+                verbose=1,
+            ),
         ]
         val_data = None
         val_kwargs = {}
@@ -2748,8 +2793,8 @@ if boids_caches:
 
 # Build run tag
 run_tag = build_run_tag_3d(
-    effective_unique_reps, 
-    args.tr_set_repeats, 
+    args.run_tag_unique or effective_unique_reps,
+    args.tr_set_repeats,
     UPWEIGHT_NEAR_GOAL,
     args.critical_distance,
     args.distance_weight,
