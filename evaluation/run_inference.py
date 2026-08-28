@@ -1,13 +1,12 @@
-"""
-Standalone inference script.
+"""Standalone 2D GNCA inference and reporting.
+
 Loads saved GNCA weights, generates fresh test centers, runs inference, and plots.
 
-Usage: python -m boids.run_inference
-Edit the CONFIG block at the top to change settings.
+Canonical usage: ``python -m evaluation.run_inference``.
+The original ``python -m boids.run_inference`` command remains compatible.
 """
 import glob
 import os
-import sys
 import argparse
 import re
 
@@ -19,29 +18,14 @@ import tensorflow as tf
 from tensorflow.keras.optimizers import Adam
 from modules.boids import Boids
 from models.gnn_ca_simple_boids import GNNCASimpleBoids
-from boids.visualize_boids import _plot_individual_ranked as _plot_individual_ranked_shared
+from evaluation.visualize_boids import (
+    _get_tube_exterior,
+    _plot_individual_ranked as _plot_individual_ranked_shared,
+)
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
-from shapely.geometry import LineString, MultiPolygon, Point, Polygon
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-# ── CONFIG (edit these) ──────────────────────────────────────────────────────
-RUN_TAG         = "200x5_newl_cd_2.5_dw_2.5"
-INTERACTIVE     = True        # prompt user to type starting (x, y) coordinates
-QUADRANTS       = [1, 2, 3]
-N_CENTERS       = 15
-EXCLUSION       = 0.5
-VIZ_MODE        = "individual"
-N_BOIDS         = 100
-MAX_STEPS       = 2000
-NEAR_GOAL_VERBOSE = False
-NEAR_GOAL_RADIUS  = 1.0
-SKIP_QUADRANT_INFERENCE = True
-COLLISION_WARMUP_STEPS = 100
-OUTPUT_DIR      = "."
-# ─────────────────────────────────────────────────────────────────────────────
+from shapely.geometry import LineString, Point, Polygon
 
 QUADRANT_BOUNDS = {
     0: ( 0,  5,  0,  5),
@@ -49,12 +33,6 @@ QUADRANT_BOUNDS = {
     2: (-5,  0, -5,  0),
     3: ( 0,  5, -5,  0),
 }
-
-
-def _get_tube_exterior(tube):
-    if isinstance(tube, MultiPolygon):
-        tube = max(tube.geoms, key=lambda p: p.area)
-    return tube.exterior.xy
 
 
 def _count_collision_events(traj, threshold, warmup_steps=0):
@@ -382,44 +360,53 @@ def _run_comparison(args):
         f.write("\n".join(summary_lines) + "\n")
 
 
-def _parse_args():
+def _parse_args(argv=None):
     parser = argparse.ArgumentParser(description="2D GNCA inference")
     parser.add_argument("--mode", choices=["single", "comparison"], default="single")
-    parser.add_argument("--run_tag", default=RUN_TAG)
+    parser.add_argument("--run_tag", default="")
     parser.add_argument("--weights_dir", default="important_weights_2d")
     parser.add_argument("--models", nargs="*", default=None,
                         help="Checkpoint prefixes/files to compare. Defaults to all models in --weights_dir.")
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--centers_per_quadrant", type=int, default=10)
     parser.add_argument("--quadrants", nargs="+", type=int, default=[0, 1, 2, 3])
-    parser.add_argument("--n_centers", type=int, default=N_CENTERS,
+    parser.add_argument("--n_centers", type=int, default=15,
                         help="Single-mode total random centers. Ignored by comparison mode.")
     parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--max_steps", type=int, default=MAX_STEPS)
+    parser.add_argument("--max_steps", type=int, default=2000)
     parser.add_argument("--success_threshold", type=float, default=0.5)
-    parser.add_argument("--n_boids", type=int, default=N_BOIDS)
-    parser.add_argument("--exclusion", type=float, default=EXCLUSION)
-    parser.add_argument("--viz_mode", choices=["individual", "multi_tubular"], default=VIZ_MODE)
-    parser.add_argument("--interactive", action="store_true", default=INTERACTIVE)
-    parser.add_argument("--skip_quadrant_inference", action="store_true", default=SKIP_QUADRANT_INFERENCE)
-    parser.add_argument("--near_goal_verbose", action="store_true", default=NEAR_GOAL_VERBOSE)
-    parser.add_argument("--near_goal_radius", type=float, default=NEAR_GOAL_RADIUS)
-    parser.add_argument("--collision_warmup_steps", type=int, default=COLLISION_WARMUP_STEPS)
+    parser.add_argument("--n_boids", type=int, default=100)
+    parser.add_argument("--exclusion", type=float, default=0.5)
+    parser.add_argument(
+        "--viz_mode",
+        choices=["individual", "multi_tubular"],
+        default="individual",
+    )
+    parser.add_argument("--interactive", action="store_true")
+    parser.add_argument("--skip_quadrant_inference", action="store_true")
+    parser.add_argument("--near_goal_verbose", action="store_true")
+    parser.add_argument("--near_goal_radius", type=float, default=1.0)
+    parser.add_argument("--collision_warmup_steps", type=int, default=100)
     parser.add_argument("--print_collisions", action="store_true", default=False)
     parser.add_argument("--compare_ground_truth", action="store_true", default=False)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main():
-    args = _parse_args()
+def main(argv=None):
+    args = _parse_args(argv)
     if args.output_dir is None:
-        args.output_dir = "comparison_inference_2d" if args.mode == "comparison" else OUTPUT_DIR
+        args.output_dir = (
+            "comparison_inference_2d" if args.mode == "comparison" else "."
+        )
     os.makedirs(args.output_dir, exist_ok=True)
     if args.mode == "comparison":
         _run_comparison(args)
         return
 
     # ── Load weights ────────────────────────────────────────────────────────
+    if not args.run_tag:
+        raise ValueError("Single mode requires --run_tag.")
+    np.random.seed(args.seed)
     model = _load_model(_find_single_weights(args.run_tag))
 
     # ── Build boids + exclusion zone ─────────────────────────────────────────
@@ -441,7 +428,6 @@ def main():
     print(f"Generated {len(test_centers)} test centers ({n_per_q} per quadrant, quadrants={args.quadrants})")
 
     # ── Run inference ────────────────────────────────────────────────────────
-    trajs = []
     collision_counts = []
     q_labels = {0: "Q1(top-right)", 1: "Q2(top-left)", 2: "Q3(bot-left)", 3: "Q4(bot-right)"}
     center_q_map = [args.quadrants[k // n_per_q] for k in range(len(test_centers))]
@@ -538,40 +524,6 @@ def main():
             fname = os.path.join(args.output_dir, f"interactive_{cx:.1f}_{cy:.1f}.pdf")
             plt.savefig(fname); plt.close()
             print(f"  Saved {fname}\n")
-
-    # ── DEBUG: start flock AT goal 0 and see if GNCA navigates onward ────────
-    # print("\n>>> DEBUG: initializing flock at goal 0 (3,-3) ...")
-    # goal0_center = np.array([3.0, -3.0])
-    # pos_g0, vel_g0, _, _ = boids.get_random_init(N_BOIDS, save_config=False, center=goal0_center)
-    # frames_g0 = [np.concatenate([pos_g0, vel_g0], axis=-1).astype(np.float32)]
-    # for step in range(MAX_STEPS - 1):
-    #     x = frames_g0[-1]
-    #     a = to_tf_sparse(boids.get_neighbors(x[:, :2]))
-    #     x_next = model([tf.constant(x, dtype=tf.float32), a, step], training=False)
-    #     frames_g0.append(x_next.numpy())
-    #     if (step + 1) % 500 == 0:
-    #         centroid_now = x_next.numpy()[:, :2].mean(axis=0)
-    #         print(f"    step {step+1} | centroid=({centroid_now[0]:.3f},{centroid_now[1]:.3f})")
-    # traj_g0 = np.array(frames_g0)
-    # centroid_g0 = traj_g0[:, :, :2].mean(axis=1)
-    # for g_idx, g in enumerate(goals):
-    #     dists = np.linalg.norm(centroid_g0 - g[None, :], axis=-1)
-    #     print(f"  goal {g_idx} ({g[0]:.1f},{g[1]:.1f}): closest mean dist = {dists.min():.4f}")
-    # # plot it
-    # fig, ax = plt.subplots(figsize=(7, 7))
-    # ax.plot(centroid_g0[:, 0], centroid_g0[:, 1], lw=1.5, color="#8B0000")
-    # ax.scatter(goals[:, 0], goals[:, 1], c='red', marker='*', s=200, zorder=5)
-    # for g_idx, g in enumerate(goals):
-    #     ax.annotate(f"G{g_idx}", g, textcoords="offset points", xytext=(6, 6), fontsize=10)
-    # ax.scatter([goal0_center[0]], [goal0_center[1]], c='blue', marker='o', s=100, zorder=6, label='Start (goal 0)')
-    # ax.set_xlim(-5, 5); ax.set_ylim(-5, 5)
-    # ax.set_aspect('equal')
-    # ax.set_title("GNCA starting AT goal 0 — does it reach goal 1?")
-    # ax.legend()
-    # plt.tight_layout()
-    # fname = os.path.join(OUTPUT_DIR, "debug_start_at_goal0.pdf")
-    # plt.savefig(fname); plt.close()
-    # print(f"  Saved {fname}")
 
     # ── Ground-truth boids on same centers ───────────────────────────────────
     if args.compare_ground_truth and not args.skip_quadrant_inference:

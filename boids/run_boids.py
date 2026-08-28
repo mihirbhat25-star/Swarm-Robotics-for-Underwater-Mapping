@@ -1,5 +1,8 @@
-"""
-Trains the GNCA to imitate the Boids algorithm.
+"""Train the 2D GNCA to imitate the 2D Boids GCA.
+
+This remains the public experiment entry point. Bounded cache packing and
+streaming live in :mod:`runtime.local_2d`; model and experiment semantics stay
+here.
 """
 import argparse
 import atexit
@@ -14,22 +17,24 @@ import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
-import scipy.sparse as sp
 from spektral.data import DisjointLoader
-from spektral.data import Graph
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
-from boids.evaluate_boids import evaluate
+from evaluation.evaluate_boids import evaluate
 from boids.forward import forward
 from models.gnn_ca_simple_boids import GNNCASimpleBoids
 from modules.boids import (
     BOIDS_GOAL_POSITIONS,
     Boids,
-    BoidsDataset,
-    load_chunk_from_cache,
     make_dataset,
 )
 from modules.callbacks import ComplexityCallback
+from runtime.local_2d import (
+    dataset_from_batch_files,
+    load_validation_dataset,
+    save_validation_dataset,
+    write_batch_files,
+)
 import h5py
 import psutil
 
@@ -174,381 +179,6 @@ def _build_model_variables(model, n_boids):
     model([x_dummy, tf.sparse.reorder(a_dummy), tf.constant(0)], training=False)
 
 
-def save_dataset_npz(dataset, path, n_boids):
-    """Serialize a small Spektral dataset for subprocess validation."""
-    graphs = list(dataset.graphs)
-    max_edges = max((g.a.nnz for g in graphs), default=0)
-    x = np.stack([g.x for g in graphs], axis=0).astype(np.float32)
-    y = np.stack([g.y for g in graphs], axis=0).astype(np.float32)
-    a_row = np.full((len(graphs), max_edges), -1, dtype=np.int32)
-    a_col = np.full((len(graphs), max_edges), -1, dtype=np.int32)
-    a_len = np.zeros(len(graphs), dtype=np.int32)
-
-    for i, g in enumerate(graphs):
-        a = g.a.tocoo()
-        nnz = a.nnz
-        a_row[i, :nnz] = a.row
-        a_col[i, :nnz] = a.col
-        a_len[i] = nnz
-
-    np.savez_compressed(
-        path,
-        x=x,
-        y=y,
-        a_row=a_row,
-        a_col=a_col,
-        a_len=a_len,
-        n_boids=np.array([n_boids], dtype=np.int32),
-    )
-
-
-def load_dataset_npz(path):
-    """Rebuild a BoidsDataset from a serialized validation NPZ."""
-    data = np.load(path)
-    x, y = data["x"], data["y"]
-    a_row, a_col, a_len = data["a_row"], data["a_col"], data["a_len"]
-    n_boids = int(data["n_boids"][0])
-    graphs = []
-    for i in range(len(x)):
-        nnz = int(a_len[i])
-        a = sp.coo_matrix(
-            (np.ones(nnz, dtype=np.float32), (a_row[i, :nnz], a_col[i, :nnz])),
-            shape=(n_boids, n_boids),
-        )
-        graphs.append(Graph(x=x[i], a=a, y=y[i]))
-    return BoidsDataset(graphs)
-
-
-def make_disjoint_batch(x_list, y_list, row_list, col_list, len_list, n_boids):
-    """Pack per-timestep cached arrays into one disjoint sparse mini-batch."""
-    batch_size = len(x_list)
-    x = np.concatenate(x_list, axis=0).astype(np.float32)
-    y = np.concatenate(y_list, axis=0).astype(np.float32)
-
-    edge_rows = []
-    edge_cols = []
-    for b, (rows, cols, nnz) in enumerate(zip(row_list, col_list, len_list)):
-        nnz = int(nnz)
-        if nnz <= 0:
-            continue
-        offset = b * n_boids
-        edge_rows.append(rows[:nnz].astype(np.int64) + offset)
-        edge_cols.append(cols[:nnz].astype(np.int64) + offset)
-
-    if edge_rows:
-        indices = np.stack([np.concatenate(edge_rows), np.concatenate(edge_cols)], axis=1)
-        order = np.lexsort((indices[:, 1], indices[:, 0]))
-        indices = indices[order]
-        values = np.ones(indices.shape[0], dtype=np.float32)
-    else:
-        indices = np.zeros((0, 2), dtype=np.int64)
-        values = np.zeros((0,), dtype=np.float32)
-
-    n_nodes = batch_size * n_boids
-    dense_shape = np.array([n_nodes, n_nodes], dtype=np.int64)
-    step_i = np.repeat(np.arange(batch_size), n_boids).astype(np.int64)
-    return (x, indices, values, dense_shape, step_i), y
-
-
-def batch_to_tf_sparse(batch):
-    """Convert a compact NumPy disjoint batch into model-ready TensorFlow inputs."""
-    (x, indices, values, dense_shape, step_i), y = batch
-    adj = tf.SparseTensor(indices=indices, values=values, dense_shape=dense_shape)
-    return (x, adj, step_i), y
-
-
-def _load_adaptive_xy(f, start, end, timestep_stride, near_goal_radius):
-    """Load selected states/targets without trusting the cached adjacency."""
-    if timestep_stride <= 1 or near_goal_radius <= 0:
-        return f["x"][start:end:timestep_stride], f["y"][start:end:timestep_stride]
-
-    x_full = f["x"][start:end]
-    y_full = f["y"][start:end]
-    mean_pos = x_full[:, :, :2].mean(axis=1)
-    dist_to_goal = np.min(
-        np.linalg.norm(
-            mean_pos[:, None, :] - BOIDS_GOAL_POSITIONS[None, :, :],
-            axis=-1,
-        ),
-        axis=1,
-    )
-
-    keep = np.zeros(end - start, dtype=bool)
-    keep[::timestep_stride] = True
-    keep |= dist_to_goal < near_goal_radius
-    return x_full[keep], y_full[keep]
-
-
-def _adjacency_indices_from_state(x, perception):
-    """Rebuild the graph from the current positions in one cached sample."""
-    positions = x[:, :2]
-    distances = np.linalg.norm(
-        positions[:, None, :] - positions[None, :, :], axis=-1
-    )
-    neighbors = distances < perception
-    np.fill_diagonal(neighbors, False)
-    return np.nonzero(neighbors)
-
-
-def write_cached_chunk_batches(cache_path, flat_indices, boundaries, n_boids, batch_size,
-                               output_dir, timestep_stride=1, near_goal_radius=1.0,
-                               perception=0.1, shuffle_buffer_size=4096):
-    """Write sample-shuffled disjoint batches with adjacency rebuilt from x."""
-    os.makedirs(output_dir, exist_ok=True)
-    batch_paths = []
-    x_batch, y_batch, row_batch, col_batch, len_batch = [], [], [], [], []
-    shuffle_buffer = []
-    shuffle_buffer_size = max(batch_size, int(shuffle_buffer_size))
-    rng = np.random.default_rng()
-
-    def flush_batch():
-        nonlocal x_batch, y_batch, row_batch, col_batch, len_batch
-        batch = make_disjoint_batch(
-            x_batch, y_batch, row_batch, col_batch, len_batch, n_boids
-        )
-        (x, indices, values, dense_shape, step_i), y = batch
-        path = os.path.join(output_dir, f"batch_{len(batch_paths):05d}.npz")
-        np.savez(
-            path,
-            x=x,
-            indices=indices,
-            values=values,
-            dense_shape=dense_shape,
-            step_i=step_i,
-            y=y,
-        )
-        batch_paths.append(path)
-        x_batch, y_batch, row_batch, col_batch, len_batch = [], [], [], [], []
-
-    def emit_sample(sample):
-        x, y, row, col = sample
-        x_batch.append(x)
-        y_batch.append(y)
-        row_batch.append(row)
-        col_batch.append(col)
-        len_batch.append(len(row))
-        if len(x_batch) == batch_size:
-            flush_batch()
-
-    def emit_random_buffered_sample():
-        sample_idx = int(rng.integers(len(shuffle_buffer)))
-        sample = shuffle_buffer[sample_idx]
-        shuffle_buffer[sample_idx] = shuffle_buffer[-1]
-        shuffle_buffer.pop()
-        emit_sample(sample)
-
-    with h5py.File(cache_path, "r") as f:
-        trajectory_order = rng.permutation(np.array(flat_indices, dtype=np.int64))
-        for flat_idx in trajectory_order:
-            start = int(boundaries[flat_idx])
-            end = int(boundaries[flat_idx + 1])
-            x_c, y_c = _load_adaptive_xy(
-                f, start, end, timestep_stride, near_goal_radius
-            )
-            for k in rng.permutation(len(x_c)):
-                row, col = _adjacency_indices_from_state(x_c[k], perception)
-                shuffle_buffer.append((x_c[k].copy(), y_c[k].copy(), row, col))
-                if len(shuffle_buffer) >= shuffle_buffer_size:
-                    emit_random_buffered_sample()
-            del x_c, y_c
-
-    while shuffle_buffer:
-        emit_random_buffered_sample()
-
-    if x_batch:
-        flush_batch()
-    return batch_paths, max(1, len(batch_paths))
-
-
-def dataset_from_batch_files(batch_paths):
-    """Create a repeatable tf.data dataset from compact disjoint batch files."""
-    def generator():
-        for path in np.random.permutation(batch_paths):
-            with np.load(path) as batch:
-                yield batch_to_tf_sparse((
-                    (
-                        batch["x"],
-                        batch["indices"],
-                        batch["values"],
-                        batch["dense_shape"],
-                        batch["step_i"],
-                    ),
-                    batch["y"],
-                ))
-
-    output_signature = (
-        (
-            tf.TensorSpec(shape=(None, 4), dtype=tf.float32),
-            tf.SparseTensorSpec(shape=(None, None), dtype=tf.float32),
-            tf.TensorSpec(shape=(None,), dtype=tf.int64),
-        ),
-        tf.TensorSpec(shape=(None, 10), dtype=tf.float32),
-    )
-    return tf.data.Dataset.from_generator(generator, output_signature=output_signature).repeat()
-
-
-def run_chunked(boids_cache_path, flat_traj_indices, boundaries, cache_info, data_va, run_tag):
-    """Sequential chunk fine-tuning with val_loss early stopping per chunk.
-
-    For each chunk:
-      1. tf.keras.backend.clear_session() — frees ALL TF memory from previous chunk.
-      2. Rebuild model fresh and restore weights from previous chunk (numpy arrays).
-      3. Load chunk data from HDF5.
-      4. Train with val_loss EarlyStopping until this chunk converges.
-      5. Save best weights as numpy arrays; track current LR.
-      6. Free all Python/TF objects. Repeat.
-
-    clear_session() between chunks prevents the cumulative TF eager-kernel and
-    optimizer-state memory growth that causes OOM on long chunk sequences.
-    """
-    chunk_size     = args.chunk_size
-    chunk_patience = args.chunk_patience
-    n_boids_c      = cache_info['n_boids']
-    stride           = cache_info['timestep_stride']
-    near_goal_radius = cache_info.get('near_goal_radius', 1.0)
-    cache_repeats    = cache_info.get('cache_repeats', 1)
-    centers          = cache_info.get('centers', None)  # (cache_unique, 2) center coords
-
-    os.makedirs("saved_models", exist_ok=True)
-
-    # ── Build quadrant-balanced chunks ───────────────────────────────────
-    from boids.generate_boids_cache import QUADRANTS
-
-    def _center_quadrant(flat_idx):
-        """Return quadrant index (0-3) for a flat trajectory index."""
-        if centers is None:
-            return 0
-        ci = int(flat_idx) // cache_repeats
-        cx, cy = centers[ci]
-        for q, (xmn, xmx, ymn, ymx, _) in enumerate(QUADRANTS):
-            if xmn <= cx <= xmx and ymn <= cy <= ymx:
-                return q
-        return 0
-
-    # Group all flat indices by quadrant, then shuffle each bucket
-    q_buckets = [[] for _ in range(4)]
-    for fi in flat_traj_indices:
-        q_buckets[_center_quadrant(fi)].append(fi)
-    for q in range(4):
-        np.random.shuffle(q_buckets[q])
-
-    # Find non-empty quadrants and interleave from them only
-    active_quads = [q for q in range(4) if len(q_buckets[q]) > 0]
-    n_per_q   = chunk_size // len(active_quads) if active_quads else chunk_size
-    remainder = chunk_size % len(active_quads) if active_quads else 0
-    q_ptrs = [0, 0, 0, 0]
-    balanced_chunks = []
-    while any(q_ptrs[q] < len(q_buckets[q]) for q in active_quads):
-        chunk = []
-        for i, q in enumerate(active_quads):
-            take = n_per_q + (1 if i < remainder else 0)
-            end  = min(q_ptrs[q] + take, len(q_buckets[q]))
-            chunk.extend(q_buckets[q][q_ptrs[q]:end])
-            q_ptrs[q] = end
-        if chunk:
-            balanced_chunks.append(np.array(chunk, dtype=np.int64))
-    n_chunks = len(balanced_chunks)
-
-    # Weight state carried across chunks as plain numpy lists (survive clear_session).
-    saved_weights_np = None   # None → chunk 1 starts from random init
-    saved_lr         = args.lr
-    last_chunk_losses = []
-    total_trajs = sum(len(c) for c in balanced_chunks)
-
-    print(f"\n>>> Chunked training: {total_trajs} trajectories, "
-          f"chunk_size={chunk_size} ({n_chunks} balanced chunks), "
-          f"chunk_patience={chunk_patience} (val_loss early stopping per chunk)")
-
-    for chunk_num, chunk_idxs in enumerate(balanced_chunks, start=1):
-        # ── Per-chunk quadrant breakdown (debug) ─────────────────────────
-        q_counts = [0, 0, 0, 0]
-        for fi in chunk_idxs:
-            q_counts[_center_quadrant(fi)] += 1
-        q_summary = "  ".join(
-            f"{QUADRANTS[q][4]}:{q_counts[q]}" for q in range(4)
-        )
-        print(f"\n--- Chunk {chunk_num}/{n_chunks}  [{q_summary}] ---")
-
-        # ── 1. Clear ALL TF state from previous chunk ────────────────────
-        tf.keras.backend.clear_session()
-        gc.collect()
-
-        # ── 2. Rebuild model; restore previous chunk's weights ───────────
-        model = _build_model(saved_lr)
-        chunk_data = load_chunk_from_cache(
-            boids_cache_path, chunk_idxs, boundaries, n_boids_c, stride, near_goal_radius
-        )
-        loader_tr = DisjointLoader(chunk_data, node_level=True, batch_size=args.batch_size)
-        loader_va = DisjointLoader(data_va,    node_level=True, batch_size=args.batch_size)
-
-        if saved_weights_np is not None:
-            # Build the model with 1 step, then overwrite with saved weights.
-            model.fit(
-                loader_tr.load().map(add_graph_ids_to_targets),
-                steps_per_epoch=1,
-                epochs=1,
-                verbose=0,
-            )
-            model.set_weights(saved_weights_np)
-            # Recreate loaders — generators were exhausted by the build step.
-            loader_tr = DisjointLoader(chunk_data, node_level=True, batch_size=args.batch_size)
-            loader_va = DisjointLoader(data_va,    node_level=True, batch_size=args.batch_size)
-
-        # ── 3 & 4. Train until val_loss plateaus ─────────────────────────
-        h = model.fit(
-            loader_tr.load().map(add_graph_ids_to_targets),
-            steps_per_epoch=loader_tr.steps_per_epoch,
-            epochs=10_000,
-            validation_data=loader_va.load().map(add_graph_ids_to_targets),
-            validation_steps=loader_va.steps_per_epoch,
-            callbacks=[
-                EarlyStopping(
-                    monitor='val_loss',
-                    patience=chunk_patience,
-                    restore_best_weights=True,
-                    verbose=1,
-                ),
-                ReduceLROnPlateau(patience=args.lr_patience, min_delta=1e-8, verbose=1),
-            ],
-        )
-        last_chunk_losses = h.history.get('loss', [])
-
-        # ── 5. Persist weights & LR as numpy (survive clear_session) ─────
-        saved_weights_np = model.get_weights()
-        saved_lr = float(tf.keras.backend.get_value(model.optimizer.learning_rate))
-
-        # ── 6. Destroy all TF/Python objects ─────────────────────────────
-        del chunk_data, loader_tr, loader_va, h, model
-        gc.collect()
-
-        try:
-            rss_mb = psutil.Process().memory_info().rss / 1e6
-            print(f"  [chunk {chunk_num}/{n_chunks}] RAM after cleanup: {rss_mb:.0f} MB")
-        except ImportError:
-            print(f"  [chunk {chunk_num}/{n_chunks}] cleanup done (install psutil for RAM stats)")
-
-    # ── Reconstruct final model from saved weights for return ────────────
-    tf.keras.backend.clear_session()
-    gc.collect()
-    final_model = _build_model(saved_lr)
-    checkpoint_path = f"saved_models/best_weights_{run_tag}"
-    # Build via one validation batch then set weights.
-    loader_va_build = DisjointLoader(data_va, node_level=True, batch_size=args.batch_size)
-    final_model.fit(
-        loader_va_build.load().map(add_graph_ids_to_targets),
-        steps_per_epoch=1,
-        epochs=1,
-        verbose=0,
-    )
-    del loader_va_build
-    final_model.set_weights(saved_weights_np)
-    final_model.save_weights(checkpoint_path)   # persist to disk for post-training restore
-
-    print(f"\n✅ Chunked training done ({n_chunks} chunks). "
-          f"Final model = last chunk's best weights.")
-    return _HistoryProxy({'loss': last_chunk_losses}), final_model, _BestInfo(n_chunks, float('nan'))
-
-
 def run_chunked_subprocess(boids_cache_path, flat_traj_indices, boundaries, cache_info, data_va, run_tag):
     """Chunked 2D training with one subprocess per chunk to release RAM."""
     chunk_size = args.chunk_size
@@ -603,7 +233,7 @@ def run_chunked_subprocess(boids_cache_path, flat_traj_indices, boundaries, cach
         val_npz_file = os.path.join(tmpdir, "validation.npz")
         lr_state_file = os.path.join(tmpdir, "learning_rate.npy")
         np.save(boundaries_file, boundaries)
-        save_dataset_npz(data_va, val_npz_file, n_boids_c)
+        save_validation_dataset(data_va, val_npz_file, n_boids_c)
 
         for chunk_num, chunk_idxs in enumerate(chunks, start=1):
             q_counts = [0, 0, 0, 0]
@@ -675,7 +305,10 @@ def run_chunked_subprocess(boids_cache_path, flat_traj_indices, boundaries, cach
     )
     del loader_va_build
     final_model.load_weights(checkpoint_path).expect_partial()
-    print(f"\nâœ… Chunked training done ({len(chunks)} chunks). Final model = last chunk's best weights.")
+    print(
+        f"\n✅ Chunked training done ({len(chunks)} chunks). "
+        "Final model = last chunk's best weights."
+    )
     return _HistoryProxy({'loss': []}), final_model, _BestInfo(len(chunks), float('nan'))
 
 
@@ -950,7 +583,7 @@ if args._chunk_worker:
         flush=True,
     )
     print(">>> Worker setup: writing compact train batch files...", flush=True)
-    train_batch_paths, train_steps = write_cached_chunk_batches(
+    train_batch_paths, train_steps = write_batch_files(
         args._cache_path,
         chunk_flat,
         boundaries,
@@ -968,7 +601,7 @@ if args._chunk_worker:
         flush=True,
     )
     train_data = dataset_from_batch_files(train_batch_paths).map(add_graph_ids_to_targets)
-    data_val = load_dataset_npz(args._val_npz_file)
+    data_val = load_validation_dataset(args._val_npz_file)
 
     model = _build_model(args.lr)
     loader_va = DisjointLoader(data_val, node_level=True, batch_size=args.batch_size)

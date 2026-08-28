@@ -1,7 +1,7 @@
 import numpy as np
 from tensorflow.keras.callbacks import Callback
 
-from boids.evaluate_boids import evaluate_complexity
+from evaluation.evaluate_boids import evaluate_complexity
 from boids.forward import forward
 
 

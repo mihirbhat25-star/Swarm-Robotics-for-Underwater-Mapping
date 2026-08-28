@@ -1,11 +1,10 @@
 import numpy as np
 import scipy.sparse as sp
 from matplotlib import pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from spektral import utils
 from spektral.data import Dataset, Graph
 from tqdm import tqdm
-import tensorflow as tf
 import h5py
 
 
@@ -372,7 +371,6 @@ class Boids3D:
 
     def get_fixed_init(self, n_boids):
         center = np.array([-3.0, -3.0, -3.0])
-        # print("Using fixed initial configuration for reproducibility. Center of flock: ", center)
         self.rand_configs.append(center)
         positions = center + 0.325 * np.random.rand(n_boids, 3)
         direction = np.array([1.0, 0.0, 0.0])

@@ -1,8 +1,7 @@
-"""
-3D GNCA inference.
+"""Standalone 3D GNCA inference and reporting.
 
 Examples:
-  python -m boids.run_inference_3d \
+  python -m evaluation.run_inference_3d \
     --run_tag 500x2_3d_newl_cd_2.5_dw_2.5_500total_o01234567_bal_b256_p10_s5_fixedstepi_freshval7 \
     --octants 0 1 2 3 4 5 6 7 \
     --centers_per_octant 5 \
@@ -15,7 +14,6 @@ import argparse
 import glob
 import os
 import re
-import sys
 import warnings
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -28,8 +26,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.optimizers import Adam
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from models.gnn_ca_simple_boids_3d import GNNCASimpleBoids3D
 from modules.boids_3d import Boids3D

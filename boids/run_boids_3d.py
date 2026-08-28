@@ -1,7 +1,9 @@
+"""Train the 3D GNCA to imitate the 3D Boids GCA.
+
+This remains the experiment entry point. Computational data movement is
+selected with ``--backend local`` or ``--backend cloud`` and implemented in
+the :mod:`runtime` package; model and experiment semantics stay here.
 """
-Trains the 3D GNCA to imitate the 3D Boids GCA.
-"""
-import argparse
 import gc
 import os
 
@@ -20,28 +22,35 @@ import atexit
 import shutil
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import ExitStack
 warnings.filterwarnings('ignore')
-import joblib
-import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
 from spektral.data import DisjointLoader
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
-from boids.forward import forward
 from models.gnn_ca_simple_boids_3d import GNNCASimpleBoids3D
 from modules.boids_3d import (
     BOIDS_GOAL_POSITIONS_3D,
     FIXED_ORDER_POLICY,
     NEAREST_CCW_POLICY,
     Boids3D,
-    load_chunk_from_cache_3d,
     make_dataset_3d,
 )
+from runtime import CLOUD_BACKEND, LOCAL_BACKEND
+from runtime.cli_3d import build_parser, validate_args
+from runtime.cloud_3d import (
+    dataset_from_trajectories as cloud_dataset_from_trajectories,
+    fit_distributed as fit_cloud_distributed,
+    generate_compact_chunk as generate_cloud_chunk,
+)
+from runtime.chunking import proportional_chunk_allocations
+from runtime.local_3d import (
+    dataset_from_shards as local_dataset_from_shards,
+    load_validation_dataset,
+    save_validation_dataset,
+    write_batch_shards as write_local_batch_shards,
+)
 import h5py
-import scipy.sparse as sp
 import psutil
 
 physical_devices = tf.config.list_physical_devices("GPU")
@@ -69,17 +78,6 @@ def load_init_centers_from_npz(npz_path):
 
     print(f"✅ Loaded {len(centers)} initial start centers from {npz_path}")
     return [np.array(c, dtype=np.float32) for c in centers]
-
-def to_tf_sparse(a):
-    """Convert scipy sparse matrix to TensorFlow sparse tensor."""
-    indices = np.stack([a.row, a.col], axis=1)
-    a_tf = tf.SparseTensor(
-        indices=indices,
-        values=a.data.astype(np.float32),
-        dense_shape=a.shape
-    )
-    return tf.sparse.reorder(a_tf)
-
 
 def build_run_tag_3d(unique_reps, tr_repeats, upweight, critical_distance, distance_weight, noise_config):
     """Build run tag for 3D model saving."""
@@ -109,11 +107,9 @@ def print_run_parameters_3d(args, upweight, critical_distance, distance_weight, 
     print(f"Noise config:         {noise_config or ''}")
     print(f"Learning rate:        {args.lr}")
     print(f"Batch size:           {args.batch_size}")
-    print(f"Multi-GPU:            {args.multi_gpu}")
-    print(f"Cloud optimized:      {args.cloud_optimized}")
-    print(f"Cloud native data:    {args.cloud_native_dataset}")
-    print(f"Cloud RAM data:       {args.cloud_ram_dataset}")
-    print(f"Cloud BF16:           {args.cloud_bfloat16}")
+    print(f"Training backend:     {args.backend}")
+    if args.backend == CLOUD_BACKEND:
+        print(f"Visible GPUs:         {len(physical_devices)}")
     print(
         f"Execution:            "
         f"{'eager (debug)' if args.eager_training else 'compiled graph'}; "
@@ -135,12 +131,6 @@ def custom_weighted_mse_3d(y_true, y_pred):
     remains emphasized immediately after the active-goal label switches.
     y_pred is predicted next_state (6D).
     """
-    # BF16 is used only for cloud model compute. Keep target slicing, distance
-    # weighting, squared error, and loss reduction in float32 for stability.
-    if getattr(args, "cloud_bfloat16", False):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred, tf.float32)
-
     n_features = tf.shape(y_pred)[-1]  # Should be 6
     current_state = y_true[..., :n_features]
     next_state = y_true[..., n_features:2*n_features]
@@ -323,845 +313,6 @@ def make_validation_dataset_3d(args):
     )
 
 
-def save_dataset_npz_3d(dataset, path, n_boids):
-    """Serialize a small Spektral 3D dataset for subprocess validation."""
-    graphs = list(dataset.graphs)
-    max_edges = max((g.a.nnz for g in graphs), default=0)
-    x = np.stack([g.x for g in graphs], axis=0).astype(np.float32)
-    y = np.stack([g.y for g in graphs], axis=0).astype(np.float32)
-    a_row = np.full((len(graphs), max_edges), -1, dtype=np.int32)
-    a_col = np.full((len(graphs), max_edges), -1, dtype=np.int32)
-    a_len = np.zeros(len(graphs), dtype=np.int32)
-
-    for i, g in enumerate(graphs):
-        a = g.a.tocoo()
-        nnz = a.nnz
-        a_row[i, :nnz] = a.row
-        a_col[i, :nnz] = a.col
-        a_len[i] = nnz
-
-    np.savez_compressed(
-        path,
-        x=x,
-        y=y,
-        a_row=a_row,
-        a_col=a_col,
-        a_len=a_len,
-        n_boids=np.array([n_boids], dtype=np.int32),
-    )
-
-
-def make_disjoint_batch_3d(
-    x_list, y_list, row_list, col_list, len_list, n_boids, compact=False
-):
-    """Pack per-timestep cached arrays into one disjoint sparse mini-batch."""
-    batch_size = len(x_list)
-    x = np.concatenate(x_list, axis=0).astype(np.float32)
-    y = np.concatenate(y_list, axis=0).astype(np.float32)
-
-    edge_rows = []
-    edge_cols = []
-    for b, (rows, cols, nnz) in enumerate(zip(row_list, col_list, len_list)):
-        nnz = int(nnz)
-        if nnz <= 0:
-            continue
-        offset = b * n_boids
-        edge_rows.append(rows[:nnz].astype(np.int64) + offset)
-        edge_cols.append(cols[:nnz].astype(np.int64) + offset)
-
-    if edge_rows:
-        indices = np.stack([np.concatenate(edge_rows), np.concatenate(edge_cols)], axis=1)
-        # Cache COO entries are row-major sorted. Graph offsets increase with
-        # batch order, so concatenation remains SparseTensor-compatible without
-        # an expensive global lexsort for every mini-batch.
-        if compact:
-            return x, y, indices
-        values = np.ones(indices.shape[0], dtype=np.float32)
-    else:
-        indices = np.zeros((0, 2), dtype=np.int64)
-        if compact:
-            return x, y, indices
-        values = np.zeros((0,), dtype=np.float32)
-
-    n_nodes = batch_size * n_boids
-    dense_shape = np.array([n_nodes, n_nodes], dtype=np.int64)
-    step_i = np.repeat(np.arange(batch_size), n_boids).astype(np.int64)
-    return (x, indices, values, dense_shape, step_i), y
-
-
-def batch_to_tf_sparse_3d(batch):
-    """Convert a compact NumPy disjoint batch into model-ready TensorFlow inputs."""
-    (x, indices, values, dense_shape, step_i), y = batch
-    adj = tf.SparseTensor(indices=indices, values=values, dense_shape=dense_shape)
-    return (x, adj, step_i), y
-
-
-def _load_adaptive_cached_samples_3d(
-    f, start, end, timestep_stride, near_goal_radius
-):
-    """Load selected states, targets, and their cached current-state graphs."""
-    if timestep_stride <= 1 or near_goal_radius <= 0:
-        selection = slice(start, end, timestep_stride)
-        return (
-            f["x"][selection],
-            f["y"][selection],
-            f["a_row"][selection],
-            f["a_col"][selection],
-            f["a_len"][selection],
-        )
-
-    x_full = f["x"][start:end]
-    y_full = f["y"][start:end]
-    mean_pos = x_full[:, :, :3].mean(axis=1)
-    dist_to_goal = np.min(
-        np.linalg.norm(
-            mean_pos[:, None, :] - BOIDS_GOAL_POSITIONS_3D[None, :, :],
-            axis=-1,
-        ),
-        axis=1,
-    )
-
-    keep = np.zeros(end - start, dtype=bool)
-    keep[::timestep_stride] = True
-    keep |= dist_to_goal < near_goal_radius
-    absolute_indices = np.flatnonzero(keep) + start
-    return (
-        x_full[keep],
-        y_full[keep],
-        f["a_row"][absolute_indices],
-        f["a_col"][absolute_indices],
-        f["a_len"][absolute_indices],
-    )
-
-
-def _validate_cached_adjacency_3d(f, sample_indices, perception):
-    """Fail fast if a cache graph is not aligned with x or uses another radius."""
-    for sample_idx in sample_indices:
-        sample_idx = int(sample_idx)
-        x = f["x"][sample_idx]
-        nnz = int(f["a_len"][sample_idx])
-        cached = set(zip(
-            f["a_row"][sample_idx, :nnz].tolist(),
-            f["a_col"][sample_idx, :nnz].tolist(),
-        ))
-
-        positions = x[:, :3]
-        distances = np.linalg.norm(
-            positions[:, None, :] - positions[None, :, :], axis=-1
-        )
-        neighbors = distances < perception
-        np.fill_diagonal(neighbors, False)
-        row, col = np.nonzero(neighbors)
-        expected = set(zip(row.tolist(), col.tolist()))
-        if cached != expected:
-            raise ValueError(
-                "Cached adjacency does not match the current state at sample "
-                f"{sample_idx} for perception={perception}. Use a compatible "
-                "cache; training will not silently use a stale graph."
-            )
-        cached_pairs = np.column_stack((
-            f["a_row"][sample_idx, :nnz],
-            f["a_col"][sample_idx, :nnz],
-        ))
-        if nnz > 1:
-            order = np.lexsort((cached_pairs[:, 1], cached_pairs[:, 0]))
-            if not np.array_equal(order, np.arange(nnz)):
-                raise ValueError(
-                    f"Cached adjacency at sample {sample_idx} is not row-major "
-                    "sorted and cannot use the optimized sparse packing path."
-                )
-
-
-def _serialize_cloud_tfrecord_batch_3d(x, y, indices, n_boids):
-    """Serialize one packed graph batch without an intermediate NPZ shard."""
-    x = np.ascontiguousarray(x, dtype=np.float32)
-    y = np.ascontiguousarray(y, dtype=np.float32)
-    indices = np.ascontiguousarray(indices, dtype=np.int32)
-    example = tf.train.Example(features=tf.train.Features(feature={
-        "x": tf.train.Feature(bytes_list=tf.train.BytesList(value=[x.tobytes()])),
-        "y": tf.train.Feature(bytes_list=tf.train.BytesList(value=[y.tobytes()])),
-        "indices": tf.train.Feature(
-            bytes_list=tf.train.BytesList(value=[indices.tobytes()])
-        ),
-        "n_nodes": tf.train.Feature(
-            int64_list=tf.train.Int64List(value=[len(x)])
-        ),
-        "n_edges": tf.train.Feature(
-            int64_list=tf.train.Int64List(value=[len(indices)])
-        ),
-        "n_boids": tf.train.Feature(
-            int64_list=tf.train.Int64List(value=[int(n_boids)])
-        ),
-    }))
-    return example.SerializeToString()
-
-
-_CLOUD_TFRECORD_SPEC_3D = {
-    "x": tf.io.FixedLenFeature([], tf.string),
-    "y": tf.io.FixedLenFeature([], tf.string),
-    "indices": tf.io.FixedLenFeature([], tf.string),
-    "n_nodes": tf.io.FixedLenFeature([], tf.int64),
-    "n_edges": tf.io.FixedLenFeature([], tf.int64),
-    "n_boids": tf.io.FixedLenFeature([], tf.int64),
-}
-
-
-def _parse_cloud_tfrecord_batch_3d(serialized):
-    """Parse one direct TFRecord batch entirely with TensorFlow operations."""
-    record = tf.io.parse_single_example(serialized, _CLOUD_TFRECORD_SPEC_3D)
-    n_nodes = record["n_nodes"]
-    n_edges = record["n_edges"]
-    n_boids = record["n_boids"]
-
-    x = tf.reshape(
-        tf.io.decode_raw(record["x"], tf.float32),
-        tf.stack([n_nodes, tf.constant(6, dtype=tf.int64)]),
-    )
-    y = tf.reshape(
-        tf.io.decode_raw(record["y"], tf.float32),
-        tf.stack([n_nodes, tf.constant(15, dtype=tf.int64)]),
-    )
-    indices = tf.reshape(
-        tf.io.decode_raw(record["indices"], tf.int32),
-        tf.stack([n_edges, tf.constant(2, dtype=tf.int64)]),
-    )
-    indices = tf.cast(indices, tf.int64)
-    adjacency = tf.SparseTensor(
-        indices=indices,
-        values=tf.ones([n_edges], dtype=tf.float32),
-        dense_shape=tf.stack([n_nodes, n_nodes]),
-    )
-    graph_count = n_nodes // n_boids
-    graph_ids = tf.repeat(tf.range(graph_count, dtype=tf.int64), n_boids)
-    x = tf.ensure_shape(x, [None, 6])
-    y = tf.ensure_shape(y, [None, 15])
-    graph_ids = tf.ensure_shape(graph_ids, [None])
-    return (x, adjacency, graph_ids), y
-
-
-def dataset_from_cloud_tfrecord_shards_3d(shard_paths, steps):
-    """Load packed batches through native C++ TFRecord readers and parsers."""
-    if not shard_paths:
-        raise ValueError("Cloud TFRecord dataset received no shard paths.")
-    dataset = tf.data.TFRecordDataset(
-        shard_paths,
-        compression_type="",
-        num_parallel_reads=tf.data.AUTOTUNE,
-    )
-    dataset = dataset.map(
-        _parse_cloud_tfrecord_batch_3d,
-        num_parallel_calls=tf.data.AUTOTUNE,
-        deterministic=False,
-    )
-    dataset = dataset.map(
-        add_graph_ids_to_targets_3d,
-        num_parallel_calls=tf.data.AUTOTUNE,
-        deterministic=False,
-    )
-    if steps > 1:
-        dataset = dataset.shuffle(
-            min(256, int(steps)),
-            reshuffle_each_iteration=True,
-        )
-    options = tf.data.Options()
-    options.deterministic = False
-    return dataset.with_options(options).repeat().prefetch(tf.data.AUTOTUNE)
-
-
-def _generate_compact_ram_chunk_3d(chunk_idx, octant_counts):
-    """Generate compact trajectories in CPU workers and return them in RAM."""
-    from boids.cloud_ram_data_3d import generate_compact_task_3d
-
-    total = sum(octant_counts.values())
-    workers = args.generation_workers
-    if workers <= 0:
-        workers = max(1, (os.cpu_count() or 2) - 2)
-    workers = max(1, min(workers, total))
-    task_configs = []
-    task_idx = 0
-    for octant, count in sorted(octant_counts.items()):
-        # One trajectory per task lets Loky dynamically feed the next job to
-        # whichever worker finishes first.  Trajectory lengths vary, so this
-        # avoids making an entire chunk wait for one slow five-trajectory task.
-        for _ in range(count):
-            task_configs.append({
-                "octant": int(octant),
-                "count": 1,
-                "seed": int((
-                    args.generation_seed
-                    + chunk_idx * 1_000_003
-                    + task_idx
-                ) % (2**32 - 1)),
-                "n_boids": int(args.n_boids),
-                "perception": float(args.perception),
-                "pos_noise": float(args.expert_pos_noise),
-                "vel_noise": float(args.expert_vel_noise),
-                "waypoint_order_policy": _expert_waypoint_policy_3d(args),
-                "goal_exclusion_size": float(args.goal_exclusion_size),
-            })
-            task_idx += 1
-
-    print(
-        f">>> Cloud RAM: generating {total} trajectories across "
-        f"{len(task_configs)} tasks with {workers} CPU workers...",
-        flush=True,
-    )
-    generation_t0 = time.time()
-    previous_cuda_visibility = os.environ.get("CUDA_VISIBLE_DEVICES")
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
-        os.environ.setdefault(name, "1")
-    try:
-        task_results = joblib.Parallel(
-            n_jobs=workers,
-            backend="loky",
-            batch_size=1,
-            pre_dispatch=workers,
-            max_nbytes=None,
-        )(
-            joblib.delayed(generate_compact_task_3d)(config)
-            for config in task_configs
-        )
-    finally:
-        if previous_cuda_visibility is None:
-            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-        else:
-            os.environ["CUDA_VISIBLE_DEVICES"] = previous_cuda_visibility
-
-    trajectories = []
-    centers = []
-    center_octants = []
-    task_records = []
-    for result in task_results:
-        trajectories.extend(result["trajectories"])
-        centers.append(result["centers"])
-        center_octants.extend([result["octant"]] * result["count"])
-        task_records.append({
-            "octant": result["octant"],
-            "count": result["count"],
-            "seed": result["seed"],
-            "seconds": result["seconds"],
-        })
-
-    print(
-        f">>> Cloud RAM: expert trajectories ready in "
-        f"{time.time() - generation_t0:.1f}s; no HDF5 cache was written.",
-        flush=True,
-    )
-    return (
-        trajectories,
-        np.concatenate(centers, axis=0),
-        np.asarray(center_octants, dtype=np.int8),
-        task_records,
-    )
-
-
-def _selected_ram_sample_refs_3d(
-    trajectories, timestep_stride, near_goal_radius
-):
-    """Return shuffled (trajectory, timestep) references for RAM packing."""
-    trajectory_ids = []
-    timestep_ids = []
-    for trajectory_idx, trajectory in enumerate(trajectories):
-        n_steps = len(trajectory["x"])
-        if timestep_stride <= 1 or near_goal_radius <= 0:
-            selected = np.arange(0, n_steps, timestep_stride, dtype=np.int32)
-        else:
-            mean_pos = trajectory["x"][..., :3].mean(axis=1)
-            dist_to_goal = np.min(
-                np.linalg.norm(
-                    mean_pos[:, None, :]
-                    - BOIDS_GOAL_POSITIONS_3D[None, :, :],
-                    axis=-1,
-                ),
-                axis=1,
-            )
-            keep = np.zeros(n_steps, dtype=bool)
-            keep[::timestep_stride] = True
-            keep |= dist_to_goal < near_goal_radius
-            selected = np.flatnonzero(keep).astype(np.int32, copy=False)
-        trajectory_ids.append(
-            np.full(len(selected), trajectory_idx, dtype=np.int32)
-        )
-        timestep_ids.append(selected)
-    return np.concatenate(trajectory_ids), np.concatenate(timestep_ids)
-
-
-def _ram_batch_to_model_inputs_3d(x, y, indices, n_boids):
-    indices = tf.cast(indices, tf.int64)
-    n_nodes = tf.shape(x, out_type=tf.int64)[0]
-    adjacency = tf.SparseTensor(
-        indices=indices,
-        values=tf.ones([tf.shape(indices)[0]], dtype=tf.float32),
-        dense_shape=tf.stack([n_nodes, n_nodes]),
-    )
-    graph_count = n_nodes // tf.cast(n_boids, tf.int64)
-    graph_ids = tf.repeat(
-        tf.range(graph_count, dtype=tf.int64), tf.cast(n_boids, tf.int64)
-    )
-    targets = tf.concat(
-        [y, tf.cast(graph_ids[:, None], y.dtype)], axis=-1
-    )
-    x = tf.ensure_shape(x, [None, 6])
-    targets = tf.ensure_shape(targets, [None, 16])
-    graph_ids = tf.ensure_shape(graph_ids, [None])
-    return (x, adjacency, graph_ids), targets
-
-
-def dataset_from_compact_ram_trajectories_3d(
-    trajectories,
-    batch_size,
-    n_boids,
-    timestep_stride,
-    near_goal_radius,
-    seed,
-    drop_remainder=True,
-    shuffle_batches=True,
-):
-    """Pack a chunk once in RAM and expose it through native ``tf.data``."""
-    pack_t0 = time.time()
-    trajectory_ids, timestep_ids = _selected_ram_sample_refs_3d(
-        trajectories, timestep_stride, near_goal_radius
-    )
-    rng = np.random.default_rng(seed)
-    order = rng.permutation(len(trajectory_ids))
-    trajectory_ids = trajectory_ids[order]
-    timestep_ids = timestep_ids[order]
-
-    if drop_remainder:
-        usable = (len(order) // batch_size) * batch_size
-        trajectory_ids = trajectory_ids[:usable]
-        timestep_ids = timestep_ids[:usable]
-    n_batches = int(np.ceil(len(trajectory_ids) / batch_size))
-    if n_batches < 1:
-        raise ValueError("Cloud RAM mode produced no trainable batches.")
-    if len(trajectory_ids) % batch_size:
-        raise ValueError(
-            "Cloud RAM tensor packing currently requires complete batches."
-        )
-
-    n_nodes = batch_size * n_boids
-    x_batches = np.empty((n_batches, n_nodes, 6), dtype=np.float32)
-    y_batches = np.empty((n_batches, n_nodes, 15), dtype=np.float32)
-    edge_batches = []
-    edge_lengths = np.zeros(n_batches, dtype=np.int64)
-
-    # Gather dense states in vectorized trajectory-sized blocks. The previous
-    # implementation copied X and Y inside the per-sample Python loop (hundreds
-    # of thousands of iterations for a 400-trajectory chunk). This produces
-    # identical packed tensors with only one NumPy assignment per trajectory.
-    x_samples = x_batches.reshape(-1, n_boids, 6)
-    y_samples = y_batches.reshape(-1, n_boids, 15)
-    grouped_positions = np.argsort(trajectory_ids, kind="stable")
-    trajectory_counts = np.bincount(
-        trajectory_ids, minlength=len(trajectories)
-    )
-    trajectory_splits = np.concatenate((
-        np.zeros(1, dtype=np.int64),
-        np.cumsum(trajectory_counts, dtype=np.int64),
-    ))
-    for trajectory_idx, trajectory in enumerate(trajectories):
-        group_start = int(trajectory_splits[trajectory_idx])
-        group_stop = int(trajectory_splits[trajectory_idx + 1])
-        if group_start == group_stop:
-            continue
-        sample_positions = grouped_positions[group_start:group_stop]
-        selected_steps = timestep_ids[sample_positions]
-        x_samples[sample_positions] = trajectory["x"][selected_steps]
-        y_samples[sample_positions] = trajectory["y"][selected_steps]
-
-    for batch_idx in range(n_batches):
-        start = batch_idx * batch_size
-        stop = start + batch_size
-        batch_edge_parts = []
-        for graph_idx, sample_idx in enumerate(range(start, stop)):
-            trajectory = trajectories[int(trajectory_ids[sample_idx])]
-            timestep = int(timestep_ids[sample_idx])
-            node_start = graph_idx * n_boids
-            edge_start = int(trajectory["edge_offsets"][timestep])
-            edge_stop = int(trajectory["edge_offsets"][timestep + 1])
-            if edge_stop > edge_start:
-                batch_edge_parts.append(
-                    trajectory["edge_values"][edge_start:edge_stop]
-                    + np.int32(node_start)
-                )
-        if batch_edge_parts:
-            batch_edges = np.concatenate(batch_edge_parts, axis=0)
-        else:
-            batch_edges = np.zeros((0, 2), dtype=np.int32)
-        edge_batches.append(batch_edges)
-        edge_lengths[batch_idx] = len(batch_edges)
-
-    edge_values = (
-        np.concatenate(edge_batches, axis=0)
-        if np.sum(edge_lengths) > 0
-        else np.zeros((0, 2), dtype=np.int32)
-    )
-    edge_splits = np.concatenate((
-        np.zeros(1, dtype=np.int64),
-        np.cumsum(edge_lengths, dtype=np.int64),
-    ))
-
-    with tf.device("/CPU:0"):
-        x_tensor = tf.convert_to_tensor(x_batches)
-        y_tensor = tf.convert_to_tensor(y_batches)
-        edge_tensor = tf.RaggedTensor.from_row_splits(
-            tf.convert_to_tensor(edge_values),
-            tf.convert_to_tensor(edge_splits),
-            validate=False,
-        )
-        dataset = tf.data.Dataset.from_tensor_slices(
-            (x_tensor, y_tensor, edge_tensor)
-        )
-    dataset = dataset.map(
-        lambda x, y, indices: _ram_batch_to_model_inputs_3d(
-            x, y, indices, n_boids
-        ),
-        num_parallel_calls=tf.data.AUTOTUNE,
-        deterministic=False,
-    )
-    if shuffle_batches and n_batches > 1:
-        dataset = dataset.shuffle(
-            min(256, n_batches),
-            seed=seed,
-            reshuffle_each_iteration=True,
-        )
-    options = tf.data.Options()
-    options.deterministic = False
-    dataset = dataset.with_options(options).repeat().prefetch(tf.data.AUTOTUNE)
-    resident_gb = (
-        x_batches.nbytes + y_batches.nbytes + edge_values.nbytes
-    ) / (1024 ** 3)
-    print(
-        f">>> Cloud RAM: packed {n_batches} batches in "
-        f"{time.time() - pack_t0:.1f}s ({resident_gb:.1f} GiB resident); "
-        "no TFRecord was written.",
-        flush=True,
-    )
-    return dataset, n_batches
-
-
-def write_cached_chunk_shards_3d(
-    cache_paths,
-    trajectory_refs,
-    boundaries_by_cache,
-    n_boids,
-    batch_size,
-    output_dir,
-    timestep_stride=1,
-    near_goal_radius=1.0,
-    perception=0.1,
-    shuffle_buffer_size=4096,
-    batches_per_shard=16,
-    drop_remainder=False,
-    native_tfrecord=False,
-):
-    """Write shuffled disjoint batches into compact multi-batch shards.
-
-    Trajectory order is randomized first, then individual timesteps pass through
-    a bounded shuffle buffer before packing.  This prevents the optimizer from
-    receiving thousands of adjacent states from one trajectory in sequence.
-    Cached current-state adjacency is reused instead of rebuilding an O(N^2)
-    distance matrix for every sample. Sparse values and shapes are reconstructed
-    while loading, and int32 indices are stored on disk to reduce temporary data.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    shard_paths = []
-    shard_batches = []
-    record_writer = None
-    record_batches_in_shard = 0
-    total_batches = 0
-    x_batch, y_batch, row_batch, col_batch, len_batch = [], [], [], [], []
-    shuffle_buffer = []
-    shuffle_buffer_size = max(batch_size, int(shuffle_buffer_size))
-    batches_per_shard = max(1, int(batches_per_shard))
-    rng = np.random.default_rng()
-
-    def write_record_batch(x, y, indices):
-        nonlocal record_writer, record_batches_in_shard
-        if record_writer is None:
-            path = os.path.join(
-                output_dir, f"shard_{len(shard_paths):05d}.tfrecord"
-            )
-            record_writer = tf.io.TFRecordWriter(path)
-            shard_paths.append(path)
-            record_batches_in_shard = 0
-        record_writer.write(
-            _serialize_cloud_tfrecord_batch_3d(x, y, indices, n_boids)
-        )
-        record_batches_in_shard += 1
-        if record_batches_in_shard >= batches_per_shard:
-            record_writer.close()
-            record_writer = None
-            record_batches_in_shard = 0
-
-    def flush_shard():
-        nonlocal shard_batches
-        if not shard_batches:
-            return
-
-        node_lengths = np.asarray(
-            [len(batch[0]) for batch in shard_batches], dtype=np.int64
-        )
-        edge_lengths = np.asarray(
-            [len(batch[2]) for batch in shard_batches], dtype=np.int64
-        )
-        node_offsets = np.concatenate([
-            np.zeros(1, dtype=np.int64), np.cumsum(node_lengths)
-        ])
-        edge_offsets = np.concatenate([
-            np.zeros(1, dtype=np.int64), np.cumsum(edge_lengths)
-        ])
-        path = os.path.join(output_dir, f"shard_{len(shard_paths):05d}.npz")
-        np.savez(
-            path,
-            x=np.concatenate([batch[0] for batch in shard_batches], axis=0),
-            y=np.concatenate([batch[1] for batch in shard_batches], axis=0),
-            indices=np.concatenate(
-                [batch[2] for batch in shard_batches], axis=0
-            ).astype(np.int32, copy=False),
-            node_offsets=node_offsets,
-            edge_offsets=edge_offsets,
-            n_boids=np.asarray(n_boids, dtype=np.int32),
-        )
-        shard_paths.append(path)
-        shard_batches = []
-
-    def flush_batch():
-        nonlocal total_batches, x_batch, y_batch, row_batch, col_batch, len_batch
-        x, y, indices = make_disjoint_batch_3d(
-            x_batch,
-            y_batch,
-            row_batch,
-            col_batch,
-            len_batch,
-            n_boids,
-            compact=True,
-        )
-        if native_tfrecord:
-            write_record_batch(x, y, indices)
-        else:
-            shard_batches.append((x, y, indices))
-        total_batches += 1
-        x_batch, y_batch, row_batch, col_batch, len_batch = [], [], [], [], []
-        if not native_tfrecord and len(shard_batches) >= batches_per_shard:
-            flush_shard()
-
-    def emit_sample(sample):
-        x, y, row, col = sample
-        x_batch.append(x)
-        y_batch.append(y)
-        row_batch.append(row)
-        col_batch.append(col)
-        len_batch.append(len(row))
-        if len(x_batch) == batch_size:
-            flush_batch()
-
-    def emit_random_buffered_sample():
-        sample_idx = int(rng.integers(len(shuffle_buffer)))
-        sample = shuffle_buffer[sample_idx]
-        shuffle_buffer[sample_idx] = shuffle_buffer[-1]
-        shuffle_buffer.pop()
-        emit_sample(sample)
-
-    with ExitStack() as stack:
-        caches = [stack.enter_context(h5py.File(path, "r")) for path in cache_paths]
-        refs = np.asarray(trajectory_refs, dtype=np.int64).reshape(-1, 2)
-        for cache_idx, f in enumerate(caches):
-            cache_refs = refs[refs[:, 0] == cache_idx, 1]
-            if len(cache_refs) == 0:
-                continue
-            boundaries = boundaries_by_cache[cache_idx]
-            probe_refs = cache_refs[np.linspace(
-                0, len(cache_refs) - 1, num=min(3, len(cache_refs)), dtype=int
-            )]
-            probe_samples = [int(boundaries[int(ref)]) for ref in probe_refs]
-            _validate_cached_adjacency_3d(f, probe_samples, perception)
-
-        trajectory_order = rng.permutation(refs)
-        for cache_idx, flat_idx in trajectory_order:
-            f = caches[int(cache_idx)]
-            boundaries = boundaries_by_cache[int(cache_idx)]
-            start = int(boundaries[int(flat_idx)])
-            end = int(boundaries[int(flat_idx) + 1])
-            x_c, y_c, row_c, col_c, len_c = _load_adaptive_cached_samples_3d(
-                f, start, end, timestep_stride, near_goal_radius
-            )
-            # Randomize individual timesteps before they enter the cross-
-            # trajectory buffer; adjacent expert states must not remain an
-            # optimizer batch merely because they share a trajectory.
-            for k in rng.permutation(len(x_c)):
-                nnz = int(len_c[k])
-                row = row_c[k, :nnz]
-                col = col_c[k, :nnz]
-                # Copy the sample so buffered views do not keep an entire
-                # trajectory-sized HDF5 slice alive in RAM.
-                shuffle_buffer.append((
-                    x_c[k].copy(),
-                    y_c[k].copy(),
-                    row.copy(),
-                    col.copy(),
-                ))
-                if len(shuffle_buffer) >= shuffle_buffer_size:
-                    emit_random_buffered_sample()
-            del x_c, y_c, row_c, col_c, len_c
-
-    while shuffle_buffer:
-        emit_random_buffered_sample()
-
-    if x_batch and not drop_remainder:
-        flush_batch()
-    if native_tfrecord:
-        if record_writer is not None:
-            record_writer.close()
-    else:
-        flush_shard()
-    return shard_paths, max(1, total_batches)
-
-
-def dataset_from_batch_shards_3d(shard_paths):
-    """Create a repeatable dataset while opening each shard only once per epoch."""
-    def generator():
-        # from_generator is restarted by repeat(), so this is a new random
-        # shard/batch order without retaining the full chunk in RAM.
-        for path in np.random.permutation(shard_paths):
-            with np.load(path) as shard:
-                # Materialize each uncompressed NPZ member once. Re-indexing an
-                # NpzFile member inside the batch loop would reopen the ZIP
-                # member and reload the entire shard for every mini-batch.
-                x_all = shard["x"]
-                y_all = shard["y"]
-                indices_all = shard["indices"]
-                node_offsets = shard["node_offsets"]
-                edge_offsets = shard["edge_offsets"]
-                batch_order = np.random.permutation(len(node_offsets) - 1)
-                n_boids = int(shard["n_boids"])
-                for batch_idx in batch_order:
-                    node_start = int(node_offsets[batch_idx])
-                    node_end = int(node_offsets[batch_idx + 1])
-                    edge_start = int(edge_offsets[batch_idx])
-                    edge_end = int(edge_offsets[batch_idx + 1])
-                    n_nodes = node_end - node_start
-                    graph_count = n_nodes // n_boids
-                    yield batch_to_tf_sparse_3d((
-                        (
-                            x_all[node_start:node_end],
-                            indices_all[edge_start:edge_end].astype(
-                                np.int64, copy=False
-                            ),
-                            np.ones(edge_end - edge_start, dtype=np.float32),
-                            np.asarray([n_nodes, n_nodes], dtype=np.int64),
-                            np.repeat(
-                                np.arange(graph_count, dtype=np.int64), n_boids
-                            ),
-                        ),
-                        y_all[node_start:node_end],
-                    ))
-
-    output_signature = (
-        (
-            tf.TensorSpec(shape=(None, 6), dtype=tf.float32),
-            tf.SparseTensorSpec(shape=(None, None), dtype=tf.float32),
-            tf.TensorSpec(shape=(None,), dtype=tf.int64),
-        ),
-        tf.TensorSpec(shape=(None, 15), dtype=tf.float32),
-    )
-    return tf.data.Dataset.from_generator(
-        generator, output_signature=output_signature
-    ).repeat()
-
-
-def materialize_cloud_native_dataset_3d(
-    dataset,
-    steps,
-    output_dir,
-    shuffle_batches,
-):
-    """Serialize one finite epoch and reload it through native tf.data I/O.
-
-    Materialization pays the Python generator cost once per chunk. Training
-    epochs subsequently read TensorFlow's native saved-dataset representation,
-    so no Python callback is required for each sparse graph batch.
-    """
-    steps = int(steps)
-    if steps < 1:
-        raise ValueError("Native cloud dataset requires at least one batch.")
-    if os.path.exists(output_dir):
-        shutil.rmtree(output_dir)
-
-    finite_dataset = dataset.take(steps)
-    save_t0 = time.time()
-    print(
-        f">>> Cloud native dataset: materializing {steps} batches to "
-        f"{output_dir}...",
-        flush=True,
-    )
-    finite_dataset.save(output_dir, compression=None)
-
-    def reader_func(shard_datasets):
-        # Shuffle/interleave native shards in TensorFlow rather than opening
-        # NPZ members and yielding batches from Python during every epoch.
-        return shard_datasets.shuffle(1024).interleave(
-            lambda shard: shard,
-            num_parallel_calls=tf.data.AUTOTUNE,
-            deterministic=False,
-        )
-
-    native_dataset = tf.data.Dataset.load(
-        output_dir,
-        element_spec=finite_dataset.element_spec,
-        compression=None,
-        reader_func=reader_func,
-    )
-    if shuffle_batches and steps > 1:
-        # The examples inside every packed batch were already timestep-shuffled
-        # by the unchanged packer. A bounded native shuffle varies batch order
-        # across epochs without buffering an entire 70+ GB chunk in RAM.
-        native_dataset = native_dataset.shuffle(
-            min(256, steps),
-            reshuffle_each_iteration=True,
-        )
-    native_dataset = native_dataset.repeat().prefetch(tf.data.AUTOTUNE)
-    print(
-        f">>> Cloud native dataset ready in {time.time() - save_t0:.1f}s.",
-        flush=True,
-    )
-    return native_dataset
-
-
-def _proportional_chunk_allocations_3d(total_counts, chunk_size):
-    """Allocate every chunk proportionally while preserving exact octant totals."""
-    remaining = {int(o): int(count) for o, count in total_counts.items()}
-    allocations = []
-    while sum(remaining.values()) > 0:
-        current_size = min(int(chunk_size), sum(remaining.values()))
-        total_remaining = sum(remaining.values())
-        exact = {
-            o: current_size * count / total_remaining
-            for o, count in remaining.items()
-        }
-        allocation = {
-            o: min(remaining[o], int(np.floor(exact[o])))
-            for o in remaining
-        }
-        unassigned = current_size - sum(allocation.values())
-        while unassigned > 0:
-            candidates = [
-                o for o in remaining if allocation[o] < remaining[o]
-            ]
-            chosen = max(
-                candidates,
-                key=lambda o: (exact[o] - allocation[o], remaining[o]),
-            )
-            allocation[chosen] += 1
-            unassigned -= 1
-        allocation = {o: count for o, count in allocation.items() if count}
-        allocations.append(allocation)
-        for o, count in allocation.items():
-            remaining[o] -= count
-    return allocations
-
-
 def _build_chunk_worker_command_3d(
     chunk_idx,
     chunk_file,
@@ -1194,6 +345,8 @@ def _build_chunk_worker_command_3d(
         "--lr_red_factor", str(args.lr_red_factor),
         "--min_lr", str(args.min_lr),
         "--n_boids", str(args.n_boids),
+        "--tr_set_unique", str(args.tr_set_unique),
+        "--tr_set_repeats", str(args.tr_set_repeats),
         "--loss_type", args.loss_type,
         "--critical_distance", str(args.critical_distance),
         "--distance_weight", str(args.distance_weight),
@@ -1203,6 +356,7 @@ def _build_chunk_worker_command_3d(
         "--shuffle_buffer_size", str(args.shuffle_buffer_size),
         "--packed_shard_batches", str(args.packed_shard_batches),
         "--steps_per_execution", str(args.steps_per_execution),
+        "--backend", args.backend,
         "--expert_goal_order", args.expert_goal_order,
         "--goal_exclusion_size", str(args.goal_exclusion_size),
         "--expert_pos_noise", str(args.expert_pos_noise),
@@ -1226,135 +380,11 @@ def _build_chunk_worker_command_3d(
         ])
     if args.eager_training:
         cmd.append("--eager_training")
-    if args.multi_gpu:
-        cmd.append("--multi_gpu")
-    if args.cloud_optimized:
-        cmd.append("--cloud_optimized")
-    if args.cloud_native_dataset:
-        cmd.append("--cloud_native_dataset")
-    if args.cloud_ram_dataset:
-        cmd.append("--cloud_ram_dataset")
-    if args.cloud_bfloat16:
-        cmd.append("--cloud_bfloat16")
     if args.chunk_epochs is not None:
         cmd.extend(["--chunk_epochs", str(args.chunk_epochs)])
     if args.init_weights:
         cmd.extend(["--init_weights", args.init_weights])
     return cmd
-
-
-def _generate_chunk_cache_shards_3d(chunk_idx, octant_counts, output_dir):
-    """Generate one temporary cache shard per CPU task for a training chunk."""
-    total = sum(octant_counts.values())
-    workers = args.generation_workers
-    if workers <= 0:
-        workers = max(1, (os.cpu_count() or 2) - 2)
-    workers = max(1, min(workers, total))
-    target_task_size = max(1, int(np.ceil(total / workers)))
-
-    task_specs = []
-    for octant, count in sorted(octant_counts.items()):
-        n_tasks = max(1, int(np.ceil(count / target_task_size)))
-        task_counts = [len(part) for part in np.array_split(np.arange(count), n_tasks)]
-        for task_count in task_counts:
-            task_specs.append({"octant": int(octant), "count": int(task_count)})
-
-    def run_task(task_idx, spec):
-        seed = int(args.generation_seed + chunk_idx * 1_000_003 + task_idx)
-        path = os.path.join(output_dir, f"generated_{task_idx:04d}.h5")
-        cmd = [
-            sys.executable,
-            "-m",
-            "boids.generate_boids_cache_3d",
-            "--unique", str(spec["count"]),
-            "--repeats", "1",
-            "--n_boids", str(args.n_boids),
-            "--sample_mode", "octant",
-            "--octants", str(spec["octant"]),
-            "--goal_exclusion_size", str(args.goal_exclusion_size),
-            "--pos_noise", str(args.expert_pos_noise),
-            "--vel_noise", str(args.expert_vel_noise),
-            "--perception", str(args.perception),
-            "--goal_order", args.expert_goal_order,
-            "--seed", str(seed),
-            "--output", path,
-            "--skip_centers_plot",
-            "--quiet",
-        ]
-        env = os.environ.copy()
-        # Expert simulation is CPU-only. Hiding the GPU prevents dozens of
-        # generator processes from each creating a TensorFlow CUDA context.
-        env["CUDA_VISIBLE_DEVICES"] = ""
-        env["TF_CPP_MIN_LOG_LEVEL"] = "3"
-        for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
-            env[name] = "1"
-        started = time.time()
-        result = subprocess.run(
-            cmd, env=env, text=True, capture_output=True
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Expert-generation task {task_idx} failed for octant "
-                f"{spec['octant']} (exit {result.returncode}).\n"
-                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-            )
-        return {
-            **spec,
-            "seed": seed,
-            "path": path,
-            "seconds": time.time() - started,
-        }
-
-    print(
-        f">>> Generating {total} expert trajectories across {len(task_specs)} "
-        f"tasks with up to {workers} concurrent CPU workers...",
-        flush=True,
-    )
-    completed = []
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(run_task, task_idx, spec): task_idx
-            for task_idx, spec in enumerate(task_specs)
-        }
-        for future in as_completed(futures):
-            record = future.result()
-            completed.append(record)
-            print(
-                f"  Generated {record['count']} octant-{record['octant']} "
-                f"trajectories in {record['seconds']:.1f}s",
-                flush=True,
-            )
-
-    completed.sort(key=lambda record: record["path"])
-    cache_paths = [record["path"] for record in completed]
-    boundaries_by_cache = []
-    trajectory_refs = []
-    centers = []
-    center_octants = []
-    for cache_idx, record in enumerate(completed):
-        with h5py.File(record["path"], "r") as cache_file:
-            if int(cache_file.attrs["n_boids"]) != args.n_boids:
-                raise ValueError("Generated cache n_boids does not match training.")
-            lengths = cache_file["traj_lengths"][:]
-            boundaries_by_cache.append(np.concatenate([
-                np.zeros(1, dtype=np.int64),
-                np.cumsum(lengths, dtype=np.int64),
-            ]))
-            shard_centers = cache_file["centers"][:].astype(np.float32)
-        trajectory_refs.extend((cache_idx, i) for i in range(len(lengths)))
-        centers.append(shard_centers)
-        center_octants.extend([record["octant"]] * len(shard_centers))
-
-    refs = np.asarray(trajectory_refs, dtype=np.int64)
-    np.random.shuffle(refs)
-    return (
-        cache_paths,
-        boundaries_by_cache,
-        refs,
-        np.concatenate(centers, axis=0),
-        np.asarray(center_octants, dtype=np.int8),
-        completed,
-    )
 
 
 def run_chunked_3d(cache_paths, boundaries_by_cache, n_boids_cache,
@@ -1372,56 +402,33 @@ def run_chunked_3d(cache_paths, boundaries_by_cache, n_boids_cache,
             np.random.shuffle(active[o])
         pointers = {o: 0 for o in active}
         chunks, chunk_mixes = [], []
-        while True:
-            remaining = {o: len(active[o]) - pointers[o] for o in active}
-            total_remaining = sum(remaining.values())
-            if total_remaining == 0:
-                break
-
-            current_size = min(chunk_size, total_remaining)
-            exact = {
-                o: current_size * remaining[o] / total_remaining
-                for o in active
-            }
-            allocation = {
-                o: min(remaining[o], int(np.floor(exact[o])))
-                for o in active
-            }
-            unassigned = current_size - sum(allocation.values())
-            while unassigned > 0:
-                candidates = [
-                    o for o in active
-                    if allocation[o] < remaining[o]
-                ]
-                if not candidates:
-                    raise RuntimeError("Could not allocate a complete replay chunk.")
-                chosen = max(
-                    candidates,
-                    key=lambda o: (exact[o] - allocation[o], remaining[o]),
-                )
-                allocation[chosen] += 1
-                unassigned -= 1
-
+        requested_mix = {o: len(active[o]) for o in active}
+        allocations = proportional_chunk_allocations(requested_mix, chunk_size)
+        for allocation in allocations:
             current = []
-            for o in active:
-                take = allocation[o]
+            for o, take in allocation.items():
                 start = pointers[o]
                 current.extend(active[o][start:start + take].tolist())
                 pointers[o] += take
             np.random.shuffle(current)
             chunks.append(np.array(current, dtype=np.int64))
-            chunk_mixes.append({o: allocation[o] for o in active})
+            chunk_mixes.append(allocation)
         n_chunks = len(chunks)
-        requested_mix = {o: len(active[o]) for o in active}
         print(
             f">>> Chunked training: {n_chunks} proportional balanced chunks; "
             f"requested octant totals {requested_mix}"
         )
     else:
-        n_chunks = max(1, len(all_trajectory_refs) // chunk_size)
-        chunks = np.array_split(all_trajectory_refs, n_chunks)
+        chunks = [
+            all_trajectory_refs[start:start + chunk_size]
+            for start in range(0, len(all_trajectory_refs), chunk_size)
+        ]
+        n_chunks = len(chunks)
         chunk_mixes = None
-        print(f">>> Chunked training: {n_chunks} chunks of ~{chunk_size} trajectories each")
+        print(
+            f">>> Chunked training: {n_chunks} chunks of at most "
+            f"{chunk_size} trajectories each"
+        )
 
     def _mem_mb():
         return psutil.Process(os.getpid()).memory_info().rss / 1e6
@@ -1453,7 +460,7 @@ def run_chunked_3d(cache_paths, boundaries_by_cache, n_boids_cache,
                 print(f">>> Chunk octant mix: {chunk_mixes[chunk_idx]}")
             print(f">>> Generating fresh validation set for chunk {chunk_idx+1}/{n_chunks} ({args.va_set_size} centers)...")
             data_va_chunk = make_validation_dataset_3d(args)
-            save_dataset_npz_3d(data_va_chunk, val_npz_file, n_boids_cache)
+            save_validation_dataset(data_va_chunk, val_npz_file, n_boids_cache)
             del data_va_chunk
             gc.collect()
 
@@ -1488,147 +495,13 @@ def run_chunked_3d(cache_paths, boundaries_by_cache, n_boids_cache,
     return final_model
 
 
-def run_generated_chunked_3d(run_tag, requested_counts, chunk_size, chunk_patience):
-    """Generate, train, and delete one balanced expert chunk at a time."""
-    checkpoint_path = f"saved_models/best_weights_3d_{run_tag}"
-    os.makedirs("saved_models", exist_ok=True)
-    allocations = _proportional_chunk_allocations_3d(
-        requested_counts, chunk_size
-    )
-    n_chunks = len(allocations)
-    print(
-        f">>> On-the-fly chunked training: {n_chunks} chunks; "
-        f"requested octant totals {requested_counts}"
-    )
-
-    temp_root = args.on_the_fly_tmp_dir or None
-    if temp_root is not None:
-        os.makedirs(temp_root, exist_ok=True)
-    all_centers = []
-    all_center_octants = []
-    manifest_tasks = []
-
-    with tempfile.TemporaryDirectory(
-        prefix="gnca_3d_onthefly_", dir=temp_root
-    ) as tmpdir:
-        training_state_dir = os.path.join(tmpdir, "training_state")
-        for chunk_idx, chunk_mix in enumerate(allocations):
-            print(f"\n{'='*60}")
-            print(
-                f"  Chunk {chunk_idx + 1}/{n_chunks} | "
-                f"{sum(chunk_mix.values())} generated trajectories"
-            )
-            print(f"{'='*60}")
-            print(f">>> Chunk octant mix: {chunk_mix}")
-
-            with tempfile.TemporaryDirectory(
-                prefix=f"chunk_{chunk_idx:04d}_", dir=tmpdir
-            ) as chunk_dir:
-                generation_t0 = time.time()
-                (
-                    cache_paths,
-                    boundaries_by_cache,
-                    chunk_refs,
-                    chunk_centers,
-                    center_octants,
-                    task_records,
-                ) = _generate_chunk_cache_shards_3d(
-                    chunk_idx, chunk_mix, chunk_dir
-                )
-                print(
-                    f">>> Expert chunk ready in "
-                    f"{time.time() - generation_t0:.1f}s; beginning packing/training."
-                )
-                all_centers.append(chunk_centers)
-                all_center_octants.append(center_octants)
-                for record in task_records:
-                    manifest_tasks.append({
-                        "chunk": chunk_idx,
-                        "octant": record["octant"],
-                        "count": record["count"],
-                        "seed": record["seed"],
-                    })
-
-                boundaries_file = os.path.join(chunk_dir, "boundaries.npz")
-                cache_paths_file = os.path.join(chunk_dir, "cache_paths.json")
-                chunk_file = os.path.join(chunk_dir, "chunk.json")
-                val_npz_file = os.path.join(chunk_dir, "validation.npz")
-                np.savez(
-                    boundaries_file,
-                    **{
-                        f"cache_{cache_idx}": boundaries
-                        for cache_idx, boundaries in enumerate(boundaries_by_cache)
-                    },
-                )
-                with open(cache_paths_file, "w", encoding="utf-8") as f:
-                    json.dump([os.path.abspath(path) for path in cache_paths], f)
-                with open(chunk_file, "w", encoding="utf-8") as f:
-                    json.dump(chunk_refs.tolist(), f)
-
-                print(
-                    f">>> Generating fresh validation set for chunk "
-                    f"{chunk_idx + 1}/{n_chunks} ({args.va_set_size} centers)..."
-                )
-                data_va_chunk = make_validation_dataset_3d(args)
-                save_dataset_npz_3d(data_va_chunk, val_npz_file, args.n_boids)
-                del data_va_chunk
-                gc.collect()
-
-                cmd = _build_chunk_worker_command_3d(
-                    chunk_idx,
-                    chunk_file,
-                    cache_paths_file,
-                    checkpoint_path,
-                    args.n_boids,
-                    boundaries_file,
-                    val_npz_file,
-                    training_state_dir,
-                    chunk_patience,
-                )
-                result = subprocess.run(cmd)
-                if result.returncode != 0:
-                    raise RuntimeError(
-                        f"Generated chunk worker {chunk_idx + 1}/{n_chunks} "
-                        f"failed with exit code {result.returncode}"
-                    )
-            gc.collect()
-            print(
-                f">>> Deleted temporary expert caches for chunk "
-                f"{chunk_idx + 1}/{n_chunks}."
-            )
-
-    final_model = _build_model_3d(args.lr)
-    _build_model_variables_3d(final_model, args.n_boids)
-    final_model.load_weights(checkpoint_path).expect_partial()
-    final_model.save_weights(checkpoint_path)
-    print(f"Saved final weights to {checkpoint_path}")
-    manifest = {
-        "mode": "on_the_fly",
-        "generation_seed": args.generation_seed,
-        "generation_workers": args.generation_workers,
-        "goal_order": args.expert_goal_order,
-        "goal_exclusion_size": args.goal_exclusion_size,
-        "pos_noise": args.expert_pos_noise,
-        "vel_noise": args.expert_vel_noise,
-        "perception": args.perception,
-        "octant_unique_counts": requested_counts,
-        "tasks": manifest_tasks,
-    }
-    return (
-        final_model,
-        np.concatenate(all_centers, axis=0),
-        np.concatenate(all_center_octants, axis=0),
-        manifest,
-    )
-
-
-def run_generated_ram_chunked_3d(
+def run_cloud_chunked_3d(
     run_tag, requested_counts, chunk_size, chunk_patience
 ):
     """Run generated chunks entirely in each worker's host RAM."""
     checkpoint_path = f"saved_models/best_weights_3d_{run_tag}"
     os.makedirs("saved_models", exist_ok=True)
-    allocations = _proportional_chunk_allocations_3d(
+    allocations = proportional_chunk_allocations(
         requested_counts, chunk_size
     )
     print(
@@ -1702,7 +575,7 @@ def run_generated_ram_chunked_3d(
     final_model.save_weights(checkpoint_path)
     print(f"Saved final weights to {checkpoint_path}")
     manifest = {
-        "mode": "on_the_fly_cloud_ram",
+        "mode": "cloud_ram",
         "generation_seed": args.generation_seed,
         "generation_workers": args.generation_workers,
         "goal_order": args.expert_goal_order,
@@ -1771,662 +644,24 @@ def run(data_tr, data_va, run_tag=""):
     return history, model, best_after50_cb
 
 
-def _distribute_complete_graph_batches_3d(strategy, local_batches):
-    """Place one already-disjoint, graph-complete batch on each replica."""
-    return strategy.experimental_distribute_values_from_function(
-        lambda context: local_batches[context.replica_id_in_sync_group]
-    )
-
-
-def fit_mirrored_worker_3d(
-    model,
-    strategy,
-    train_data,
-    train_local_steps,
-    n_epochs,
-    callbacks,
-    global_node_count,
-    val_data=None,
-    val_local_steps=0,
-):
-    """Synchronous graph-safe data parallelism for prepacked sparse batches.
-
-    Each replica receives a complete local block-diagonal adjacency matrix.
-    Gradients are normalized across all nodes and synchronously all-reduced by
-    the mirrored optimizer, preserving the single-GPU global-batch objective.
-    """
-    replicas = strategy.num_replicas_in_sync
-    train_steps = train_local_steps // replicas
-    if train_steps < 1:
-        raise ValueError(
-            f"Need at least {replicas} local train batches for {replicas} GPUs."
-        )
-    dropped_train = train_local_steps - train_steps * replicas
-    if dropped_train:
-        print(
-            f">>> Multi-GPU: dropping {dropped_train} incomplete local "
-            "batch(es) per epoch to keep replicas synchronized."
-        )
-
-    val_steps = val_local_steps // replicas if val_data is not None else 0
-    if val_data is not None and val_steps < 1:
-        raise ValueError(
-            f"Need at least {replicas} local validation batches for "
-            f"{replicas} GPUs."
-        )
-
-    @tf.function(reduce_retracing=True)
-    def distributed_train_step(distributed_batch):
-        def replica_step(batch):
-            inputs, targets = batch
-            with tf.GradientTape() as tape:
-                predictions = model(inputs, training=True)
-                per_node_loss = custom_weighted_mse_3d(targets, predictions)
-                local_loss_sum = tf.reduce_sum(per_node_loss)
-                local_node_count = tf.cast(tf.size(per_node_loss), tf.float32)
-                loss = local_loss_sum / tf.cast(global_node_count, tf.float32)
-            gradients = tape.gradient(loss, model.trainable_variables)
-            model.optimizer.apply_gradients(
-                zip(gradients, model.trainable_variables)
-            )
-            return local_loss_sum, local_node_count
-
-        loss_sums, node_counts = strategy.run(
-            replica_step, args=(distributed_batch,)
-        )
-        total_loss = strategy.reduce(
-            tf.distribute.ReduceOp.SUM, loss_sums, axis=None
-        )
-        total_nodes = strategy.reduce(
-            tf.distribute.ReduceOp.SUM, node_counts, axis=None
-        )
-        return total_loss, total_nodes
-
-    @tf.function(reduce_retracing=True)
-    def distributed_validation_step(distributed_batch):
-        def replica_step(batch):
-            inputs, targets = batch
-            predictions = model(inputs, training=False)
-            per_node_loss = custom_weighted_mse_3d(targets, predictions)
-            return (
-                tf.reduce_sum(per_node_loss),
-                tf.cast(tf.size(per_node_loss), tf.float32),
-            )
-
-        loss_sums, node_counts = strategy.run(
-            replica_step, args=(distributed_batch,)
-        )
-        return (
-            strategy.reduce(tf.distribute.ReduceOp.SUM, loss_sums, axis=None),
-            strategy.reduce(tf.distribute.ReduceOp.SUM, node_counts, axis=None),
-        )
-
-    callback_list = tf.keras.callbacks.CallbackList(
-        callbacks,
-        add_history=False,
-        add_progbar=False,
-        model=model,
-        epochs=n_epochs,
-        steps=train_steps,
-        verbose=1,
-        metrics=["loss"] + (["val_loss"] if val_data is not None else []),
-    )
-    model.stop_training = False
-    callback_list.on_train_begin()
-    train_iterator = iter(train_data)
-    try:
-        for epoch in range(n_epochs):
-            if model.stop_training:
-                break
-            epoch_t0 = time.time()
-            callback_list.on_epoch_begin(epoch)
-            epoch_loss_sum = 0.0
-            epoch_node_count = 0.0
-
-            for step in range(train_steps):
-                callback_list.on_train_batch_begin(step)
-                local_batches = [next(train_iterator) for _ in range(replicas)]
-                distributed_batch = _distribute_complete_graph_batches_3d(
-                    strategy, local_batches
-                )
-                loss_sum, node_count = distributed_train_step(distributed_batch)
-                epoch_loss_sum += float(loss_sum.numpy())
-                epoch_node_count += float(node_count.numpy())
-                callback_list.on_train_batch_end(step)
-
-            logs = {"loss": epoch_loss_sum / max(epoch_node_count, 1.0)}
-            if val_data is not None:
-                val_iterator = iter(val_data)
-                val_loss_sum = 0.0
-                val_node_count = 0.0
-                for _ in range(val_steps):
-                    local_batches = [
-                        next(val_iterator) for _ in range(replicas)
-                    ]
-                    distributed_batch = _distribute_complete_graph_batches_3d(
-                        strategy, local_batches
-                    )
-                    loss_sum, node_count = distributed_validation_step(
-                        distributed_batch
-                    )
-                    val_loss_sum += float(loss_sum.numpy())
-                    val_node_count += float(node_count.numpy())
-                logs["val_loss"] = val_loss_sum / max(val_node_count, 1.0)
-
-            callback_list.on_epoch_end(epoch, logs)
-            learning_rate = float(
-                tf.keras.backend.get_value(model.optimizer.learning_rate)
-            )
-            summary = (
-                f"Epoch {epoch + 1}/{n_epochs} - "
-                f"{time.time() - epoch_t0:.1f}s - loss: {logs['loss']:.6g}"
-            )
-            if "val_loss" in logs:
-                summary += f" - val_loss: {logs['val_loss']:.6g}"
-            summary += f" - lr: {learning_rate:.6g}"
-            print(summary, flush=True)
-    finally:
-        callback_list.on_train_end()
-
-    return train_steps
-
-
-def fit_cloud_mirrored_worker_3d(
-    model,
-    strategy,
-    train_data,
-    train_local_steps,
-    n_epochs,
-    callbacks,
-    global_node_count,
-    steps_per_execution,
-    val_data=None,
-    val_local_steps=0,
-):
-    """Cloud-only distributed loop with compiled multi-step execution.
-
-    The input datasets already contain complete per-replica disjoint graph
-    batches. ``distribute_datasets_from_function`` dequeues one such batch for
-    every replica without splitting its node or adjacency tensors. Multiple
-    optimizer steps then execute inside one ``tf.function`` call, avoiding the
-    Python dispatch and device-to-host synchronization performed per step by
-    the compatibility multi-GPU loop above.
-    """
-    replicas = strategy.num_replicas_in_sync
-    train_steps = train_local_steps // replicas
-    if train_steps < 1:
-        raise ValueError(
-            f"Need at least {replicas} local train batches for {replicas} GPUs."
-        )
-    dropped_train = train_local_steps - train_steps * replicas
-    if dropped_train:
-        print(
-            f">>> Cloud optimized: dropping {dropped_train} incomplete local "
-            "batch(es) per epoch to keep replicas synchronized."
-        )
-
-    val_steps = val_local_steps // replicas if val_data is not None else 0
-    if val_data is not None and val_steps < 1:
-        raise ValueError(
-            f"Need at least {replicas} local validation batches for "
-            f"{replicas} GPUs."
-        )
-
-    # The source datasets are already batched at the per-replica size. This API
-    # distributes whole dataset elements instead of slicing a disjoint graph's
-    # node dimension as experimental_distribute_dataset would do.
-    distributed_train_data = strategy.distribute_datasets_from_function(
-        lambda _input_context: train_data
-    )
-    distributed_val_data = None
-    if val_data is not None:
-        distributed_val_data = strategy.distribute_datasets_from_function(
-            lambda _input_context: val_data
-        )
-
-    def replica_train_step(batch):
-        inputs, targets = batch
-        with tf.GradientTape() as tape:
-            predictions = model(inputs, training=True)
-            per_node_loss = custom_weighted_mse_3d(targets, predictions)
-            local_loss_sum = tf.reduce_sum(per_node_loss)
-            local_node_count = tf.cast(tf.size(per_node_loss), tf.float32)
-            loss = local_loss_sum / tf.cast(global_node_count, tf.float32)
-        gradients = tape.gradient(loss, model.trainable_variables)
-        model.optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-        return local_loss_sum, local_node_count
-
-    def replica_validation_step(batch):
-        inputs, targets = batch
-        predictions = model(inputs, training=False)
-        per_node_loss = custom_weighted_mse_3d(targets, predictions)
-        return (
-            tf.reduce_sum(per_node_loss),
-            tf.cast(tf.size(per_node_loss), tf.float32),
-        )
-
-    @tf.function(reduce_retracing=True)
-    def distributed_train_block(iterator, block_steps):
-        total_loss = tf.constant(0.0, dtype=tf.float32)
-        total_nodes = tf.constant(0.0, dtype=tf.float32)
-        for _ in tf.range(block_steps):
-            loss_sums, node_counts = strategy.run(
-                replica_train_step, args=(next(iterator),)
-            )
-            total_loss += strategy.reduce(
-                tf.distribute.ReduceOp.SUM, loss_sums, axis=None
-            )
-            total_nodes += strategy.reduce(
-                tf.distribute.ReduceOp.SUM, node_counts, axis=None
-            )
-        return total_loss, total_nodes
-
-    @tf.function(reduce_retracing=True)
-    def distributed_validation_block(iterator, block_steps):
-        total_loss = tf.constant(0.0, dtype=tf.float32)
-        total_nodes = tf.constant(0.0, dtype=tf.float32)
-        for _ in tf.range(block_steps):
-            loss_sums, node_counts = strategy.run(
-                replica_validation_step, args=(next(iterator),)
-            )
-            total_loss += strategy.reduce(
-                tf.distribute.ReduceOp.SUM, loss_sums, axis=None
-            )
-            total_nodes += strategy.reduce(
-                tf.distribute.ReduceOp.SUM, node_counts, axis=None
-            )
-        return total_loss, total_nodes
-
-    callback_list = tf.keras.callbacks.CallbackList(
-        callbacks,
-        add_history=False,
-        add_progbar=False,
-        model=model,
-        epochs=n_epochs,
-        steps=train_steps,
-        verbose=1,
-        metrics=["loss"] + (["val_loss"] if val_data is not None else []),
-    )
-    execution_steps = max(1, min(int(steps_per_execution), train_steps))
-    print(
-        f">>> Cloud optimized execution: {replicas} replicas, "
-        f"{train_steps} global steps/epoch, "
-        f"{execution_steps} compiled steps/dispatch.",
-        flush=True,
-    )
-
-    model.stop_training = False
-    callback_list.on_train_begin()
-    train_iterator = iter(distributed_train_data)
-    try:
-        for epoch in range(n_epochs):
-            if model.stop_training:
-                break
-            epoch_t0 = time.time()
-            callback_list.on_epoch_begin(epoch)
-            epoch_loss_sum = 0.0
-            epoch_node_count = 0.0
-
-            for block_start in range(0, train_steps, execution_steps):
-                block_steps = min(execution_steps, train_steps - block_start)
-                loss_sum, node_count = distributed_train_block(
-                    train_iterator, tf.constant(block_steps, dtype=tf.int32)
-                )
-                # One host synchronization per compiled block, never per step.
-                epoch_loss_sum += float(loss_sum.numpy())
-                epoch_node_count += float(node_count.numpy())
-
-            logs = {"loss": epoch_loss_sum / max(epoch_node_count, 1.0)}
-            if distributed_val_data is not None:
-                val_iterator = iter(distributed_val_data)
-                val_loss_sum = 0.0
-                val_node_count = 0.0
-                val_execution_steps = max(1, min(execution_steps, val_steps))
-                for block_start in range(0, val_steps, val_execution_steps):
-                    block_steps = min(
-                        val_execution_steps, val_steps - block_start
-                    )
-                    loss_sum, node_count = distributed_validation_block(
-                        val_iterator,
-                        tf.constant(block_steps, dtype=tf.int32),
-                    )
-                    val_loss_sum += float(loss_sum.numpy())
-                    val_node_count += float(node_count.numpy())
-                logs["val_loss"] = val_loss_sum / max(val_node_count, 1.0)
-
-            callback_list.on_epoch_end(epoch, logs)
-            learning_rate = float(
-                tf.keras.backend.get_value(model.optimizer.learning_rate)
-            )
-            summary = (
-                f"Epoch {epoch + 1}/{n_epochs} - "
-                f"{time.time() - epoch_t0:.1f}s - loss: {logs['loss']:.6g}"
-            )
-            if "val_loss" in logs:
-                summary += f" - val_loss: {logs['val_loss']:.6g}"
-            summary += f" - lr: {learning_rate:.6g}"
-            print(summary, flush=True)
-    finally:
-        callback_list.on_train_end()
-
-    return train_steps
-
 ####################################################################################
-# Configuration
+# Training entry point
 ####################################################################################
-parser = argparse.ArgumentParser()
-parser.add_argument("--lr", default=1e-3, type=float)
-parser.add_argument("--batch_size", default=30, type=int)
-parser.add_argument("--epochs", default=1000000, type=int)
-parser.add_argument("--chunk_epochs", default=None, type=int,
-                   help="Fixed epochs per chunk (overrides early stopping). Use for debugging.")
-parser.add_argument("--es_patience", default=12, type=int)
-parser.add_argument(
-    "--early_stopping_min_delta",
-    default=1e-8,
-    type=float,
-    help=(
-        "Minimum monitored-loss improvement required to reset early stopping. "
-        "Prevents tiny floating-point changes from extending a chunk indefinitely."
-    ),
-)
-parser.add_argument("--lr_patience", default=5, type=int,
-                   help="Epochs without improvement before reducing LR; keep below chunk_patience.")
-parser.add_argument("--lr_red_factor", default=0.1, type=float)
-parser.add_argument("--min_lr", default=1e-6, type=float,
-                   help="Minimum learning-rate floor for ReduceLROnPlateau.")
-parser.add_argument("--n_boids", default=100, type=int)
-parser.add_argument("--tr_set_unique", default=20, type=int)
-parser.add_argument(
-    "--run_tag_unique",
-    default=None,
-    type=int,
-    help=(
-        "Optional naming-only unique count used in checkpoint/run tags. "
-        "It does not change sampling; --tr_set_unique remains the actual "
-        "number of trajectories in the training stage."
-    ),
-)
-parser.add_argument(
-    "--tr_set_repeats",
-    default=50,
-    type=int,
-    help=(
-        "Training exposures per selected center. If this exceeds the cache's "
-        "repeat count, cached trajectories are cycled for reinforcement."
-    ),
-)
-parser.add_argument("--va_set_size", default=10, type=int)
-parser.add_argument("--te_set_size", default=30, type=int)
-parser.add_argument("--loss_type", default="oldl", choices=["oldl", "newl"],
-                   help="oldl: standard MSE, newl: distance-weighted MSE")
-parser.add_argument("--critical_distance", default=2.5, type=float)
-parser.add_argument("--distance_weight", default=2.5, type=float)
-parser.add_argument("--viz_mode", default="tubular", choices=["tubular", "per_boid", "multi_tubular", "individual"])
-# ── Chunk worker args (internal use, passed by run_chunked_3d subprocess) ──
-parser.add_argument("--_chunk_worker", action="store_true", default=False)
-parser.add_argument("--_chunk_idx", default=0, type=int)
-parser.add_argument("--_chunk_indices_file", default=None)
-parser.add_argument("--_cache_paths_file", default=None)
-parser.add_argument("--_checkpoint_path", default=None)
-parser.add_argument("--_n_boids_cache", default=None, type=int)
-parser.add_argument("--_boundaries_file", default=None)
-parser.add_argument("--_val_indices_file", default=None)
-parser.add_argument("--_val_npz_file", default=None)
-parser.add_argument("--_training_state_dir", default=None)
-parser.add_argument("--_ram_chunk_mix_file", default=None)
-parser.add_argument("--_ram_centers_output_file", default=None)
-parser.add_argument("--noise_tag", default="", type=str)
-parser.add_argument("--init_centers_npz", default="", type=str)
-parser.add_argument(
-    "--boids_cache",
-    nargs="+",
-    default=None,
-    help="One or more compatible HDF5 caches used directly during chunked training.",
-)
-parser.add_argument(
-    "--generate_on_the_fly",
-    action="store_true",
-    help=(
-        "Generate each expert chunk in parallel into temporary local HDF5 "
-        "shards, train it, then delete it. Cannot be combined with --boids_cache."
-    ),
-)
-parser.add_argument(
-    "--generation_workers",
-    default=0,
-    type=int,
-    help="Concurrent expert-generation subprocesses; 0 uses CPU count minus two.",
-)
-parser.add_argument("--generation_seed", default=0, type=int)
-parser.add_argument(
-    "--on_the_fly_tmp_dir",
-    default="",
-    help="Temporary generation root. Empty uses the OS temporary directory (/tmp).",
-)
-parser.add_argument(
-    "--expert_goal_order",
-    choices=["nearest_ccw", "fixed"],
-    default="nearest_ccw",
-)
-parser.add_argument("--goal_exclusion_size", default=0.5, type=float)
-parser.add_argument("--expert_pos_noise", default=0.0, type=float)
-parser.add_argument("--expert_vel_noise", default=0.0, type=float)
-parser.add_argument("--init_weights", default="", type=str,
-                   help="Optional checkpoint prefix to initialize training from.")
-parser.add_argument("--timestep_stride", default=1, type=int)
-parser.add_argument("--near_goal_radius", default=1.0, type=float)
-parser.add_argument("--perception", default=0.1, type=float,
-                   help="Neighbor radius required of cached adjacency matrices.")
-parser.add_argument("--shuffle_buffer_size", default=4096, type=int,
-                   help="Number of individual timesteps mixed before packed batching.")
-parser.add_argument("--packed_shard_batches", default=16, type=int,
-                   help="Number of packed mini-batches stored in each temporary shard.")
-parser.add_argument("--steps_per_execution", default=10, type=int,
-                   help="Compiled optimizer steps run per Keras/Python dispatch.")
-parser.add_argument("--eager_training", action="store_true",
-                   help="Debug training eagerly instead of using the faster compiled graph.")
-parser.add_argument(
-    "--multi_gpu",
-    action="store_true",
-    help=(
-        "Use all visible GPUs with graph-safe synchronous MirroredStrategy "
-        "training. --batch_size remains the global batch size."
-    ),
-)
-parser.add_argument(
-    "--cloud_optimized",
-    action="store_true",
-    help=(
-        "Opt-in cloud multi-GPU execution path: distribute complete graph "
-        "batches through tf.data and compile multiple optimizer steps per "
-        "Python dispatch. Requires --multi_gpu. Local/default paths are unchanged."
-    ),
-)
-parser.add_argument(
-    "--cloud_native_dataset",
-    action="store_true",
-    help=(
-        "Cloud-only: write packed batches directly as TFRecord shards and "
-        "train through native parallel tf.data readers without NPZ or a "
-        "per-batch Python generator. Requires --cloud_optimized and --multi_gpu."
-    ),
-)
-parser.add_argument(
-    "--cloud_ram_dataset",
-    action="store_true",
-    help=(
-        "Cloud-only generated-data mode: generate compact trajectories in "
-        "parallel, pack them once in host RAM, and train through native "
-        "tf.data without temporary HDF5 or TFRecord files. Requires "
-        "--generate_on_the_fly, --cloud_optimized, and --multi_gpu."
-    ),
-)
-parser.add_argument(
-    "--cloud_bfloat16",
-    action="store_true",
-    help=(
-        "Cloud-only: use mixed_bfloat16 model compute with float32 variables, "
-        "optimizer state, targets, weighting, and loss. Requires "
-        "--cloud_optimized and --multi_gpu."
-    ),
-)
-parser.add_argument("--chunk_size", default=100, type=int)
-parser.add_argument("--chunk_patience", default=15, type=int)
-parser.add_argument("--best_after_epoch", default=50, type=int,
-                   help="Non-chunked only: save best val_loss checkpoint after this epoch (default: 50).")
-parser.add_argument("--train_octants", type=int, nargs="+", default=None)
-parser.add_argument(
-    "--octant_unique_counts",
-    type=int,
-    nargs="+",
-    default=None,
-    help=(
-        "Optional unique-center count for each --train_octants entry. "
-        "Use this for focus-octant training with balanced replay."
-    ),
-)
-parser.add_argument("--viz_n_centers", default=50, type=int)
-parser.add_argument("--viz_centers_source", default="trained", choices=["trained", "unseen_cache", "random", "fresh_octant"])
-parser.add_argument("--skip_trained_viz", action="store_true", default=False,
-                   help="Skip computing trajectories from trained centers during evaluation.")
-parser.add_argument("--skip_evaluation", action="store_true", default=False,
-                   help="Skip post-training evaluation/visualization.")
-parser.add_argument("--eval_centers_per_octant", default=10, type=int,
-                   help="Fresh unseen centers sampled per evaluated octant after training.")
-parser.add_argument("--eval_output_dir", default="", type=str,
-                   help="Post-training inference directory. Defaults to inference_3d_<run_tag>.")
-parser.add_argument("--eval_max_steps", default=3000, type=int)
-parser.add_argument("--eval_success_threshold", default=0.5, type=float)
-parser.add_argument("--eval_max_success_r", default=2.0, type=float)
-parser.add_argument("--eval_seed", default=None, type=int)
+args = validate_args(build_parser().parse_args(), len(physical_devices))
 
 
-####################################################################################
-# Training
-####################################################################################
-args = parser.parse_args()
-
-if args.tr_set_repeats < 1:
-    raise ValueError("--tr_set_repeats must be at least 1.")
-if args.run_tag_unique is not None and args.run_tag_unique < 1:
-    raise ValueError("--run_tag_unique must be at least 1 when provided.")
-if args.generate_on_the_fly and args.boids_cache:
-    raise ValueError("--generate_on_the_fly cannot be combined with --boids_cache.")
-if args.generate_on_the_fly and args.tr_set_repeats != 1:
-    raise ValueError(
-        "On-the-fly generation currently requires --tr_set_repeats 1; "
-        "every generated trajectory is unique."
-    )
-if args.generate_on_the_fly and args.train_octants is None:
-    raise ValueError("--generate_on_the_fly requires explicit --train_octants.")
-if args.generate_on_the_fly and args.chunk_size <= 0:
-    raise ValueError("--generate_on_the_fly requires --chunk_size greater than 0.")
-if args.generate_on_the_fly and args.init_centers_npz:
-    raise ValueError(
-        "--generate_on_the_fly does not currently combine with --init_centers_npz."
-    )
-if args.generation_workers < 0:
-    raise ValueError("--generation_workers must be nonnegative.")
-if args.train_octants is not None and len(set(args.train_octants)) != len(args.train_octants):
-    raise ValueError("--train_octants must not contain duplicates.")
-if args.octant_unique_counts is not None:
-    if args.train_octants is None:
-        raise ValueError("--octant_unique_counts requires --train_octants.")
-    if len(args.octant_unique_counts) != len(args.train_octants):
-        raise ValueError(
-            "--octant_unique_counts must provide one count per --train_octants entry."
-        )
-    if any(count < 1 for count in args.octant_unique_counts):
-        raise ValueError("Every --octant_unique_counts value must be positive.")
-    if sum(args.octant_unique_counts) != args.tr_set_unique:
-        raise ValueError(
-            "The sum of --octant_unique_counts must equal --tr_set_unique."
-        )
-if args.min_lr <= 0:
-    raise ValueError("--min_lr must be greater than 0.")
-if args.early_stopping_min_delta < 0:
-    raise ValueError("--early_stopping_min_delta must be nonnegative.")
-if args.min_lr > args.lr:
-    raise ValueError("--min_lr cannot exceed --lr.")
-if args.steps_per_execution < 1:
-    raise ValueError("--steps_per_execution must be at least 1.")
-if args.cloud_optimized and not args.multi_gpu:
-    raise ValueError("--cloud_optimized requires --multi_gpu.")
-if args.cloud_optimized and args.eager_training:
-    raise ValueError("--cloud_optimized cannot be combined with --eager_training.")
-if args.cloud_native_dataset and not args.cloud_optimized:
-    raise ValueError("--cloud_native_dataset requires --cloud_optimized.")
-if args.cloud_ram_dataset and not args.cloud_optimized:
-    raise ValueError("--cloud_ram_dataset requires --cloud_optimized.")
-if args.cloud_ram_dataset and args.cloud_native_dataset:
-    raise ValueError(
-        "Choose only one of --cloud_ram_dataset and --cloud_native_dataset."
-    )
-if (
-    args.cloud_ram_dataset
-    and not args._chunk_worker
-    and not args.generate_on_the_fly
-):
-    raise ValueError(
-        "--cloud_ram_dataset requires --generate_on_the_fly."
-    )
-if args.cloud_bfloat16 and not args.cloud_optimized:
-    raise ValueError("--cloud_bfloat16 requires --cloud_optimized.")
-if args.cloud_bfloat16:
-    tf.keras.mixed_precision.set_global_policy("mixed_bfloat16")
-    policy = tf.keras.mixed_precision.global_policy()
-    print(
-        f">>> Cloud BF16 policy enabled: compute={policy.compute_dtype}, "
-        f"variables={policy.variable_dtype}; loss=float32.",
-        flush=True,
-    )
-if args.multi_gpu:
-    if len(physical_devices) < 2:
-        raise ValueError(
-            f"--multi_gpu requires at least 2 visible GPUs; found "
-            f"{len(physical_devices)}."
-        )
-    if args.batch_size % len(physical_devices) != 0:
-        raise ValueError(
-            "--batch_size is the global batch size in multi-GPU mode and must "
-            f"be divisible by {len(physical_devices)} visible GPUs."
-        )
-    # The parent process validates the external data source, then launches each
-    # isolated worker with an internal cache manifest rather than repeating
-    # --generate_on_the_fly/--boids_cache.  Do not reject that valid worker mode.
-    if not args._chunk_worker and (
-        args.chunk_size <= 0
-        or not (args.generate_on_the_fly or args.boids_cache)
-    ):
-        raise ValueError(
-            "--multi_gpu currently requires chunked training from either "
-            "--generate_on_the_fly or --boids_cache."
-        )
-
-if (
-    not args._chunk_worker
-    and args.chunk_size > 0
-    and args.chunk_epochs is None
-    and args.lr_patience >= args.chunk_patience
-):
-    raise ValueError(
-        "--lr_patience must be smaller than --chunk_patience so the reduced "
-        "learning rate is used before early stopping."
-    )
-
-# ── Chunk worker mode (subprocess per chunk) ─────────────────────────────────
 if args._chunk_worker:
     UPWEIGHT_NEAR_GOAL = (args.loss_type == "newl")
     setup_t0 = time.time()
-    replica_count = len(physical_devices) if args.multi_gpu else 1
+    is_cloud = args.backend == CLOUD_BACKEND
+    replica_count = len(physical_devices) if is_cloud else 1
     per_replica_batch_size = args.batch_size // replica_count
     worker_tmpdir = None
     loader_va = None
     val_data = None
     val_steps = 0
 
-    if args.cloud_ram_dataset:
+    if is_cloud:
         if args._ram_chunk_mix_file is None:
             raise RuntimeError("Cloud RAM worker requires a chunk-mix file.")
         with open(args._ram_chunk_mix_file, encoding="utf-8") as file_handle:
@@ -2439,7 +674,9 @@ if args._chunk_worker:
             chunk_centers,
             chunk_center_octants,
             _,
-        ) = _generate_compact_ram_chunk_3d(args._chunk_idx, chunk_mix)
+        ) = generate_cloud_chunk(
+            args, args._chunk_idx, chunk_mix, _expert_waypoint_policy_3d(args)
+        )
         if args._ram_centers_output_file is None:
             raise RuntimeError("Cloud RAM worker requires a centers output file.")
         np.savez(
@@ -2447,14 +684,13 @@ if args._chunk_worker:
             centers=chunk_centers,
             center_octants=chunk_center_octants,
         )
-        train_data, train_steps = dataset_from_compact_ram_trajectories_3d(
+        train_data, train_steps = cloud_dataset_from_trajectories(
             compact_trajectories,
             per_replica_batch_size,
             args._n_boids_cache,
             args.timestep_stride,
             args.near_goal_radius,
             seed=args.generation_seed + args._chunk_idx,
-            drop_remainder=args.multi_gpu,
             shuffle_batches=True,
         )
         del compact_trajectories
@@ -2475,10 +711,13 @@ if args._chunk_worker:
                 if count > 0
             }
             validation_seed_chunk = args._chunk_idx + 10_000
-            validation_trajectories, _, _, _ = _generate_compact_ram_chunk_3d(
-                validation_seed_chunk, validation_mix
+            validation_trajectories, _, _, _ = generate_cloud_chunk(
+                args,
+                validation_seed_chunk,
+                validation_mix,
+                _expert_waypoint_policy_3d(args),
             )
-            val_data, val_steps = dataset_from_compact_ram_trajectories_3d(
+            val_data, val_steps = cloud_dataset_from_trajectories(
                 validation_trajectories,
                 per_replica_batch_size,
                 args._n_boids_cache,
@@ -2489,13 +728,12 @@ if args._chunk_worker:
                     + 1_000_000_000
                     + args._chunk_idx
                 ),
-                drop_remainder=True,
                 shuffle_batches=False,
             )
             del validation_trajectories
             gc.collect()
         print(
-            f">>> Cloud RAM worker setup complete in "
+            f">>> Cloud worker setup complete in "
             f"{time.time() - setup_t0:.1f}s; training begins now.",
             flush=True,
         )
@@ -2523,14 +761,11 @@ if args._chunk_worker:
             f"near_goal_radius={args.near_goal_radius}",
             flush=True,
         )
-        shard_format = (
-            "direct TFRecord" if args.cloud_native_dataset else "compact NPZ"
-        )
         print(
-            f">>> Worker setup: writing {shard_format} train batch shards...",
+            ">>> Local worker: writing compact NPZ train shards...",
             flush=True,
         )
-        train_shard_paths, train_steps = write_cached_chunk_shards_3d(
+        train_shard_paths, train_steps = write_local_batch_shards(
             worker_cache_paths,
             chunk_refs,
             boundaries_by_cache,
@@ -2542,8 +777,6 @@ if args._chunk_worker:
             perception=args.perception,
             shuffle_buffer_size=args.shuffle_buffer_size,
             batches_per_shard=args.packed_shard_batches,
-            drop_remainder=args.multi_gpu,
-            native_tfrecord=args.cloud_native_dataset,
         )
         print(
             f">>> Worker setup: wrote {train_steps} train batches in "
@@ -2551,57 +784,16 @@ if args._chunk_worker:
             f"{time.time() - setup_t0:.1f}s",
             flush=True,
         )
-        if args.cloud_native_dataset:
-            train_data = dataset_from_cloud_tfrecord_shards_3d(
-                train_shard_paths, train_steps
-            )
-            print(
-                ">>> Cloud native dataset: direct TFRecord loader ready; "
-                "no NPZ conversion or Dataset.save pass required.",
-                flush=True,
-            )
-        else:
-            train_data = dataset_from_batch_shards_3d(train_shard_paths).map(
-                add_graph_ids_to_targets_3d,
-                num_parallel_calls=tf.data.AUTOTUNE,
-            ).prefetch(tf.data.AUTOTUNE)
+        train_data = local_dataset_from_shards(train_shard_paths).map(
+            add_graph_ids_to_targets_3d,
+            num_parallel_calls=tf.data.AUTOTUNE,
+        ).prefetch(tf.data.AUTOTUNE)
 
         use_val = (
             args.chunk_epochs is None and args._val_npz_file is not None
         )
         if use_val:
-            validation_npz = np.load(args._val_npz_file)
-            validation_x = validation_npz["x"]
-            validation_y = validation_npz["y"]
-            validation_rows = validation_npz["a_row"]
-            validation_cols = validation_npz["a_col"]
-            validation_lengths = validation_npz["a_len"]
-            validation_n_boids = int(validation_npz["n_boids"][0])
-            from spektral.data import Graph
-
-            validation_graphs = []
-            for graph_idx in range(len(validation_x)):
-                nnz = int(validation_lengths[graph_idx])
-                adjacency = sp.coo_matrix(
-                    (
-                        np.ones(nnz, dtype=np.float32),
-                        (
-                            validation_rows[graph_idx, :nnz],
-                            validation_cols[graph_idx, :nnz],
-                        ),
-                    ),
-                    shape=(validation_n_boids, validation_n_boids),
-                )
-                validation_graphs.append(
-                    Graph(
-                        x=validation_x[graph_idx],
-                        a=adjacency,
-                        y=validation_y[graph_idx],
-                    )
-                )
-            from modules.boids_3d import BoidsDataset3D
-
-            data_val = BoidsDataset3D(validation_graphs)
+            data_val = load_validation_dataset(args._val_npz_file)
             loader_va = DisjointLoader(
                 data_val,
                 node_level=True,
@@ -2613,12 +805,12 @@ if args._chunk_worker:
         raise RuntimeError("Chunk worker requires --_training_state_dir")
 
     strategy = None
-    if args.multi_gpu:
+    if is_cloud:
         strategy = tf.distribute.MirroredStrategy(
             devices=[device.name for device in tf.config.list_logical_devices("GPU")]
         )
         print(
-            f">>> Multi-GPU strategy initialized with "
+            f">>> Cloud strategy initialized with "
             f"{strategy.num_replicas_in_sync} replicas."
         )
         with strategy.scope():
@@ -2683,15 +875,8 @@ if args._chunk_worker:
                 verbose=1,
             ),
         ]
-        if not args.cloud_ram_dataset:
+        if not is_cloud:
             val_data = loader_va.load().map(add_graph_ids_to_targets_3d)
-            if args.cloud_native_dataset:
-                val_data = materialize_cloud_native_dataset_3d(
-                    val_data,
-                    val_steps,
-                    os.path.join(worker_tmpdir, "native_validation_dataset"),
-                    shuffle_batches=False,
-                )
         val_kwargs = {
             'validation_data': val_data,
             'validation_steps': val_steps,
@@ -2717,16 +902,8 @@ if args._chunk_worker:
         val_data = None
         val_kwargs = {}
 
-    if args.multi_gpu:
-        mirrored_fit = (
-            fit_cloud_mirrored_worker_3d
-            if args.cloud_optimized
-            else fit_mirrored_worker_3d
-        )
-        mirrored_kwargs = {}
-        if args.cloud_optimized:
-            mirrored_kwargs["steps_per_execution"] = args.steps_per_execution
-        mirrored_fit(
+    if is_cloud:
+        fit_cloud_distributed(
             model,
             strategy,
             train_data,
@@ -2734,9 +911,10 @@ if args._chunk_worker:
             n_epochs,
             cbs,
             global_node_count=args.batch_size * args._n_boids_cache,
+            steps_per_execution=args.steps_per_execution,
+            loss_fn=custom_weighted_mse_3d,
             val_data=val_data,
             val_local_steps=(val_steps if use_val else 0),
-            **mirrored_kwargs,
         )
     else:
         model.fit(
@@ -2804,9 +982,11 @@ run_tag = build_run_tag_3d(
 # Print parameters
 print_run_parameters_3d(args, UPWEIGHT_NEAR_GOAL, args.critical_distance, args.distance_weight, noise_config, run_tag)
 
-use_cached_chunked = args.chunk_size > 0 and bool(boids_caches)
-use_generated_chunked = args.chunk_size > 0 and args.generate_on_the_fly
-use_chunked = use_cached_chunked or use_generated_chunked
+use_cloud_chunked = args.backend == CLOUD_BACKEND
+use_cached_chunked = (
+    args.backend == LOCAL_BACKEND and args.chunk_size > 0 and bool(boids_caches)
+)
+use_chunked = use_cached_chunked or use_cloud_chunked
 data_va = None
 generation_manifest = None
 
@@ -2818,7 +998,7 @@ if not use_chunked:
     print(f"\n>>> Generating validation set ({args.va_set_size} centers)...")
     data_va = make_validation_dataset_3d(args)
 
-if use_generated_chunked:
+if use_cloud_chunked:
     if args.octant_unique_counts is not None:
         requested_counts = dict(
             zip(args.train_octants, args.octant_unique_counts)
@@ -2830,24 +1010,16 @@ if use_generated_chunked:
             o: n_per_o + (1 if i < remainder else 0)
             for i, o in enumerate(args.train_octants)
         }
-    generation_storage = (
-        "in worker RAM" if args.cloud_ram_dataset else "in temporary shards"
-    )
     print(
         f"\n>>> Generating expert data one chunk at a time "
-        f"({generation_storage}): {requested_counts}"
-    )
-    generated_runner = (
-        run_generated_ram_chunked_3d
-        if args.cloud_ram_dataset
-        else run_generated_chunked_3d
+        f"in worker RAM: {requested_counts}"
     )
     (
         model,
         generated_centers,
         generated_center_octants,
         generation_manifest,
-    ) = generated_runner(
+    ) = run_cloud_chunked_3d(
         run_tag,
         requested_counts,
         args.chunk_size,
@@ -3078,7 +1250,7 @@ eval_output_dir = args.eval_output_dir or f"inference_3d_{run_tag}"
 eval_cmd = [
     sys.executable,
     "-m",
-    "boids.run_inference_3d",
+    "evaluation.run_inference_3d",
     "--run_tag",
     run_tag,
     "--octants",

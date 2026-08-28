@@ -1,6 +1,7 @@
 import tensorflow as tf
 from spektral.layers import EdgeConv
 
+
 class SimpleEdgeConv(EdgeConv):
     def propagate(self, x, a, e=None, **kwargs):
         # We bypass Spektral's 'message' and 'get_kwargs' logic entirely.
@@ -22,7 +23,4 @@ class SimpleEdgeConv(EdgeConv):
         # Aggregate (mean messages for each target node j)
         out = tf.math.unsorted_segment_mean(messages, j, tf.shape(x)[0])
 
-        # Aggregate (sum messages for each target node j)
-        # out = tf.math.unsorted_segment_sum(messages, j, tf.shape(x)[0])
-        
         return out
