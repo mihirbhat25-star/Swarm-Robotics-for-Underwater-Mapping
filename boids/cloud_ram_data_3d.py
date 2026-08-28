@@ -61,7 +61,33 @@ def canonical_ragged_adjacency_3d(states, perception, block_steps=64):
     return edge_values, edge_offsets
 
 
-def _compact_history_3d(history, perception):
+def history_ragged_adjacency_3d(neighbors):
+    """Pack the exact adjacency matrices already produced by the expert."""
+    edge_parts = []
+    edge_lengths = np.zeros(len(neighbors), dtype=np.int64)
+    for step, adjacency in enumerate(neighbors):
+        adjacency = adjacency.tocoo(copy=False)
+        edges = np.column_stack((adjacency.row, adjacency.col)).astype(
+            np.int32, copy=False
+        )
+        if len(edges) > 1:
+            order = np.lexsort((edges[:, 1], edges[:, 0]))
+            edges = edges[order]
+        edge_parts.append(edges)
+        edge_lengths[step] = len(edges)
+
+    edge_offsets = np.concatenate((
+        np.zeros(1, dtype=np.int64),
+        np.cumsum(edge_lengths, dtype=np.int64),
+    ))
+    if edge_parts and edge_offsets[-1] > 0:
+        edge_values = np.concatenate(edge_parts, axis=0)
+    else:
+        edge_values = np.zeros((0, 2), dtype=np.int32)
+    return edge_values, edge_offsets
+
+
+def _compact_history_3d(history, _perception):
     states = np.concatenate(
         (history["positions"], history["velocities"]), axis=-1
     ).astype(np.float32, copy=False)
@@ -75,8 +101,11 @@ def _compact_history_3d(history, perception):
         np.concatenate((x, next_state, goal_broadcast), axis=-1),
         dtype=np.float32,
     )
-    edge_values, edge_offsets = canonical_ragged_adjacency_3d(
-        x, perception
+    # Boids3D computes neighbors from the current positions before every
+    # update. Reusing those exact matrices avoids repeating an O(T*N^2)
+    # distance calculation while preserving the training graph byte-for-byte.
+    edge_values, edge_offsets = history_ragged_adjacency_3d(
+        history["neighbors"][:-1]
     )
     return {
         "x": x,

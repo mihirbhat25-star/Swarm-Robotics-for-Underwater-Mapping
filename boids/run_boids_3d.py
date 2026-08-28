@@ -10,6 +10,7 @@ import os
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 os.environ.setdefault("GLOG_minloglevel", "3")
+os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
 
 import sys
 import json
@@ -570,19 +571,16 @@ def _generate_compact_ram_chunk_3d(chunk_idx, octant_counts):
     if workers <= 0:
         workers = max(1, (os.cpu_count() or 2) - 2)
     workers = max(1, min(workers, total))
-    target_task_size = max(1, int(np.ceil(total / workers)))
-
     task_configs = []
     task_idx = 0
     for octant, count in sorted(octant_counts.items()):
-        n_tasks = max(1, int(np.ceil(count / target_task_size)))
-        task_counts = [
-            len(part) for part in np.array_split(np.arange(count), n_tasks)
-        ]
-        for task_count in task_counts:
+        # One trajectory per task lets Loky dynamically feed the next job to
+        # whichever worker finishes first.  Trajectory lengths vary, so this
+        # avoids making an entire chunk wait for one slow five-trajectory task.
+        for _ in range(count):
             task_configs.append({
                 "octant": int(octant),
-                "count": int(task_count),
+                "count": 1,
                 "seed": int((
                     args.generation_seed
                     + chunk_idx * 1_000_003
@@ -742,6 +740,30 @@ def dataset_from_compact_ram_trajectories_3d(
     edge_batches = []
     edge_lengths = np.zeros(n_batches, dtype=np.int64)
 
+    # Gather dense states in vectorized trajectory-sized blocks. The previous
+    # implementation copied X and Y inside the per-sample Python loop (hundreds
+    # of thousands of iterations for a 400-trajectory chunk). This produces
+    # identical packed tensors with only one NumPy assignment per trajectory.
+    x_samples = x_batches.reshape(-1, n_boids, 6)
+    y_samples = y_batches.reshape(-1, n_boids, 15)
+    grouped_positions = np.argsort(trajectory_ids, kind="stable")
+    trajectory_counts = np.bincount(
+        trajectory_ids, minlength=len(trajectories)
+    )
+    trajectory_splits = np.concatenate((
+        np.zeros(1, dtype=np.int64),
+        np.cumsum(trajectory_counts, dtype=np.int64),
+    ))
+    for trajectory_idx, trajectory in enumerate(trajectories):
+        group_start = int(trajectory_splits[trajectory_idx])
+        group_stop = int(trajectory_splits[trajectory_idx + 1])
+        if group_start == group_stop:
+            continue
+        sample_positions = grouped_positions[group_start:group_stop]
+        selected_steps = timestep_ids[sample_positions]
+        x_samples[sample_positions] = trajectory["x"][selected_steps]
+        y_samples[sample_positions] = trajectory["y"][selected_steps]
+
     for batch_idx in range(n_batches):
         start = batch_idx * batch_size
         stop = start + batch_size
@@ -750,9 +772,6 @@ def dataset_from_compact_ram_trajectories_3d(
             trajectory = trajectories[int(trajectory_ids[sample_idx])]
             timestep = int(timestep_ids[sample_idx])
             node_start = graph_idx * n_boids
-            node_stop = node_start + n_boids
-            x_batches[batch_idx, node_start:node_stop] = trajectory["x"][timestep]
-            y_batches[batch_idx, node_start:node_stop] = trajectory["y"][timestep]
             edge_start = int(trajectory["edge_offsets"][timestep])
             edge_stop = int(trajectory["edge_offsets"][timestep + 1])
             if edge_stop > edge_start:
