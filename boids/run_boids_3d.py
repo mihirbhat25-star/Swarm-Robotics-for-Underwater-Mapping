@@ -461,6 +461,102 @@ def _validate_cached_adjacency_3d(f, sample_indices, perception):
                 )
 
 
+def _serialize_cloud_tfrecord_batch_3d(x, y, indices, n_boids):
+    """Serialize one packed graph batch without an intermediate NPZ shard."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    y = np.ascontiguousarray(y, dtype=np.float32)
+    indices = np.ascontiguousarray(indices, dtype=np.int32)
+    example = tf.train.Example(features=tf.train.Features(feature={
+        "x": tf.train.Feature(bytes_list=tf.train.BytesList(value=[x.tobytes()])),
+        "y": tf.train.Feature(bytes_list=tf.train.BytesList(value=[y.tobytes()])),
+        "indices": tf.train.Feature(
+            bytes_list=tf.train.BytesList(value=[indices.tobytes()])
+        ),
+        "n_nodes": tf.train.Feature(
+            int64_list=tf.train.Int64List(value=[len(x)])
+        ),
+        "n_edges": tf.train.Feature(
+            int64_list=tf.train.Int64List(value=[len(indices)])
+        ),
+        "n_boids": tf.train.Feature(
+            int64_list=tf.train.Int64List(value=[int(n_boids)])
+        ),
+    }))
+    return example.SerializeToString()
+
+
+_CLOUD_TFRECORD_SPEC_3D = {
+    "x": tf.io.FixedLenFeature([], tf.string),
+    "y": tf.io.FixedLenFeature([], tf.string),
+    "indices": tf.io.FixedLenFeature([], tf.string),
+    "n_nodes": tf.io.FixedLenFeature([], tf.int64),
+    "n_edges": tf.io.FixedLenFeature([], tf.int64),
+    "n_boids": tf.io.FixedLenFeature([], tf.int64),
+}
+
+
+def _parse_cloud_tfrecord_batch_3d(serialized):
+    """Parse one direct TFRecord batch entirely with TensorFlow operations."""
+    record = tf.io.parse_single_example(serialized, _CLOUD_TFRECORD_SPEC_3D)
+    n_nodes = record["n_nodes"]
+    n_edges = record["n_edges"]
+    n_boids = record["n_boids"]
+
+    x = tf.reshape(
+        tf.io.decode_raw(record["x"], tf.float32),
+        tf.stack([n_nodes, tf.constant(6, dtype=tf.int64)]),
+    )
+    y = tf.reshape(
+        tf.io.decode_raw(record["y"], tf.float32),
+        tf.stack([n_nodes, tf.constant(15, dtype=tf.int64)]),
+    )
+    indices = tf.reshape(
+        tf.io.decode_raw(record["indices"], tf.int32),
+        tf.stack([n_edges, tf.constant(2, dtype=tf.int64)]),
+    )
+    indices = tf.cast(indices, tf.int64)
+    adjacency = tf.SparseTensor(
+        indices=indices,
+        values=tf.ones([n_edges], dtype=tf.float32),
+        dense_shape=tf.stack([n_nodes, n_nodes]),
+    )
+    graph_count = n_nodes // n_boids
+    graph_ids = tf.repeat(tf.range(graph_count, dtype=tf.int64), n_boids)
+    x = tf.ensure_shape(x, [None, 6])
+    y = tf.ensure_shape(y, [None, 15])
+    graph_ids = tf.ensure_shape(graph_ids, [None])
+    return (x, adjacency, graph_ids), y
+
+
+def dataset_from_cloud_tfrecord_shards_3d(shard_paths, steps):
+    """Load packed batches through native C++ TFRecord readers and parsers."""
+    if not shard_paths:
+        raise ValueError("Cloud TFRecord dataset received no shard paths.")
+    dataset = tf.data.TFRecordDataset(
+        shard_paths,
+        compression_type="",
+        num_parallel_reads=tf.data.AUTOTUNE,
+    )
+    dataset = dataset.map(
+        _parse_cloud_tfrecord_batch_3d,
+        num_parallel_calls=tf.data.AUTOTUNE,
+        deterministic=False,
+    )
+    dataset = dataset.map(
+        add_graph_ids_to_targets_3d,
+        num_parallel_calls=tf.data.AUTOTUNE,
+        deterministic=False,
+    )
+    if steps > 1:
+        dataset = dataset.shuffle(
+            min(256, int(steps)),
+            reshuffle_each_iteration=True,
+        )
+    options = tf.data.Options()
+    options.deterministic = False
+    return dataset.with_options(options).repeat().prefetch(tf.data.AUTOTUNE)
+
+
 def write_cached_chunk_shards_3d(
     cache_paths,
     trajectory_refs,
@@ -474,6 +570,7 @@ def write_cached_chunk_shards_3d(
     shuffle_buffer_size=4096,
     batches_per_shard=16,
     drop_remainder=False,
+    native_tfrecord=False,
 ):
     """Write shuffled disjoint batches into compact multi-batch shards.
 
@@ -487,12 +584,32 @@ def write_cached_chunk_shards_3d(
     os.makedirs(output_dir, exist_ok=True)
     shard_paths = []
     shard_batches = []
+    record_writer = None
+    record_batches_in_shard = 0
     total_batches = 0
     x_batch, y_batch, row_batch, col_batch, len_batch = [], [], [], [], []
     shuffle_buffer = []
     shuffle_buffer_size = max(batch_size, int(shuffle_buffer_size))
     batches_per_shard = max(1, int(batches_per_shard))
     rng = np.random.default_rng()
+
+    def write_record_batch(x, y, indices):
+        nonlocal record_writer, record_batches_in_shard
+        if record_writer is None:
+            path = os.path.join(
+                output_dir, f"shard_{len(shard_paths):05d}.tfrecord"
+            )
+            record_writer = tf.io.TFRecordWriter(path)
+            shard_paths.append(path)
+            record_batches_in_shard = 0
+        record_writer.write(
+            _serialize_cloud_tfrecord_batch_3d(x, y, indices, n_boids)
+        )
+        record_batches_in_shard += 1
+        if record_batches_in_shard >= batches_per_shard:
+            record_writer.close()
+            record_writer = None
+            record_batches_in_shard = 0
 
     def flush_shard():
         nonlocal shard_batches
@@ -537,10 +654,13 @@ def write_cached_chunk_shards_3d(
             n_boids,
             compact=True,
         )
-        shard_batches.append((x, y, indices))
+        if native_tfrecord:
+            write_record_batch(x, y, indices)
+        else:
+            shard_batches.append((x, y, indices))
         total_batches += 1
         x_batch, y_batch, row_batch, col_batch, len_batch = [], [], [], [], []
-        if len(shard_batches) >= batches_per_shard:
+        if not native_tfrecord and len(shard_batches) >= batches_per_shard:
             flush_shard()
 
     def emit_sample(sample):
@@ -607,7 +727,11 @@ def write_cached_chunk_shards_3d(
 
     if x_batch and not drop_remainder:
         flush_batch()
-    flush_shard()
+    if native_tfrecord:
+        if record_writer is not None:
+            record_writer.close()
+    else:
+        flush_shard()
     return shard_paths, max(1, total_batches)
 
 
@@ -1697,9 +1821,9 @@ parser.add_argument(
     "--cloud_native_dataset",
     action="store_true",
     help=(
-        "Cloud-only: materialize each packed chunk once with Dataset.save and "
-        "train from Dataset.load without a per-batch Python generator. Requires "
-        "--cloud_optimized and --multi_gpu."
+        "Cloud-only: write packed batches directly as TFRecord shards and "
+        "train through native parallel tf.data readers without NPZ or a "
+        "per-batch Python generator. Requires --cloud_optimized and --multi_gpu."
     ),
 )
 parser.add_argument(
@@ -1865,7 +1989,11 @@ if args._chunk_worker:
         f"near_goal_radius={args.near_goal_radius}",
         flush=True,
     )
-    print(">>> Worker setup: writing compact train batch shards...", flush=True)
+    shard_format = "direct TFRecord" if args.cloud_native_dataset else "compact NPZ"
+    print(
+        f">>> Worker setup: writing {shard_format} train batch shards...",
+        flush=True,
+    )
     train_shard_paths, train_steps = write_cached_chunk_shards_3d(
         worker_cache_paths, chunk_refs, boundaries_by_cache, args._n_boids_cache,
         per_replica_batch_size,
@@ -1874,6 +2002,7 @@ if args._chunk_worker:
         perception=args.perception, shuffle_buffer_size=args.shuffle_buffer_size,
         batches_per_shard=args.packed_shard_batches,
         drop_remainder=args.multi_gpu,
+        native_tfrecord=args.cloud_native_dataset,
     )
     print(
         f">>> Worker setup: wrote {train_steps} train batches in "
@@ -1881,17 +2010,21 @@ if args._chunk_worker:
         f"{time.time() - setup_t0:.1f}s",
         flush=True,
     )
-    train_data = dataset_from_batch_shards_3d(train_shard_paths).map(
-        add_graph_ids_to_targets_3d,
-        num_parallel_calls=tf.data.AUTOTUNE,
-    ).prefetch(tf.data.AUTOTUNE)
     if args.cloud_native_dataset:
-        train_data = materialize_cloud_native_dataset_3d(
-            train_data,
+        train_data = dataset_from_cloud_tfrecord_shards_3d(
+            train_shard_paths,
             train_steps,
-            os.path.join(worker_tmpdir, "native_train_dataset"),
-            shuffle_batches=True,
         )
+        print(
+            ">>> Cloud native dataset: direct TFRecord loader ready; "
+            "no NPZ conversion or Dataset.save pass required.",
+            flush=True,
+        )
+    else:
+        train_data = dataset_from_batch_shards_3d(train_shard_paths).map(
+            add_graph_ids_to_targets_3d,
+            num_parallel_calls=tf.data.AUTOTUNE,
+        ).prefetch(tf.data.AUTOTUNE)
 
     # Load validation data from serialized npz if provided and not fixed-epoch mode
     use_val = (args.chunk_epochs is None) and (args._val_npz_file is not None)
