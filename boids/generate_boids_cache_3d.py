@@ -197,9 +197,14 @@ def main():
                 acol_buf = np.full((n, max_edges), -1, dtype=np.int32)
                 alen_buf = np.zeros(n, dtype=np.int32)
 
-                for k, (x, a, y) in enumerate(samples):
+                for k, (x, _, y) in enumerate(samples):
                     x_buf[k] = x
                     y_buf[k] = y
+                    # Canonicalize the graph from the exact float32 state that
+                    # is written to the cache.  The simulator evolves float64
+                    # positions, so reusing its graph can disagree at the
+                    # perception boundary after x is quantized to float32.
+                    a = boids.get_neighbors(x_buf[k, :, :3])
                     nnz = a.nnz
                     arow_buf[k, :nnz] = a.row
                     acol_buf[k, :nnz] = a.col
