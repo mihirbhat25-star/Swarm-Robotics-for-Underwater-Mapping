@@ -4,6 +4,13 @@ Trains the 3D GNCA to imitate the 3D Boids GCA.
 import argparse
 import gc
 import os
+
+# Configure native libraries before TensorFlow/ABSL are imported.  These
+# settings affect only log verbosity, not numerical execution.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+os.environ.setdefault("GLOG_minloglevel", "3")
+
 import sys
 import json
 import subprocess
@@ -35,10 +42,6 @@ from modules.boids_3d import (
 import h5py
 import scipy.sparse as sp
 import psutil
-
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-os.environ['GRPC_VERBOSITY'] = 'ERROR'
-os.environ['GLOG_minloglevel'] = '3'
 
 physical_devices = tf.config.list_physical_devices("GPU")
 for physical_device in physical_devices:
@@ -106,6 +109,7 @@ def print_run_parameters_3d(args, upweight, critical_distance, distance_weight, 
     print(f"Multi-GPU:            {args.multi_gpu}")
     print(f"Cloud optimized:      {args.cloud_optimized}")
     print(f"Cloud native data:    {args.cloud_native_dataset}")
+    print(f"Cloud RAM data:       {args.cloud_ram_dataset}")
     print(f"Cloud BF16:           {args.cloud_bfloat16}")
     print(
         f"Execution:            "
@@ -557,6 +561,261 @@ def dataset_from_cloud_tfrecord_shards_3d(shard_paths, steps):
     return dataset.with_options(options).repeat().prefetch(tf.data.AUTOTUNE)
 
 
+def _generate_compact_ram_chunk_3d(chunk_idx, octant_counts):
+    """Generate compact trajectories in CPU workers and return them in RAM."""
+    from boids.cloud_ram_data_3d import generate_compact_task_3d
+
+    total = sum(octant_counts.values())
+    workers = args.generation_workers
+    if workers <= 0:
+        workers = max(1, (os.cpu_count() or 2) - 2)
+    workers = max(1, min(workers, total))
+    target_task_size = max(1, int(np.ceil(total / workers)))
+
+    task_configs = []
+    task_idx = 0
+    for octant, count in sorted(octant_counts.items()):
+        n_tasks = max(1, int(np.ceil(count / target_task_size)))
+        task_counts = [
+            len(part) for part in np.array_split(np.arange(count), n_tasks)
+        ]
+        for task_count in task_counts:
+            task_configs.append({
+                "octant": int(octant),
+                "count": int(task_count),
+                "seed": int((
+                    args.generation_seed
+                    + chunk_idx * 1_000_003
+                    + task_idx
+                ) % (2**32 - 1)),
+                "n_boids": int(args.n_boids),
+                "perception": float(args.perception),
+                "pos_noise": float(args.expert_pos_noise),
+                "vel_noise": float(args.expert_vel_noise),
+                "waypoint_order_policy": _expert_waypoint_policy_3d(args),
+                "goal_exclusion_size": float(args.goal_exclusion_size),
+            })
+            task_idx += 1
+
+    print(
+        f">>> Cloud RAM: generating {total} trajectories across "
+        f"{len(task_configs)} tasks with {workers} CPU workers...",
+        flush=True,
+    )
+    generation_t0 = time.time()
+    previous_cuda_visibility = os.environ.get("CUDA_VISIBLE_DEVICES")
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(name, "1")
+    try:
+        task_results = joblib.Parallel(
+            n_jobs=workers,
+            backend="loky",
+            batch_size=1,
+            pre_dispatch=workers,
+            max_nbytes=None,
+        )(
+            joblib.delayed(generate_compact_task_3d)(config)
+            for config in task_configs
+        )
+    finally:
+        if previous_cuda_visibility is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = previous_cuda_visibility
+
+    trajectories = []
+    centers = []
+    center_octants = []
+    task_records = []
+    for result in task_results:
+        trajectories.extend(result["trajectories"])
+        centers.append(result["centers"])
+        center_octants.extend([result["octant"]] * result["count"])
+        task_records.append({
+            "octant": result["octant"],
+            "count": result["count"],
+            "seed": result["seed"],
+            "seconds": result["seconds"],
+        })
+
+    print(
+        f">>> Cloud RAM: expert trajectories ready in "
+        f"{time.time() - generation_t0:.1f}s; no HDF5 cache was written.",
+        flush=True,
+    )
+    return (
+        trajectories,
+        np.concatenate(centers, axis=0),
+        np.asarray(center_octants, dtype=np.int8),
+        task_records,
+    )
+
+
+def _selected_ram_sample_refs_3d(
+    trajectories, timestep_stride, near_goal_radius
+):
+    """Return shuffled (trajectory, timestep) references for RAM packing."""
+    trajectory_ids = []
+    timestep_ids = []
+    for trajectory_idx, trajectory in enumerate(trajectories):
+        n_steps = len(trajectory["x"])
+        if timestep_stride <= 1 or near_goal_radius <= 0:
+            selected = np.arange(0, n_steps, timestep_stride, dtype=np.int32)
+        else:
+            mean_pos = trajectory["x"][..., :3].mean(axis=1)
+            dist_to_goal = np.min(
+                np.linalg.norm(
+                    mean_pos[:, None, :]
+                    - BOIDS_GOAL_POSITIONS_3D[None, :, :],
+                    axis=-1,
+                ),
+                axis=1,
+            )
+            keep = np.zeros(n_steps, dtype=bool)
+            keep[::timestep_stride] = True
+            keep |= dist_to_goal < near_goal_radius
+            selected = np.flatnonzero(keep).astype(np.int32, copy=False)
+        trajectory_ids.append(
+            np.full(len(selected), trajectory_idx, dtype=np.int32)
+        )
+        timestep_ids.append(selected)
+    return np.concatenate(trajectory_ids), np.concatenate(timestep_ids)
+
+
+def _ram_batch_to_model_inputs_3d(x, y, indices, n_boids):
+    indices = tf.cast(indices, tf.int64)
+    n_nodes = tf.shape(x, out_type=tf.int64)[0]
+    adjacency = tf.SparseTensor(
+        indices=indices,
+        values=tf.ones([tf.shape(indices)[0]], dtype=tf.float32),
+        dense_shape=tf.stack([n_nodes, n_nodes]),
+    )
+    graph_count = n_nodes // tf.cast(n_boids, tf.int64)
+    graph_ids = tf.repeat(
+        tf.range(graph_count, dtype=tf.int64), tf.cast(n_boids, tf.int64)
+    )
+    targets = tf.concat(
+        [y, tf.cast(graph_ids[:, None], y.dtype)], axis=-1
+    )
+    x = tf.ensure_shape(x, [None, 6])
+    targets = tf.ensure_shape(targets, [None, 16])
+    graph_ids = tf.ensure_shape(graph_ids, [None])
+    return (x, adjacency, graph_ids), targets
+
+
+def dataset_from_compact_ram_trajectories_3d(
+    trajectories,
+    batch_size,
+    n_boids,
+    timestep_stride,
+    near_goal_radius,
+    seed,
+    drop_remainder=True,
+    shuffle_batches=True,
+):
+    """Pack a chunk once in RAM and expose it through native ``tf.data``."""
+    pack_t0 = time.time()
+    trajectory_ids, timestep_ids = _selected_ram_sample_refs_3d(
+        trajectories, timestep_stride, near_goal_radius
+    )
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(trajectory_ids))
+    trajectory_ids = trajectory_ids[order]
+    timestep_ids = timestep_ids[order]
+
+    if drop_remainder:
+        usable = (len(order) // batch_size) * batch_size
+        trajectory_ids = trajectory_ids[:usable]
+        timestep_ids = timestep_ids[:usable]
+    n_batches = int(np.ceil(len(trajectory_ids) / batch_size))
+    if n_batches < 1:
+        raise ValueError("Cloud RAM mode produced no trainable batches.")
+    if len(trajectory_ids) % batch_size:
+        raise ValueError(
+            "Cloud RAM tensor packing currently requires complete batches."
+        )
+
+    n_nodes = batch_size * n_boids
+    x_batches = np.empty((n_batches, n_nodes, 6), dtype=np.float32)
+    y_batches = np.empty((n_batches, n_nodes, 15), dtype=np.float32)
+    edge_batches = []
+    edge_lengths = np.zeros(n_batches, dtype=np.int64)
+
+    for batch_idx in range(n_batches):
+        start = batch_idx * batch_size
+        stop = start + batch_size
+        batch_edge_parts = []
+        for graph_idx, sample_idx in enumerate(range(start, stop)):
+            trajectory = trajectories[int(trajectory_ids[sample_idx])]
+            timestep = int(timestep_ids[sample_idx])
+            node_start = graph_idx * n_boids
+            node_stop = node_start + n_boids
+            x_batches[batch_idx, node_start:node_stop] = trajectory["x"][timestep]
+            y_batches[batch_idx, node_start:node_stop] = trajectory["y"][timestep]
+            edge_start = int(trajectory["edge_offsets"][timestep])
+            edge_stop = int(trajectory["edge_offsets"][timestep + 1])
+            if edge_stop > edge_start:
+                batch_edge_parts.append(
+                    trajectory["edge_values"][edge_start:edge_stop]
+                    + np.int32(node_start)
+                )
+        if batch_edge_parts:
+            batch_edges = np.concatenate(batch_edge_parts, axis=0)
+        else:
+            batch_edges = np.zeros((0, 2), dtype=np.int32)
+        edge_batches.append(batch_edges)
+        edge_lengths[batch_idx] = len(batch_edges)
+
+    edge_values = (
+        np.concatenate(edge_batches, axis=0)
+        if np.sum(edge_lengths) > 0
+        else np.zeros((0, 2), dtype=np.int32)
+    )
+    edge_splits = np.concatenate((
+        np.zeros(1, dtype=np.int64),
+        np.cumsum(edge_lengths, dtype=np.int64),
+    ))
+
+    with tf.device("/CPU:0"):
+        x_tensor = tf.convert_to_tensor(x_batches)
+        y_tensor = tf.convert_to_tensor(y_batches)
+        edge_tensor = tf.RaggedTensor.from_row_splits(
+            tf.convert_to_tensor(edge_values),
+            tf.convert_to_tensor(edge_splits),
+            validate=False,
+        )
+        dataset = tf.data.Dataset.from_tensor_slices(
+            (x_tensor, y_tensor, edge_tensor)
+        )
+    dataset = dataset.map(
+        lambda x, y, indices: _ram_batch_to_model_inputs_3d(
+            x, y, indices, n_boids
+        ),
+        num_parallel_calls=tf.data.AUTOTUNE,
+        deterministic=False,
+    )
+    if shuffle_batches and n_batches > 1:
+        dataset = dataset.shuffle(
+            min(256, n_batches),
+            seed=seed,
+            reshuffle_each_iteration=True,
+        )
+    options = tf.data.Options()
+    options.deterministic = False
+    dataset = dataset.with_options(options).repeat().prefetch(tf.data.AUTOTUNE)
+    resident_gb = (
+        x_batches.nbytes + y_batches.nbytes + edge_values.nbytes
+    ) / (1024 ** 3)
+    print(
+        f">>> Cloud RAM: packed {n_batches} batches in "
+        f"{time.time() - pack_t0:.1f}s ({resident_gb:.1f} GiB resident); "
+        "no TFRecord was written.",
+        flush=True,
+    )
+    return dataset, n_batches
+
+
 def write_cached_chunk_shards_3d(
     cache_paths,
     trajectory_refs,
@@ -888,6 +1147,8 @@ def _build_chunk_worker_command_3d(
     val_npz_file,
     training_state_dir,
     chunk_patience,
+    ram_chunk_mix_file=None,
+    ram_centers_output_file=None,
 ):
     """Build the isolated worker command shared by cached and generated chunks."""
     cmd = [
@@ -896,12 +1157,8 @@ def _build_chunk_worker_command_3d(
         "boids.run_boids_3d",
         "--_chunk_worker",
         "--_chunk_idx", str(chunk_idx),
-        "--_chunk_indices_file", chunk_file,
-        "--_cache_paths_file", cache_paths_file,
         "--_checkpoint_path", checkpoint_path,
         "--_n_boids_cache", str(n_boids_cache),
-        "--_boundaries_file", boundaries_file,
-        "--_val_npz_file", val_npz_file,
         "--_training_state_dir", training_state_dir,
         "--lr", str(args.lr),
         "--batch_size", str(args.batch_size),
@@ -925,6 +1182,22 @@ def _build_chunk_worker_command_3d(
         "--expert_pos_noise", str(args.expert_pos_noise),
         "--expert_vel_noise", str(args.expert_vel_noise),
     ]
+    if ram_chunk_mix_file is not None:
+        cmd.extend([
+            "--_ram_chunk_mix_file", ram_chunk_mix_file,
+            "--_ram_centers_output_file", ram_centers_output_file,
+            "--generation_workers", str(args.generation_workers),
+            "--generation_seed", str(args.generation_seed),
+            "--va_set_size", str(args.va_set_size),
+            "--train_octants", *[str(o) for o in args.train_octants],
+        ])
+    else:
+        cmd.extend([
+            "--_chunk_indices_file", chunk_file,
+            "--_cache_paths_file", cache_paths_file,
+            "--_boundaries_file", boundaries_file,
+            "--_val_npz_file", val_npz_file,
+        ])
     if args.eager_training:
         cmd.append("--eager_training")
     if args.multi_gpu:
@@ -933,6 +1206,8 @@ def _build_chunk_worker_command_3d(
         cmd.append("--cloud_optimized")
     if args.cloud_native_dataset:
         cmd.append("--cloud_native_dataset")
+    if args.cloud_ram_dataset:
+        cmd.append("--cloud_ram_dataset")
     if args.cloud_bfloat16:
         cmd.append("--cloud_bfloat16")
     if args.chunk_epochs is not None:
@@ -1303,6 +1578,105 @@ def run_generated_chunked_3d(run_tag, requested_counts, chunk_size, chunk_patien
     print(f"Saved final weights to {checkpoint_path}")
     manifest = {
         "mode": "on_the_fly",
+        "generation_seed": args.generation_seed,
+        "generation_workers": args.generation_workers,
+        "goal_order": args.expert_goal_order,
+        "goal_exclusion_size": args.goal_exclusion_size,
+        "pos_noise": args.expert_pos_noise,
+        "vel_noise": args.expert_vel_noise,
+        "perception": args.perception,
+        "octant_unique_counts": requested_counts,
+        "tasks": manifest_tasks,
+    }
+    return (
+        final_model,
+        np.concatenate(all_centers, axis=0),
+        np.concatenate(all_center_octants, axis=0),
+        manifest,
+    )
+
+
+def run_generated_ram_chunked_3d(
+    run_tag, requested_counts, chunk_size, chunk_patience
+):
+    """Run generated chunks entirely in each worker's host RAM."""
+    checkpoint_path = f"saved_models/best_weights_3d_{run_tag}"
+    os.makedirs("saved_models", exist_ok=True)
+    allocations = _proportional_chunk_allocations_3d(
+        requested_counts, chunk_size
+    )
+    print(
+        f">>> Cloud RAM chunked training: {len(allocations)} chunks; "
+        f"requested octant totals {requested_counts}",
+        flush=True,
+    )
+
+    all_centers = []
+    all_center_octants = []
+    manifest_tasks = []
+    with tempfile.TemporaryDirectory(prefix="gnca_3d_ram_control_") as tmpdir:
+        training_state_dir = os.path.join(tmpdir, "training_state")
+        for chunk_idx, chunk_mix in enumerate(allocations):
+            print(f"\n{'='*60}")
+            print(
+                f"  Chunk {chunk_idx + 1}/{len(allocations)} | "
+                f"{sum(chunk_mix.values())} RAM-generated trajectories"
+            )
+            print(f"{'='*60}")
+            print(f">>> Chunk octant mix: {chunk_mix}")
+
+            mix_file = os.path.join(tmpdir, f"mix_{chunk_idx:04d}.json")
+            centers_file = os.path.join(
+                tmpdir, f"centers_{chunk_idx:04d}.npz"
+            )
+            with open(mix_file, "w", encoding="utf-8") as file_handle:
+                json.dump(chunk_mix, file_handle)
+
+            cmd = _build_chunk_worker_command_3d(
+                chunk_idx,
+                None,
+                None,
+                checkpoint_path,
+                args.n_boids,
+                None,
+                None,
+                training_state_dir,
+                chunk_patience,
+                ram_chunk_mix_file=mix_file,
+                ram_centers_output_file=centers_file,
+            )
+            result = subprocess.run(cmd)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Cloud RAM chunk worker {chunk_idx + 1}/"
+                    f"{len(allocations)} failed with exit code "
+                    f"{result.returncode}"
+                )
+            with np.load(centers_file) as center_data:
+                all_centers.append(center_data["centers"].copy())
+                all_center_octants.append(
+                    center_data["center_octants"].copy()
+                )
+            for octant, count in chunk_mix.items():
+                manifest_tasks.append({
+                    "chunk": chunk_idx,
+                    "octant": int(octant),
+                    "count": int(count),
+                })
+            gc.collect()
+            print(
+                f">>> Cloud RAM worker exited; all trajectory and packed-batch "
+                f"memory for chunk {chunk_idx + 1} was released.",
+                flush=True,
+            )
+
+    final_model = _build_model_3d(args.lr)
+    _build_model_variables_3d(final_model, args.n_boids)
+    final_model.load_weights(checkpoint_path).expect_partial()
+    final_model.save_weights(checkpoint_path)
+    print(f"Saved final weights to {checkpoint_path}")
+    manifest = {
+        "mode": "on_the_fly_cloud_ram",
         "generation_seed": args.generation_seed,
         "generation_workers": args.generation_workers,
         "goal_order": args.expert_goal_order,
@@ -1750,6 +2124,8 @@ parser.add_argument("--_boundaries_file", default=None)
 parser.add_argument("--_val_indices_file", default=None)
 parser.add_argument("--_val_npz_file", default=None)
 parser.add_argument("--_training_state_dir", default=None)
+parser.add_argument("--_ram_chunk_mix_file", default=None)
+parser.add_argument("--_ram_centers_output_file", default=None)
 parser.add_argument("--noise_tag", default="", type=str)
 parser.add_argument("--init_centers_npz", default="", type=str)
 parser.add_argument(
@@ -1824,6 +2200,16 @@ parser.add_argument(
         "Cloud-only: write packed batches directly as TFRecord shards and "
         "train through native parallel tf.data readers without NPZ or a "
         "per-batch Python generator. Requires --cloud_optimized and --multi_gpu."
+    ),
+)
+parser.add_argument(
+    "--cloud_ram_dataset",
+    action="store_true",
+    help=(
+        "Cloud-only generated-data mode: generate compact trajectories in "
+        "parallel, pack them once in host RAM, and train through native "
+        "tf.data without temporary HDF5 or TFRecord files. Requires "
+        "--generate_on_the_fly, --cloud_optimized, and --multi_gpu."
     ),
 )
 parser.add_argument(
@@ -1917,6 +2303,20 @@ if args.cloud_optimized and args.eager_training:
     raise ValueError("--cloud_optimized cannot be combined with --eager_training.")
 if args.cloud_native_dataset and not args.cloud_optimized:
     raise ValueError("--cloud_native_dataset requires --cloud_optimized.")
+if args.cloud_ram_dataset and not args.cloud_optimized:
+    raise ValueError("--cloud_ram_dataset requires --cloud_optimized.")
+if args.cloud_ram_dataset and args.cloud_native_dataset:
+    raise ValueError(
+        "Choose only one of --cloud_ram_dataset and --cloud_native_dataset."
+    )
+if (
+    args.cloud_ram_dataset
+    and not args._chunk_worker
+    and not args.generate_on_the_fly
+):
+    raise ValueError(
+        "--cloud_ram_dataset requires --generate_on_the_fly."
+    )
 if args.cloud_bfloat16 and not args.cloud_optimized:
     raise ValueError("--cloud_bfloat16 requires --cloud_optimized.")
 if args.cloud_bfloat16:
@@ -1965,87 +2365,195 @@ if (
 if args._chunk_worker:
     UPWEIGHT_NEAR_GOAL = (args.loss_type == "newl")
     setup_t0 = time.time()
-    with open(args._chunk_indices_file, encoding="utf-8") as f:
-        chunk_refs = np.asarray(json.load(f), dtype=np.int64).reshape(-1, 2)
-    with open(args._cache_paths_file, encoding="utf-8") as f:
-        worker_cache_paths = json.load(f)
-    with np.load(args._boundaries_file) as boundary_data:
-        boundaries_by_cache = [
-            boundary_data[f"cache_{cache_idx}"]
-            for cache_idx in range(len(worker_cache_paths))
-        ]
-
     replica_count = len(physical_devices) if args.multi_gpu else 1
     per_replica_batch_size = args.batch_size // replica_count
+    worker_tmpdir = None
+    loader_va = None
+    val_data = None
+    val_steps = 0
 
-    worker_tmpdir = tempfile.mkdtemp(prefix="gnca_3d_worker_batches_")
-    atexit.register(shutil.rmtree, worker_tmpdir, ignore_errors=True)
-    print(
-        f">>> Worker setup: {len(chunk_refs)} trajectories from "
-        f"{len(worker_cache_paths)} cache(s), "
-        f"global_batch_size={args.batch_size}, "
-        f"per_replica_batch_size={per_replica_batch_size}, "
-        f"replicas={replica_count}, stride={args.timestep_stride}, "
-        f"near_goal_radius={args.near_goal_radius}",
-        flush=True,
-    )
-    shard_format = "direct TFRecord" if args.cloud_native_dataset else "compact NPZ"
-    print(
-        f">>> Worker setup: writing {shard_format} train batch shards...",
-        flush=True,
-    )
-    train_shard_paths, train_steps = write_cached_chunk_shards_3d(
-        worker_cache_paths, chunk_refs, boundaries_by_cache, args._n_boids_cache,
-        per_replica_batch_size,
-        os.path.join(worker_tmpdir, "train_batches"),
-        timestep_stride=args.timestep_stride, near_goal_radius=args.near_goal_radius,
-        perception=args.perception, shuffle_buffer_size=args.shuffle_buffer_size,
-        batches_per_shard=args.packed_shard_batches,
-        drop_remainder=args.multi_gpu,
-        native_tfrecord=args.cloud_native_dataset,
-    )
-    print(
-        f">>> Worker setup: wrote {train_steps} train batches in "
-        f"{len(train_shard_paths)} compact shards in "
-        f"{time.time() - setup_t0:.1f}s",
-        flush=True,
-    )
-    if args.cloud_native_dataset:
-        train_data = dataset_from_cloud_tfrecord_shards_3d(
-            train_shard_paths,
-            train_steps,
+    if args.cloud_ram_dataset:
+        if args._ram_chunk_mix_file is None:
+            raise RuntimeError("Cloud RAM worker requires a chunk-mix file.")
+        with open(args._ram_chunk_mix_file, encoding="utf-8") as file_handle:
+            chunk_mix = {
+                int(octant): int(count)
+                for octant, count in json.load(file_handle).items()
+            }
+        (
+            compact_trajectories,
+            chunk_centers,
+            chunk_center_octants,
+            _,
+        ) = _generate_compact_ram_chunk_3d(args._chunk_idx, chunk_mix)
+        if args._ram_centers_output_file is None:
+            raise RuntimeError("Cloud RAM worker requires a centers output file.")
+        np.savez(
+            args._ram_centers_output_file,
+            centers=chunk_centers,
+            center_octants=chunk_center_octants,
         )
+        train_data, train_steps = dataset_from_compact_ram_trajectories_3d(
+            compact_trajectories,
+            per_replica_batch_size,
+            args._n_boids_cache,
+            args.timestep_stride,
+            args.near_goal_radius,
+            seed=args.generation_seed + args._chunk_idx,
+            drop_remainder=args.multi_gpu,
+            shuffle_batches=True,
+        )
+        del compact_trajectories
+        gc.collect()
+
+        use_val = args.chunk_epochs is None
+        if use_val:
+            n_octants = len(args.train_octants)
+            base = args.va_set_size // n_octants
+            remainder = args.va_set_size % n_octants
+            validation_mix = {
+                int(octant): base + (1 if idx < remainder else 0)
+                for idx, octant in enumerate(args.train_octants)
+            }
+            validation_mix = {
+                octant: count
+                for octant, count in validation_mix.items()
+                if count > 0
+            }
+            validation_seed_chunk = args._chunk_idx + 10_000
+            validation_trajectories, _, _, _ = _generate_compact_ram_chunk_3d(
+                validation_seed_chunk, validation_mix
+            )
+            val_data, val_steps = dataset_from_compact_ram_trajectories_3d(
+                validation_trajectories,
+                per_replica_batch_size,
+                args._n_boids_cache,
+                args.timestep_stride,
+                args.near_goal_radius,
+                seed=(
+                    args.generation_seed
+                    + 1_000_000_000
+                    + args._chunk_idx
+                ),
+                drop_remainder=True,
+                shuffle_batches=False,
+            )
+            del validation_trajectories
+            gc.collect()
         print(
-            ">>> Cloud native dataset: direct TFRecord loader ready; "
-            "no NPZ conversion or Dataset.save pass required.",
+            f">>> Cloud RAM worker setup complete in "
+            f"{time.time() - setup_t0:.1f}s; training begins now.",
             flush=True,
         )
     else:
-        train_data = dataset_from_batch_shards_3d(train_shard_paths).map(
-            add_graph_ids_to_targets_3d,
-            num_parallel_calls=tf.data.AUTOTUNE,
-        ).prefetch(tf.data.AUTOTUNE)
+        with open(args._chunk_indices_file, encoding="utf-8") as file_handle:
+            chunk_refs = np.asarray(
+                json.load(file_handle), dtype=np.int64
+            ).reshape(-1, 2)
+        with open(args._cache_paths_file, encoding="utf-8") as file_handle:
+            worker_cache_paths = json.load(file_handle)
+        with np.load(args._boundaries_file) as boundary_data:
+            boundaries_by_cache = [
+                boundary_data[f"cache_{cache_idx}"]
+                for cache_idx in range(len(worker_cache_paths))
+            ]
 
-    # Load validation data from serialized npz if provided and not fixed-epoch mode
-    use_val = (args.chunk_epochs is None) and (args._val_npz_file is not None)
-    if use_val:
-        _vd = np.load(args._val_npz_file)
-        _vx, _vy, _varow, _vacol, _valen = _vd['x'], _vd['y'], _vd['a_row'], _vd['a_col'], _vd['a_len']
-        _nb = int(_vd['n_boids'][0])
-        from spektral.data import Graph
-        _va_graphs = []
-        for k in range(len(_vx)):
-            _nnz = int(_valen[k])
-            _a = sp.coo_matrix((np.ones(_nnz, dtype=np.float32),
-                                (_varow[k, :_nnz], _vacol[k, :_nnz])), shape=(_nb, _nb))
-            _va_graphs.append(Graph(x=_vx[k], a=_a, y=_vy[k]))
-        from modules.boids_3d import BoidsDataset3D
-        data_val = BoidsDataset3D(_va_graphs)
-        loader_va = DisjointLoader(
-            data_val,
-            node_level=True,
-            batch_size=per_replica_batch_size,
+        worker_tmpdir = tempfile.mkdtemp(prefix="gnca_3d_worker_batches_")
+        atexit.register(shutil.rmtree, worker_tmpdir, ignore_errors=True)
+        print(
+            f">>> Worker setup: {len(chunk_refs)} trajectories from "
+            f"{len(worker_cache_paths)} cache(s), "
+            f"global_batch_size={args.batch_size}, "
+            f"per_replica_batch_size={per_replica_batch_size}, "
+            f"replicas={replica_count}, stride={args.timestep_stride}, "
+            f"near_goal_radius={args.near_goal_radius}",
+            flush=True,
         )
+        shard_format = (
+            "direct TFRecord" if args.cloud_native_dataset else "compact NPZ"
+        )
+        print(
+            f">>> Worker setup: writing {shard_format} train batch shards...",
+            flush=True,
+        )
+        train_shard_paths, train_steps = write_cached_chunk_shards_3d(
+            worker_cache_paths,
+            chunk_refs,
+            boundaries_by_cache,
+            args._n_boids_cache,
+            per_replica_batch_size,
+            os.path.join(worker_tmpdir, "train_batches"),
+            timestep_stride=args.timestep_stride,
+            near_goal_radius=args.near_goal_radius,
+            perception=args.perception,
+            shuffle_buffer_size=args.shuffle_buffer_size,
+            batches_per_shard=args.packed_shard_batches,
+            drop_remainder=args.multi_gpu,
+            native_tfrecord=args.cloud_native_dataset,
+        )
+        print(
+            f">>> Worker setup: wrote {train_steps} train batches in "
+            f"{len(train_shard_paths)} compact shards in "
+            f"{time.time() - setup_t0:.1f}s",
+            flush=True,
+        )
+        if args.cloud_native_dataset:
+            train_data = dataset_from_cloud_tfrecord_shards_3d(
+                train_shard_paths, train_steps
+            )
+            print(
+                ">>> Cloud native dataset: direct TFRecord loader ready; "
+                "no NPZ conversion or Dataset.save pass required.",
+                flush=True,
+            )
+        else:
+            train_data = dataset_from_batch_shards_3d(train_shard_paths).map(
+                add_graph_ids_to_targets_3d,
+                num_parallel_calls=tf.data.AUTOTUNE,
+            ).prefetch(tf.data.AUTOTUNE)
+
+        use_val = (
+            args.chunk_epochs is None and args._val_npz_file is not None
+        )
+        if use_val:
+            validation_npz = np.load(args._val_npz_file)
+            validation_x = validation_npz["x"]
+            validation_y = validation_npz["y"]
+            validation_rows = validation_npz["a_row"]
+            validation_cols = validation_npz["a_col"]
+            validation_lengths = validation_npz["a_len"]
+            validation_n_boids = int(validation_npz["n_boids"][0])
+            from spektral.data import Graph
+
+            validation_graphs = []
+            for graph_idx in range(len(validation_x)):
+                nnz = int(validation_lengths[graph_idx])
+                adjacency = sp.coo_matrix(
+                    (
+                        np.ones(nnz, dtype=np.float32),
+                        (
+                            validation_rows[graph_idx, :nnz],
+                            validation_cols[graph_idx, :nnz],
+                        ),
+                    ),
+                    shape=(validation_n_boids, validation_n_boids),
+                )
+                validation_graphs.append(
+                    Graph(
+                        x=validation_x[graph_idx],
+                        a=adjacency,
+                        y=validation_y[graph_idx],
+                    )
+                )
+            from modules.boids_3d import BoidsDataset3D
+
+            data_val = BoidsDataset3D(validation_graphs)
+            loader_va = DisjointLoader(
+                data_val,
+                node_level=True,
+                batch_size=per_replica_batch_size,
+            )
+            val_steps = loader_va.steps_per_epoch
 
     if args._training_state_dir is None:
         raise RuntimeError("Chunk worker requires --_training_state_dir")
@@ -2116,17 +2624,18 @@ if args._chunk_worker:
             EarlyStopping(monitor='val_loss', patience=args.es_patience,
                           restore_best_weights=False, verbose=1),
         ]
-        val_data = loader_va.load().map(add_graph_ids_to_targets_3d)
-        if args.cloud_native_dataset:
-            val_data = materialize_cloud_native_dataset_3d(
-                val_data,
-                loader_va.steps_per_epoch,
-                os.path.join(worker_tmpdir, "native_validation_dataset"),
-                shuffle_batches=False,
-            )
+        if not args.cloud_ram_dataset:
+            val_data = loader_va.load().map(add_graph_ids_to_targets_3d)
+            if args.cloud_native_dataset:
+                val_data = materialize_cloud_native_dataset_3d(
+                    val_data,
+                    val_steps,
+                    os.path.join(worker_tmpdir, "native_validation_dataset"),
+                    shuffle_batches=False,
+                )
         val_kwargs = {
             'validation_data': val_data,
-            'validation_steps': loader_va.steps_per_epoch,
+            'validation_steps': val_steps,
         }
     else:
         best_state_cb = BestTrainingStateCallback3D(
@@ -2162,7 +2671,7 @@ if args._chunk_worker:
             cbs,
             global_node_count=args.batch_size * args._n_boids_cache,
             val_data=val_data,
-            val_local_steps=(loader_va.steps_per_epoch if use_val else 0),
+            val_local_steps=(val_steps if use_val else 0),
             **mirrored_kwargs,
         )
     else:
@@ -2191,7 +2700,8 @@ if args._chunk_worker:
         f">>> Worker checkpoint: lr={final_lr:g}, optimizer_step={final_step}",
         flush=True,
     )
-    shutil.rmtree(worker_tmpdir, ignore_errors=True)
+    if worker_tmpdir is not None:
+        shutil.rmtree(worker_tmpdir, ignore_errors=True)
     sys.exit(0)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2256,16 +2766,24 @@ if use_generated_chunked:
             o: n_per_o + (1 if i < remainder else 0)
             for i, o in enumerate(args.train_octants)
         }
+    generation_storage = (
+        "in worker RAM" if args.cloud_ram_dataset else "in temporary shards"
+    )
     print(
-        f"\n>>> Generating expert data one temporary chunk at a time: "
-        f"{requested_counts}"
+        f"\n>>> Generating expert data one chunk at a time "
+        f"({generation_storage}): {requested_counts}"
+    )
+    generated_runner = (
+        run_generated_ram_chunked_3d
+        if args.cloud_ram_dataset
+        else run_generated_chunked_3d
     )
     (
         model,
         generated_centers,
         generated_center_octants,
         generation_manifest,
-    ) = run_generated_chunked_3d(
+    ) = generated_runner(
         run_tag,
         requested_counts,
         args.chunk_size,
