@@ -553,6 +553,14 @@ parser.add_argument(
 parser.add_argument("--eval_max_steps", default=5000, type=int)
 parser.add_argument("--eval_seed", default=123, type=int)
 parser.add_argument(
+    "--eval_max_tube_radius",
+    default=1.0,
+    type=float,
+    help=(
+        "Maximum per-goal tube radius allowed for online evaluation success."
+    ),
+)
+parser.add_argument(
     "--perception",
     default=0.1,
     type=float,

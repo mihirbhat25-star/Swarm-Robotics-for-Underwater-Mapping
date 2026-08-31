@@ -105,10 +105,34 @@ def _plot_multi_tubular(trajs, goals, run_tag, output_dir):
     print(f"Saved {fname}")
 
 
+def _trajectory_tube_radius(traj):
+    """Return the same robust flock radius used by the tubular plots."""
+    centroid = traj[:, :, :2].mean(axis=1)
+    boid_dists = np.linalg.norm(
+        traj[:, :, :2] - centroid[:, None, :], axis=-1
+    )
+    return float(np.percentile(np.percentile(boid_dists, 95, axis=1), 99))
+
+
+def _goal_segment_tube_radii(traj, switch_steps):
+    """Compute one robust tube radius for each active-waypoint segment."""
+    final_frame = len(traj) - 1
+    segment_start = 0
+    radii = []
+    for switch_step in switch_steps:
+        segment_stop = min(max(int(switch_step), segment_start), final_frame)
+        radii.append(
+            _trajectory_tube_radius(traj[segment_start:segment_stop + 1])
+        )
+        segment_start = segment_stop
+    if segment_start < final_frame or not radii:
+        radii.append(_trajectory_tube_radius(traj[segment_start:]))
+    return radii
+
+
 def _plot_tube_on_axis(ax, traj, color="#8B0000", label="centroid path"):
     centroid = traj[:, :, :2].mean(axis=1)
-    boid_dists = np.linalg.norm(traj[:, :, :2] - centroid[:, None, :], axis=-1)
-    r = np.percentile(np.percentile(boid_dists, 95, axis=1), 99)
+    r = _trajectory_tube_radius(traj)
     line = LineString(centroid)
     tube = line.buffer(r)
     tx, ty = _get_tube_exterior(tube)
@@ -274,14 +298,25 @@ def _run_online_goal_trajectory(model, boids, center, args, rng, manual_goals=No
         )
 
     requested = len(sampled_goals) if manual_goals is not None else args.online_goal_count
+    trajectory = np.asarray(frames)
+    goal_tube_radii = _goal_segment_tube_radii(trajectory, switch_steps)
+    max_goal_tube_radius = max(goal_tube_radii, default=float("inf"))
+    reached_all_goals = reached == requested
+    cohesive = (
+        np.all(np.isfinite(goal_tube_radii))
+        and max_goal_tube_radius <= args.max_tube_radius
+    )
     return {
-        "trajectory": np.asarray(frames),
+        "trajectory": trajectory,
         "goals": np.asarray(sampled_goals),
         "switch_steps": switch_steps,
         "closest_distances": closest_distances,
         "reached": reached,
         "requested": requested,
-        "success": reached == requested,
+        "goal_tube_radii": goal_tube_radii,
+        "max_goal_tube_radius": max_goal_tube_radius,
+        "reached_all_goals": reached_all_goals,
+        "success": reached_all_goals and cohesive,
     }
 
 
@@ -289,7 +324,8 @@ def _save_online_goal_pdf(result, center, run_index, run_tag, output_dir):
     trajectory = result["trajectory"]
     goals = result["goals"]
     fig, axis = plt.subplots(figsize=(7, 7))
-    _, radius = _plot_tube_on_axis(axis, trajectory, label="GNCA centroid")
+    _plot_tube_on_axis(axis, trajectory, label="GNCA centroid")
+    radius = result["max_goal_tube_radius"]
     colors = cm.viridis(np.linspace(0.1, 0.9, len(goals)))
     for goal_index, (goal, color) in enumerate(zip(goals, colors)):
         axis.scatter(
@@ -304,7 +340,8 @@ def _save_online_goal_pdf(result, center, run_index, run_tag, output_dir):
     axis.set_aspect("equal")
     axis.set_title(
         f"Online GNCA | start=({center[0]:.2f},{center[1]:.2f}) | "
-        f"goals={result['reached']}/{result['requested']} | r={radius:.3f}"
+        f"goals={result['reached']}/{result['requested']} | "
+        f"max goal r={radius:.3f}"
     )
     axis.legend(fontsize=8)
     plt.tight_layout()
@@ -320,10 +357,11 @@ def _save_online_goal_summary(results, run_tag, output_dir):
     fig, axis = plt.subplots(figsize=(8, 8))
     colors = cm.hsv(np.linspace(0, 0.9, len(results)))
     for result, color in zip(results, colors):
-        centroid = result["trajectory"][:, :, :2].mean(axis=1)
-        axis.plot(centroid[:, 0], centroid[:, 1], color=color, alpha=0.8)
-        axis.scatter(
-            centroid[0, 0], centroid[0, 1], color="blue", marker="*", s=40
+        _plot_tube_on_axis(
+            axis,
+            result["trajectory"],
+            color=color,
+            label=None,
         )
         axis.scatter(
             result["goals"][:, 0], result["goals"][:, 1],
@@ -384,6 +422,8 @@ def _run_online_goal_inference(args, model):
         results.append(result)
         print(
             f"    reached {result['reached']}/{result['requested']} goals | "
+            f"goal_r={[round(r, 4) for r in result['goal_tube_radii']]} | "
+            f"max_r={result['max_goal_tube_radius']:.4f} | "
             f"success={result['success']}"
         )
         _save_online_goal_pdf(
@@ -398,12 +438,29 @@ def _run_online_goal_inference(args, model):
         f"run_tag: {args.run_tag}",
         (
             "success definition: mean per-agent distance <= "
-            f"{args.success_threshold:g} for every requested waypoint"
+            f"{args.success_threshold:g} for every requested waypoint and "
+            f"max per-goal tube radius max(r_k) <= {args.max_tube_radius:g}"
         ),
         f"overall: {successes}/{len(results)} = "
         f"{100 * successes / max(len(results), 1):.2f}%",
         "",
     ]
+    report.append("per quadrant:")
+    for quadrant in args.quadrants:
+        quadrant_results = [
+            result
+            for result, result_quadrant in zip(results, center_quadrants)
+            if result_quadrant == quadrant
+        ]
+        quadrant_successes = sum(
+            result["success"] for result in quadrant_results
+        )
+        quadrant_total = len(quadrant_results)
+        report.append(
+            f"  quadrant {quadrant}: {quadrant_successes}/{quadrant_total} = "
+            f"{100 * quadrant_successes / max(quadrant_total, 1):.2f}%"
+        )
+    report.append("")
     for run_index, (center, quadrant, result) in enumerate(
         zip(centers, center_quadrants, results)
     ):
@@ -411,7 +468,10 @@ def _run_online_goal_inference(args, model):
             f"run {run_index:03d} | quadrant={quadrant} | "
             f"center=({center[0]:.4f},{center[1]:.4f}) | "
             f"reached={result['reached']}/{result['requested']} | "
-            f"success={result['success']} | goals={result['goals'].tolist()}"
+            f"goal_r={[round(r, 4) for r in result['goal_tube_radii']]} | "
+            f"max_r={result['max_goal_tube_radius']:.4f} | "
+            f"success={result['success']} | "
+            f"goals={result['goals'].tolist()}"
         )
     report_path = os.path.join(args.output_dir, "online_success_rate.txt")
     with open(report_path, "w", encoding="utf-8") as handle:
@@ -617,6 +677,15 @@ def _parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--max_steps", type=int, default=2000)
     parser.add_argument("--success_threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--max_tube_radius",
+        type=float,
+        default=1.0,
+        help=(
+            "Maximum robust flock-tube radius allowed in every active-goal "
+            "segment for online-goal success (default: 1.0)."
+        ),
+    )
     parser.add_argument("--n_boids", type=int, default=100)
     parser.add_argument("--exclusion", type=float, default=0.5)
     parser.add_argument(

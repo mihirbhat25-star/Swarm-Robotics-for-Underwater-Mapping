@@ -314,6 +314,8 @@ def validate_online_cloud_args(args):
         raise ValueError("Step limits must be positive.")
     if args.eval_online_goal_count < 1 or args.eval_max_steps < 1:
         raise ValueError("Online evaluation goal and step counts must be positive.")
+    if args.eval_max_tube_radius <= 0:
+        raise ValueError("--eval_max_tube_radius must be positive.")
     visible_gpus = tf.config.list_physical_devices("GPU")
     if not visible_gpus:
         raise ValueError("--backend cloud requires at least one visible GPU.")
@@ -434,6 +436,8 @@ def train_online_goal_cloud(args):
             str(args.goal_min_distance),
             "--success_threshold",
             str(args.goal_arrival_radius),
+            "--max_tube_radius",
+            str(args.eval_max_tube_radius),
             "--max_steps",
             str(args.eval_max_steps),
             "--n_boids",
