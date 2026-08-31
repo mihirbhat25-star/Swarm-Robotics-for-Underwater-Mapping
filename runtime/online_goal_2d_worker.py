@@ -1,6 +1,9 @@
 """Private subprocess entry point for one online-goal cloud chunk."""
 
 import argparse
+import os
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 import joblib
 

@@ -28,6 +28,33 @@ from runtime.cloud_2d import (
 )
 
 
+_BENIGN_TENSORFLOW_DIAGNOSTICS = (
+    "Unable to register cuFFT factory",
+    "successful NUMA node read from SysFS had negative value",
+    "'+ptx85' is not a recognized feature for this target",
+)
+
+
+def _run_with_clean_tensorflow_stderr(command):
+    """Run a child process while hiding only known benign native diagnostics."""
+    environment = os.environ.copy()
+    environment.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+    process = subprocess.Popen(
+        command,
+        env=environment,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stderr is not None
+    for line in process.stderr:
+        if any(message in line for message in _BENIGN_TENSORFLOW_DIAGNOSTICS):
+            continue
+        sys.stderr.write(line)
+        sys.stderr.flush()
+    return process.wait()
+
+
 def online_goal_run_tag(args):
     loss_tag = (
         f"newl_cd_{args.critical_distance:g}_dw_{args.distance_weight:g}"
@@ -181,9 +208,11 @@ def _worker(args, chunk_index, trajectory_count, state_dir, result_path, run_tag
                 f">>> Restored model + Adam state: {manager.latest_checkpoint}",
                 flush=True,
             )
-        elif args.init_weights:
-            model.load_weights(args.init_weights).expect_partial()
-            print(f">>> Initialized online model from: {args.init_weights}")
+        else:
+            init_weights = getattr(args, "init_weights", None)
+            if init_weights:
+                model.load_weights(init_weights).expect_partial()
+                print(f">>> Initialized online model from: {init_weights}")
 
     callbacks = [
         ReduceLROnPlateau(
@@ -320,7 +349,7 @@ def train_online_goal_cloud(args):
                 f"{count} episodes\n{'=' * 64}",
                 flush=True,
             )
-            completed = subprocess.run(
+            returncode = _run_with_clean_tensorflow_stderr(
                 [
                     sys.executable,
                     "-m",
@@ -337,13 +366,12 @@ def train_online_goal_cloud(args):
                     result_path,
                     "--run_tag",
                     run_tag,
-                ],
-                check=False,
+                ]
             )
-            if completed.returncode != 0:
+            if returncode != 0:
                 raise RuntimeError(
                     f"Online cloud chunk {chunk_index + 1}/{chunks} failed "
-                    f"with exit code {completed.returncode}."
+                    f"with exit code {returncode}."
                 )
             with open(result_path, encoding="utf-8") as handle:
                 all_results.append(json.load(handle))

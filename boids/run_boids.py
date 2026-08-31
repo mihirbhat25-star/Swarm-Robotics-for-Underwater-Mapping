@@ -13,6 +13,11 @@ import json
 import shutil
 import subprocess
 import tempfile
+
+# Silence TensorFlow's benign native CUDA/NUMA registration diagnostics.  Real
+# Python exceptions and fatal native errors remain visible.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+
 import joblib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -411,6 +416,14 @@ parser.add_argument(
 )
 parser.add_argument("--min_lr", default=1e-6, type=float)
 parser.add_argument("--early_stopping_min_delta", default=1e-8, type=float)
+parser.add_argument(
+    "--init_weights",
+    default=None,
+    help=(
+        "Optional TensorFlow checkpoint prefix used to initialize training. "
+        "Primarily intended for curriculum/warm-start experiments."
+    ),
+)
 parser.add_argument(
     "--steps_per_execution",
     default=100,
