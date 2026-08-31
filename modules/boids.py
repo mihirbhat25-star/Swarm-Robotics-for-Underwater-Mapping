@@ -7,11 +7,20 @@ from spektral.data import Dataset, Graph
 from tqdm import tqdm
 import h5py
 
+from modules.waypoints import OnlineWaypointManager, goal_conditioned_state
+
 
 BOIDS_GOAL_POSITIONS = np.array(
     [[3.0, -3.0], [3.0, 3.0], [0.0, 0.0]],
     dtype=np.float32,
 )
+BOIDS_STATE_FEATURES = 4
+ONLINE_GOAL_STATE_FEATURES = 6
+BOIDS_BASE_TARGET_FEATURES = 10
+BOIDS_TRANSITION_TARGET_FEATURES = 13
+CURRENT_GOAL_SLICE = slice(8, 10)
+PREVIOUS_GOAL_SLICE = slice(10, 12)
+PREVIOUS_GOAL_MAX_DISTANCE_INDEX = 12
 NEAREST_CCW_POLICY = "nearest_then_counterclockwise_xy"
 FIXED_ORDER_POLICY = "fixed_waypoint_order"
 
@@ -201,6 +210,84 @@ class Boids:
         if return_accel:
             history["accelerations"] = np.array(history["accelerations"])
 
+        return history
+
+    def generate_online_goal_trajectory(
+        self,
+        *,
+        save_config,
+        random_init,
+        rng=None,
+        n_waypoints=2,
+        goal_bounds=(-4.5, 4.5, -4.5, 4.5),
+        start_bounds=(-5.0, 5.0, -5.0, 5.0),
+        goal_min_distance=2.5,
+        goal_arrival_radius=0.5,
+        max_steps=10_000,
+    ):
+        """Generate an expert episode with externally changing random goals.
+
+        The goal label attached to state ``x_t`` is always the goal used to
+        produce ``x_{t+1}``. Exactly ``n_waypoints`` successful arrivals are
+        required; otherwise a bounded episode raises instead of silently
+        returning incomplete supervision.
+        """
+        rng = np.random.default_rng() if rng is None else rng
+        if random_init is False:
+            positions, velocities, neighbors = self.get_fixed_init(self.n_boids)
+        elif random_init is True:
+            positions, velocities, neighbors, _ = self.get_random_init(
+                self.n_boids, save_config, bounds=tuple(start_bounds)
+            )
+        elif isinstance(random_init, np.ndarray) and random_init.shape == (2,):
+            positions, velocities, neighbors, _ = self.get_random_init(
+                self.n_boids,
+                save_config,
+                center=random_init,
+            )
+        else:
+            positions, velocities = random_init
+            neighbors = self.get_neighbors(positions)
+
+        manager = OnlineWaypointManager(
+            rng=rng,
+            n_waypoints=n_waypoints,
+            bounds=tuple(goal_bounds),
+            min_distance=goal_min_distance,
+            arrival_radius=goal_arrival_radius,
+        )
+        active_goal = manager.start(positions.mean(axis=0))
+        self.goal_positions = active_goal[None, :]
+        self.current_goal = 0
+
+        history = {
+            "positions": [positions],
+            "velocities": [velocities],
+            "neighbors": [neighbors],
+            "goal_positions": [active_goal.copy()],
+        }
+        for _ in range(int(max_steps)):
+            positions, velocities, _ = self.update_boids(positions, velocities)
+            neighbors = self.get_neighbors(positions)
+            active_goal, switched, finished = manager.update(positions)
+            if switched:
+                self.goal_positions = active_goal[None, :]
+            history["positions"].append(positions)
+            history["velocities"].append(velocities)
+            history["neighbors"].append(neighbors)
+            history["goal_positions"].append(active_goal.copy())
+            if finished:
+                break
+        else:
+            raise RuntimeError(
+                f"Online expert did not reach {n_waypoints} waypoints within "
+                f"{max_steps} steps."
+            )
+
+        history["positions"] = np.asarray(history["positions"])
+        history["velocities"] = np.asarray(history["velocities"])
+        history["goal_positions"] = np.asarray(history["goal_positions"])
+        history["waypoints"] = np.asarray(manager.waypoints)
         return history
 
     def _set_goal_order_from_positions(self, positions):
@@ -453,6 +540,80 @@ def to_cartesian(polar_coords):
 def scale(x, length=1.0):
     return length * x / np.linalg.norm(x, axis=-1, keepdims=True)
 
+
+def ensure_goal_transition_metadata(inputs, targets):
+    """Attach temporally correct previous-goal metadata to one trajectory.
+
+    Targets contain current state, next state, and active goal. The appended
+    fields are the immediately previous goal and the maximum centroid distance
+    from that goal since the most recent switch. A value of -1 means that no
+    previous goal exists. The running maximum makes eligibility irreversible
+    after the flock first exits a chosen loss radius, even after timesteps are
+    shuffled for training.
+    """
+    targets = np.asarray(targets)
+    if targets.shape[-1] == BOIDS_TRANSITION_TARGET_FEATURES:
+        return targets
+    if targets.shape[-1] != BOIDS_BASE_TARGET_FEATURES:
+        raise ValueError(
+            "Expected target feature dimension "
+            f"{BOIDS_BASE_TARGET_FEATURES} or "
+            f"{BOIDS_TRANSITION_TARGET_FEATURES}, got {targets.shape[-1]}"
+        )
+    if inputs.ndim != 3 or targets.ndim != 3 or inputs.shape[:2] != targets.shape[:2]:
+        raise ValueError(
+            "inputs and targets must have matching (timesteps, boids, features) "
+            f"dimensions, got {inputs.shape} and {targets.shape}"
+        )
+
+    timesteps, n_boids = targets.shape[:2]
+    active_goals = targets[:, 0, CURRENT_GOAL_SLICE]
+    previous_goals = np.zeros((timesteps, 2), dtype=targets.dtype)
+    max_previous_distances = np.full(timesteps, -1.0, dtype=targets.dtype)
+    previous_goal = None
+    running_max_distance = -1.0
+
+    for timestep in range(timesteps):
+        if timestep > 0 and not np.allclose(
+            active_goals[timestep], active_goals[timestep - 1]
+        ):
+            previous_goal = active_goals[timestep - 1].copy()
+            running_max_distance = 0.0
+
+        if previous_goal is not None:
+            centroid = inputs[timestep, :, :2].mean(axis=0)
+            distance = float(np.linalg.norm(centroid - previous_goal))
+            running_max_distance = max(running_max_distance, distance)
+            previous_goals[timestep] = previous_goal
+            max_previous_distances[timestep] = running_max_distance
+
+    previous_goal_features = np.broadcast_to(
+        previous_goals[:, None, :], (timesteps, n_boids, 2)
+    )
+    previous_distance_features = np.broadcast_to(
+        max_previous_distances[:, None, None], (timesteps, n_boids, 1)
+    )
+    return np.concatenate(
+        [targets, previous_goal_features, previous_distance_features], axis=-1
+    ).astype(targets.dtype, copy=False)
+
+
+def goal_transition_proximity(inputs, targets, radius):
+    """Return timesteps near the active or still-eligible previous goal."""
+    targets = ensure_goal_transition_metadata(inputs, targets)
+    centroids = inputs[:, :, :2].mean(axis=1)
+    active_goals = targets[:, 0, CURRENT_GOAL_SLICE]
+    active_distances = np.linalg.norm(centroids - active_goals, axis=-1)
+    max_previous_distances = targets[
+        :, 0, PREVIOUS_GOAL_MAX_DISTANCE_INDEX
+    ]
+    previous_is_eligible = (
+        (max_previous_distances >= 0.0)
+        & (max_previous_distances < radius)
+    )
+    return (active_distances < radius) | previous_is_eligible
+
+
 def history_to_samples(history, accel=False):
     inputs = np.concatenate((history["positions"], history["velocities"]), axis=-1)
     neighbors = history["neighbors"]
@@ -467,9 +628,35 @@ def history_to_samples(history, accel=False):
             goal_pos = history["goal_positions"][:-1]  # [T-1, 2]
             goal_broadcast = np.broadcast_to(goal_pos[:, None, :], (len(goal_pos), n_boids, 2)).copy()
             targets = np.concatenate([base_targets, goal_broadcast], axis=-1)
+            targets = ensure_goal_transition_metadata(inputs[:-1], targets)
         else:
             targets = base_targets
         return [(x, a, y_) for x, a, y_ in zip(inputs[:-1], neighbors[:-1], targets)]
+
+
+def online_goal_history_to_samples(history):
+    """Convert an online-goal expert history into six-feature GNCA samples."""
+    physical = np.concatenate(
+        (history["positions"], history["velocities"]), axis=-1
+    ).astype(np.float32, copy=False)
+    goals = np.asarray(history["goal_positions"], dtype=np.float32)
+    conditioned = np.stack(
+        [goal_conditioned_state(state, goal) for state, goal in zip(physical, goals)]
+    )
+    n_boids = physical.shape[1]
+    goal_broadcast = np.broadcast_to(
+        goals[:-1, None, :], (len(goals) - 1, n_boids, 2)
+    ).copy()
+    base_targets = np.concatenate(
+        (physical[:-1], physical[1:], goal_broadcast), axis=-1
+    )
+    targets = ensure_goal_transition_metadata(conditioned[:-1], base_targets)
+    return [
+        (x, adjacency, target)
+        for x, adjacency, target in zip(
+            conditioned[:-1], history["neighbors"][:-1], targets
+        )
+    ]
     
 def make_dataset(unique_reps, repeat_reps, save_config, trajectory_len=None, random_init=True, return_boids=False, accel=False, **kwargs):
     n_jobs = kwargs.pop("n_jobs", 1)
@@ -569,8 +756,9 @@ def _load_adaptive_stride(f, start, end, timestep_stride, near_goal_radius):
 
     Normal timesteps are loaded every `timestep_stride` steps.
     Timesteps where the flock's mean position is within `near_goal_radius`
-    of any goal are always included (stride=1 in that window) so
-    goal-transition frames are never skipped.
+    of the active goal or the still-eligible immediately previous goal are
+    always included (stride=1 in that window), so transition frames are not
+    skipped and unrelated waypoints do not affect sampling.
 
     Args:
         f:                Open h5py File object.
@@ -582,7 +770,11 @@ def _load_adaptive_stride(f, start, end, timestep_stride, near_goal_radius):
     Returns:
         Tuple (x_c, y_c, arow_c, acol_c, alen_c) as numpy arrays.
     """
-    if timestep_stride <= 1 or near_goal_radius <= 0:
+    cached_target_features = f['y'].shape[-1]
+    if (
+        cached_target_features == BOIDS_TRANSITION_TARGET_FEATURES
+        and (timestep_stride <= 1 or near_goal_radius <= 0)
+    ):
         return (
             f['x'][start:end:timestep_stride],
             f['y'][start:end:timestep_stride],
@@ -591,24 +783,19 @@ def _load_adaptive_stride(f, start, end, timestep_stride, near_goal_radius):
             f['a_len'][start:end:timestep_stride],
         )
 
-    # Load positions to detect proximity to every waypoint, including the old
-    # waypoint immediately after the expert switches to the next one.
     x_full  = f['x'][start:end]       # (T, n_boids, 4)
-    y_full  = f['y'][start:end]       # (T, n_boids, 10)
-
-    mean_pos = x_full[:, :, :2].mean(axis=1)   # (T, 2)
-    dist = np.min(
-        np.linalg.norm(
-            mean_pos[:, None, :] - BOIDS_GOAL_POSITIONS[None, :, :],
-            axis=-1,
-        ),
-        axis=1,
-    )
+    y_full = ensure_goal_transition_metadata(x_full, f['y'][start:end])
 
     T = end - start
     strided = np.zeros(T, dtype=bool)
     strided[::timestep_stride] = True
-    keep = np.where(strided | (dist < near_goal_radius))[0]   # local indices
+    if near_goal_radius > 0:
+        near_transition_goal = goal_transition_proximity(
+            x_full, y_full, near_goal_radius
+        )
+    else:
+        near_transition_goal = np.zeros(T, dtype=bool)
+    keep = np.where(strided | near_transition_goal)[0]
 
     abs_keep = keep + start   # absolute indices into the HDF5 dataset
     return (

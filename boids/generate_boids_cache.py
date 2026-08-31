@@ -15,6 +15,8 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from modules.boids import (
+    BOIDS_STATE_FEATURES,
+    BOIDS_TRANSITION_TARGET_FEATURES,
     Boids,
     FIXED_ORDER_POLICY,
     NEAREST_CCW_POLICY,
@@ -117,7 +119,8 @@ def main():
     print(f">>> Waypoint order: {boids.waypoint_order_policy}\n")
 
     max_edges = args.n_boids * (args.n_boids - 1)
-    n_feat_x, n_feat_y = 4, 10
+    n_feat_x = BOIDS_STATE_FEATURES
+    n_feat_y = BOIDS_TRANSITION_TARGET_FEATURES
     all_centers, all_traj_lengths = [], []
 
     with h5py.File(args.output, 'w') as f:
@@ -188,6 +191,10 @@ def main():
         f.attrs['max_edges']    = max_edges
         f.attrs['sample_mode']  = args.sample_mode
         f.attrs['waypoint_order_policy'] = boids.waypoint_order_policy
+        f.attrs['target_features'] = n_feat_y
+        f.attrs['loss_transition_metadata'] = (
+            'active_goal,previous_goal,max_previous_goal_centroid_distance'
+        )
         if exclusion_zone is not None:
             f.attrs['goal_exclusion_size'] = args.goal_exclusion_size
         total = ds_x.shape[0]

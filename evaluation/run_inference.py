@@ -18,6 +18,8 @@ import tensorflow as tf
 from tensorflow.keras.optimizers import Adam
 from modules.boids import Boids
 from models.gnn_ca_simple_boids import GNNCASimpleBoids
+from models.gnn_ca_goal_conditioned_boids import GoalConditionedGNNCABoids
+from modules.waypoints import OnlineWaypointManager, goal_conditioned_state
 from evaluation.visualize_boids import (
     _get_tube_exterior,
     _plot_individual_ranked as _plot_individual_ranked_shared,
@@ -169,10 +171,15 @@ def _find_single_weights(run_tag):
     return _clean_checkpoint_prefix(candidates[0])
 
 
-def _load_model(weights_path):
+def _load_model(weights_path, task="fixed_waypoints"):
     weights_path = _clean_checkpoint_prefix(weights_path)
     print(f"Loading weights: {weights_path}")
-    model = GNNCASimpleBoids(
+    model_class = (
+        GoalConditionedGNNCABoids
+        if task == "online_goals"
+        else GNNCASimpleBoids
+    )
+    model = model_class(
         activation="linear", batch_norm=False, hidden=256,
         hidden_activation="relu", connectivity="cat", aggregate="mean",
     )
@@ -180,6 +187,236 @@ def _load_model(weights_path):
     model.load_weights(weights_path).expect_partial()
     print("Weights loaded.")
     return model
+
+
+def _manual_goal_array(values):
+    if values is None:
+        return None
+    values = np.asarray(values, dtype=np.float32)
+    if len(values) < 4 or len(values) % 2:
+        raise ValueError("--manual_goals needs at least two x y pairs.")
+    return values.reshape(-1, 2)
+
+
+def _run_online_goal_trajectory(model, boids, center, args, rng, manual_goals=None):
+    """Roll out a goal-conditioned GNCA under an external waypoint manager."""
+    position, velocity, _, _ = boids.get_random_init(
+        args.n_boids, save_config=False, center=np.asarray(center)
+    )
+    physical = np.concatenate((position, velocity), axis=-1).astype(np.float32)
+    frames = [physical.copy()]
+    switch_steps = []
+    closest_distances = []
+    reached = 0
+
+    if manual_goals is None:
+        manager = OnlineWaypointManager(
+            rng=rng,
+            n_waypoints=args.online_goal_count,
+            bounds=tuple(args.goal_bounds),
+            min_distance=args.goal_min_distance,
+            arrival_radius=args.success_threshold,
+        )
+        active_goal = manager.start(position.mean(axis=0))
+        sampled_goals = [active_goal.copy()]
+    else:
+        manager = None
+        sampled_goals = [goal.copy() for goal in manual_goals]
+        active_goal = sampled_goals[0]
+
+    closest_current = float(
+        np.linalg.norm(position - active_goal[None, :], axis=-1).mean()
+    )
+    for step in range(1, args.max_steps + 1):
+        conditioned = goal_conditioned_state(physical, active_goal)
+        adjacency = _to_tf_sparse(boids.get_neighbors(physical[:, :2]))
+        physical = model(
+            [tf.constant(conditioned), adjacency, tf.constant(0)],
+            training=False,
+        ).numpy()
+        frames.append(physical.copy())
+        mean_distance = float(
+            np.linalg.norm(
+                physical[:, :2] - active_goal[None, :], axis=-1
+            ).mean()
+        )
+        closest_current = min(closest_current, mean_distance)
+        if step % 500 == 0:
+            centroid = physical[:, :2].mean(axis=0)
+            print(
+                f"    step {step}/{args.max_steps} | "
+                f"centroid=({centroid[0]:.2f},{centroid[1]:.2f}) | "
+                f"active_goal=({active_goal[0]:.2f},{active_goal[1]:.2f})"
+            )
+
+        if mean_distance > args.success_threshold:
+            continue
+
+        closest_distances.append(closest_current)
+        reached += 1
+        switch_steps.append(step)
+        if manual_goals is not None:
+            if reached >= len(sampled_goals):
+                break
+            active_goal = sampled_goals[reached]
+        else:
+            next_goal, switched, finished = manager.update(physical[:, :2])
+            if finished:
+                break
+            if not switched:
+                raise RuntimeError("Waypoint manager did not switch after arrival.")
+            active_goal = next_goal
+            sampled_goals.append(active_goal.copy())
+        closest_current = float(
+            np.linalg.norm(
+                physical[:, :2] - active_goal[None, :], axis=-1
+            ).mean()
+        )
+
+    requested = len(sampled_goals) if manual_goals is not None else args.online_goal_count
+    return {
+        "trajectory": np.asarray(frames),
+        "goals": np.asarray(sampled_goals),
+        "switch_steps": switch_steps,
+        "closest_distances": closest_distances,
+        "reached": reached,
+        "requested": requested,
+        "success": reached == requested,
+    }
+
+
+def _save_online_goal_pdf(result, center, run_index, run_tag, output_dir):
+    trajectory = result["trajectory"]
+    goals = result["goals"]
+    fig, axis = plt.subplots(figsize=(7, 7))
+    _, radius = _plot_tube_on_axis(axis, trajectory, label="GNCA centroid")
+    colors = cm.viridis(np.linspace(0.1, 0.9, len(goals)))
+    for goal_index, (goal, color) in enumerate(zip(goals, colors)):
+        axis.scatter(
+            goal[0], goal[1], color=color, marker="*", s=180, zorder=7
+        )
+        axis.annotate(
+            f"G{goal_index + 1}", goal, xytext=(6, 6),
+            textcoords="offset points",
+        )
+    axis.set_xlim(-5, 5)
+    axis.set_ylim(-5, 5)
+    axis.set_aspect("equal")
+    axis.set_title(
+        f"Online GNCA | start=({center[0]:.2f},{center[1]:.2f}) | "
+        f"goals={result['reached']}/{result['requested']} | r={radius:.3f}"
+    )
+    axis.legend(fontsize=8)
+    plt.tight_layout()
+    path = os.path.join(
+        output_dir, f"online_{run_tag}_run{run_index:03d}.pdf"
+    )
+    plt.savefig(path)
+    plt.close(fig)
+    print(f"  Saved {path}")
+
+
+def _save_online_goal_summary(results, run_tag, output_dir):
+    fig, axis = plt.subplots(figsize=(8, 8))
+    colors = cm.hsv(np.linspace(0, 0.9, len(results)))
+    for result, color in zip(results, colors):
+        centroid = result["trajectory"][:, :, :2].mean(axis=1)
+        axis.plot(centroid[:, 0], centroid[:, 1], color=color, alpha=0.8)
+        axis.scatter(
+            centroid[0, 0], centroid[0, 1], color="blue", marker="*", s=40
+        )
+        axis.scatter(
+            result["goals"][:, 0], result["goals"][:, 1],
+            color=color, marker="x", s=30,
+        )
+    axis.set_xlim(-5, 5)
+    axis.set_ylim(-5, 5)
+    axis.set_aspect("equal")
+    axis.set_title(f"Online GNCA - {len(results)} unseen runs")
+    plt.tight_layout()
+    path = os.path.join(output_dir, f"online_{run_tag}_all.pdf")
+    plt.savefig(path)
+    plt.close(fig)
+    print(f"Saved {path}")
+
+
+def _run_online_goal_inference(args, model):
+    if args.mode != "single":
+        raise ValueError("online_goals currently uses --mode single.")
+    manual_goals = _manual_goal_array(args.manual_goals)
+    if manual_goals is not None and args.n_centers != 1:
+        print(
+            ">>> Manual goal sequence will be evaluated from each sampled start center."
+        )
+    rng = np.random.default_rng(args.seed)
+    centers = []
+    center_quadrants = []
+    base, remainder = divmod(args.n_centers, len(args.quadrants))
+    for quadrant_index, quadrant in enumerate(args.quadrants):
+        x_min, x_max, y_min, y_max = QUADRANT_BOUNDS[quadrant]
+        count = base + (1 if quadrant_index < remainder else 0)
+        for _ in range(count):
+            centers.append(np.array([
+                rng.uniform(x_min, x_max), rng.uniform(y_min, y_max)
+            ], dtype=np.float32))
+            center_quadrants.append(quadrant)
+    np.save(os.path.join(args.output_dir, "online_test_centers.npy"), centers)
+
+    boids = Boids(n_boids=args.n_boids)
+    individual_dir = os.path.join(args.output_dir, "individual")
+    os.makedirs(individual_dir, exist_ok=True)
+    results = []
+    for run_index, (center, quadrant) in enumerate(
+        zip(centers, center_quadrants)
+    ):
+        print(
+            f"  Online inference {run_index + 1}/{len(centers)} | "
+            f"quadrant={quadrant} | center=({center[0]:.2f},{center[1]:.2f})"
+        )
+        result = _run_online_goal_trajectory(
+            model,
+            boids,
+            center,
+            args,
+            np.random.default_rng(args.seed + 10_000 + run_index),
+            manual_goals=manual_goals,
+        )
+        results.append(result)
+        print(
+            f"    reached {result['reached']}/{result['requested']} goals | "
+            f"success={result['success']}"
+        )
+        _save_online_goal_pdf(
+            result, center, run_index, args.run_tag, individual_dir
+        )
+
+    _save_online_goal_summary(results, args.run_tag, args.output_dir)
+
+    successes = sum(result["success"] for result in results)
+    report = [
+        "2D online-goal GNCA success report",
+        f"run_tag: {args.run_tag}",
+        (
+            "success definition: mean per-agent distance <= "
+            f"{args.success_threshold:g} for every requested waypoint"
+        ),
+        f"overall: {successes}/{len(results)} = "
+        f"{100 * successes / max(len(results), 1):.2f}%",
+        "",
+    ]
+    for run_index, (center, quadrant, result) in enumerate(
+        zip(centers, center_quadrants, results)
+    ):
+        report.append(
+            f"run {run_index:03d} | quadrant={quadrant} | "
+            f"center=({center[0]:.4f},{center[1]:.4f}) | "
+            f"reached={result['reached']}/{result['requested']} | "
+            f"success={result['success']} | goals={result['goals'].tolist()}"
+        )
+    report_path = os.path.join(args.output_dir, "online_success_rate.txt")
+    with open(report_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(report) + "\n")
+    print(f"Saved {report_path}")
 
 
 def _sample_centers_per_quadrant(goals, n_per_quadrant=10, quadrants=(0, 1, 2, 3), exclusion=0.5, seed=123):
@@ -362,6 +599,11 @@ def _run_comparison(args):
 
 def _parse_args(argv=None):
     parser = argparse.ArgumentParser(description="2D GNCA inference")
+    parser.add_argument(
+        "--task",
+        choices=["fixed_waypoints", "online_goals"],
+        default="fixed_waypoints",
+    )
     parser.add_argument("--mode", choices=["single", "comparison"], default="single")
     parser.add_argument("--run_tag", default="")
     parser.add_argument("--weights_dir", default="important_weights_2d")
@@ -389,6 +631,19 @@ def _parse_args(argv=None):
     parser.add_argument("--collision_warmup_steps", type=int, default=100)
     parser.add_argument("--print_collisions", action="store_true", default=False)
     parser.add_argument("--compare_ground_truth", action="store_true", default=False)
+    parser.add_argument("--online_goal_count", type=int, default=5)
+    parser.add_argument(
+        "--goal_bounds", nargs=4, type=float,
+        default=[-4.5, 4.5, -4.5, 4.5],
+    )
+    parser.add_argument("--goal_min_distance", type=float, default=2.5)
+    parser.add_argument(
+        "--manual_goals",
+        nargs="*",
+        type=float,
+        default=None,
+        help="Optional online goal sequence: x1 y1 x2 y2 ...",
+    )
     return parser.parse_args(argv)
 
 
@@ -407,7 +662,12 @@ def main(argv=None):
     if not args.run_tag:
         raise ValueError("Single mode requires --run_tag.")
     np.random.seed(args.seed)
-    model = _load_model(_find_single_weights(args.run_tag))
+    model = _load_model(
+        _find_single_weights(args.run_tag), task=args.task
+    )
+    if args.task == "online_goals":
+        _run_online_goal_inference(args, model)
+        return
 
     # ── Build boids + exclusion zone ─────────────────────────────────────────
     boids = Boids(n_boids=args.n_boids)

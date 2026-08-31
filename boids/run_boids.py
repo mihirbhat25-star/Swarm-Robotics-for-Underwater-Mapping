@@ -24,7 +24,10 @@ from evaluation.evaluate_boids import evaluate
 from boids.forward import forward
 from models.gnn_ca_simple_boids import GNNCASimpleBoids
 from modules.boids import (
-    BOIDS_GOAL_POSITIONS,
+    BOIDS_TRANSITION_TARGET_FEATURES,
+    CURRENT_GOAL_SLICE,
+    PREVIOUS_GOAL_MAX_DISTANCE_INDEX,
+    PREVIOUS_GOAL_SLICE,
     Boids,
     make_dataset,
 )
@@ -66,30 +69,45 @@ def load_init_centers_from_npz(npz_path):
     return [np.array(c, dtype=np.float32) for c in centers]
 
 def custom_weighted_mse(y_true, y_pred):
-    # y_true is [current_state, next_state, current_goal_pos, graph_id].
-    # Weighting uses distance to the nearest waypoint so the departure turn
-    # remains emphasized immediately after the active-goal label switches.
+    # y_true is [current_state, next_state, active_goal, previous_goal,
+    #            max_distance_from_previous_since_switch, graph_id].
     n_features = tf.shape(y_pred)[-1]
     current_state = y_true[..., :n_features]
     next_state = y_true[..., n_features:2*n_features]
     mse = tf.reduce_mean(tf.square(next_state - y_pred), axis=-1)
 
     if UPWEIGHT:
-        graph_ids = tf.cast(y_true[..., 10], tf.int32)
+        graph_ids = tf.cast(
+            y_true[..., BOIDS_TRANSITION_TARGET_FEATURES], tf.int32
+        )
         n_graphs = tf.reduce_max(graph_ids) + 1
         avg_pos = tf.math.unsorted_segment_mean(
             current_state[..., :2], graph_ids, n_graphs
         )
-        goals = tf.cast(BOIDS_GOAL_POSITIONS, avg_pos.dtype)
-        dist_to_goals = tf.norm(
-            avg_pos[:, None, :] - goals[None, :, :],
-            axis=-1,
+        active_goals = tf.math.unsorted_segment_mean(
+            y_true[..., CURRENT_GOAL_SLICE], graph_ids, n_graphs
         )
-        dist_to_goal = tf.reduce_min(dist_to_goals, axis=1)
+        previous_goals = tf.math.unsorted_segment_mean(
+            y_true[..., PREVIOUS_GOAL_SLICE], graph_ids, n_graphs
+        )
+        max_previous_distances = tf.math.unsorted_segment_max(
+            y_true[..., PREVIOUS_GOAL_MAX_DISTANCE_INDEX],
+            graph_ids,
+            n_graphs,
+        )
+        active_distances = tf.norm(avg_pos - active_goals, axis=-1)
+        previous_distances = tf.norm(avg_pos - previous_goals, axis=-1)
+        near_active_goal = active_distances < args.critical_distance
+        near_eligible_previous_goal = (
+            (max_previous_distances >= 0.0)
+            & (max_previous_distances < args.critical_distance)
+            & (previous_distances < args.critical_distance)
+        )
+        near_transition_goal = near_active_goal | near_eligible_previous_goal
         graph_weight = tf.where(
-            dist_to_goal < args.critical_distance,
+            near_transition_goal,
             tf.cast(args.distance_weight, mse.dtype),
-            tf.ones_like(dist_to_goal, dtype=mse.dtype),
+            tf.ones_like(active_distances, dtype=mse.dtype),
         )
         goal_weight = tf.gather(graph_weight, graph_ids)
     else:
@@ -101,7 +119,9 @@ def add_graph_ids_to_targets(inputs, targets):
     """Append Spektral's disjoint graph id for graph-specific loss weights."""
     graph_ids = tf.cast(inputs[2], targets.dtype)
     targets = tf.concat([targets, graph_ids[:, None]], axis=-1)
-    targets = tf.ensure_shape(targets, [None, 11])
+    targets = tf.ensure_shape(
+        targets, [None, BOIDS_TRANSITION_TARGET_FEATURES + 1]
+    )
     return inputs, targets
 
 
@@ -354,6 +374,21 @@ def run(data_tr, data_va, run_tag):
 # Configuration
 ####################################################################################
 parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--task",
+    choices=["fixed_waypoints", "online_goals"],
+    default="fixed_waypoints",
+    help="Experiment semantics. Existing commands use fixed_waypoints.",
+)
+parser.add_argument(
+    "--backend",
+    choices=["local", "cloud"],
+    default="local",
+    help=(
+        "Compute backend. The cacheless online-goal experiment uses cloud; "
+        "the existing fixed-waypoint pipeline remains local."
+    ),
+)
 parser.add_argument("--lr", default=1e-3, type=float, help="Initial LR")
 parser.add_argument(
     "--batch_size", default=30, type=int, help="Size of the mini-batches"
@@ -373,6 +408,14 @@ parser.add_argument(
 )
 parser.add_argument(
     "--lr_red_factor", default=0.1, type=float, help="Rate for LR annealing"
+)
+parser.add_argument("--min_lr", default=1e-6, type=float)
+parser.add_argument("--early_stopping_min_delta", default=1e-8, type=float)
+parser.add_argument(
+    "--steps_per_execution",
+    default=100,
+    type=int,
+    help="Compiled distributed training steps per Python dispatch in cloud mode.",
 )
 parser.add_argument(
     "--n_boids", default=100, type=int, help="N. of boids in simulation"
@@ -411,7 +454,10 @@ parser.add_argument(
     "--critical_distance",
     default=2.5,
     type=float,
-    help="Distance to goal within which near-goal upweighting is applied when using loss_type=newl.",
+    help=(
+        "Radius for upweighting near the active goal and, immediately after a "
+        "switch, the previous goal until that radius is first exited."
+    ),
 )
 parser.add_argument(
     "--distance_weight",
@@ -448,10 +494,51 @@ parser.add_argument(
     default=1.0,
     type=float,
     help="When timestep_stride>1, always include timesteps where the flock mean position "
-         "is within this distance of the current goal (default: 1.0). "
+         "is within this distance of the active or still-eligible previous goal "
+         "(default: 1.0). "
          "Prevents goal-transition frames from being skipped by the stride. "
          "Set to 0 to disable.",
 )
+parser.add_argument(
+    "--generation_workers",
+    default=0,
+    type=int,
+    help="Cloud CPU expert workers (0 = all available CPUs minus two).",
+)
+parser.add_argument("--seed", default=0, type=int)
+parser.add_argument("--expert_pos_noise", default=0.0, type=float)
+parser.add_argument("--expert_vel_noise", default=0.0, type=float)
+parser.add_argument(
+    "--goal_waypoints_per_episode",
+    default=2,
+    type=int,
+    help="Online-goal training is defined using exactly two terminations.",
+)
+parser.add_argument(
+    "--goal_bounds",
+    nargs=4,
+    type=float,
+    default=[-4.5, 4.5, -4.5, 4.5],
+    metavar=("X_MIN", "X_MAX", "Y_MIN", "Y_MAX"),
+)
+parser.add_argument(
+    "--start_bounds",
+    nargs=4,
+    type=float,
+    default=[-5.0, 5.0, -5.0, 5.0],
+    metavar=("X_MIN", "X_MAX", "Y_MIN", "Y_MAX"),
+)
+parser.add_argument("--goal_min_distance", default=2.5, type=float)
+parser.add_argument("--goal_arrival_radius", default=0.5, type=float)
+parser.add_argument("--expert_max_steps", default=10000, type=int)
+parser.add_argument(
+    "--eval_online_goal_count",
+    default=5,
+    type=int,
+    help="Number of sequential random goals per post-training online rollout.",
+)
+parser.add_argument("--eval_max_steps", default=5000, type=int)
+parser.add_argument("--eval_seed", default=123, type=int)
 parser.add_argument(
     "--perception",
     default=0.1,
@@ -569,6 +656,17 @@ UPWEIGHT = args.loss_type == "newl"
 print(
     f"\n>>> Loss config: {args.loss_type} (UPWEIGHT={UPWEIGHT}, critical_distance={args.critical_distance}, distance_weight={args.distance_weight})"
 )
+
+if args.task == "online_goals":
+    from runtime.online_goal_2d import train_online_goal_cloud
+
+    train_online_goal_cloud(args)
+    sys.exit(0)
+if args.backend != "local":
+    raise ValueError(
+        "The fixed_waypoints task uses --backend local. Use "
+        "--task online_goals with --backend cloud for cacheless cloud training."
+    )
 
 if args._chunk_worker:
     chunk_flat = np.array(json.load(open(args._chunk_indices_file)), dtype=np.int64)

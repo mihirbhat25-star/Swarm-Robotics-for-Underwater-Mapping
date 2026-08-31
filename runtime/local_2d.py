@@ -8,7 +8,13 @@ import scipy.sparse as sp
 import tensorflow as tf
 from spektral.data import Graph
 
-from modules.boids import BOIDS_GOAL_POSITIONS, BoidsDataset
+from modules.boids import (
+    BOIDS_STATE_FEATURES,
+    BOIDS_TRANSITION_TARGET_FEATURES,
+    BoidsDataset,
+    ensure_goal_transition_metadata,
+    goal_transition_proximity,
+)
 
 
 def save_validation_dataset(dataset, path, n_boids):
@@ -102,23 +108,20 @@ def _make_disjoint_batch(
 def _load_selected_samples(
     cache, start, end, timestep_stride, near_goal_radius
 ):
-    if timestep_stride <= 1 or near_goal_radius <= 0:
+    cached_target_features = cache["y"].shape[-1]
+    if (
+        cached_target_features == BOIDS_TRANSITION_TARGET_FEATURES
+        and (timestep_stride <= 1 or near_goal_radius <= 0)
+    ):
         selection = slice(start, end, timestep_stride)
         return cache["x"][selection], cache["y"][selection]
 
     x = cache["x"][start:end]
-    y = cache["y"][start:end]
-    mean_pos = x[:, :, :2].mean(axis=1)
-    distance = np.min(
-        np.linalg.norm(
-            mean_pos[:, None, :] - BOIDS_GOAL_POSITIONS[None, :, :],
-            axis=-1,
-        ),
-        axis=1,
-    )
+    y = ensure_goal_transition_metadata(x, cache["y"][start:end])
     keep = np.zeros(end - start, dtype=bool)
     keep[::timestep_stride] = True
-    keep |= distance < near_goal_radius
+    if near_goal_radius > 0:
+        keep |= goal_transition_proximity(x, y, near_goal_radius)
     return x[keep], y[keep]
 
 
@@ -240,11 +243,16 @@ def dataset_from_batch_files(batch_paths):
 
     output_signature = (
         (
-            tf.TensorSpec(shape=(None, 4), dtype=tf.float32),
+            tf.TensorSpec(
+                shape=(None, BOIDS_STATE_FEATURES), dtype=tf.float32
+            ),
             tf.SparseTensorSpec(shape=(None, None), dtype=tf.float32),
             tf.TensorSpec(shape=(None,), dtype=tf.int64),
         ),
-        tf.TensorSpec(shape=(None, 10), dtype=tf.float32),
+        tf.TensorSpec(
+            shape=(None, BOIDS_TRANSITION_TARGET_FEATURES),
+            dtype=tf.float32,
+        ),
     )
     return tf.data.Dataset.from_generator(
         generator, output_signature=output_signature

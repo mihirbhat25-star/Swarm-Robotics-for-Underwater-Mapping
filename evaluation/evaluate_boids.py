@@ -250,7 +250,9 @@ def evaluate_complexity(model, forward, te_set_size, trajectory_len, n_boids, in
                 x_next_auto = forward(model, *inputs_auto, training=False)
                 boid_trajectory_auto.append(x_next_auto)
 
-            boid_trajectory_true.append(x_next)
+            # Targets also carry loss-only goal-transition metadata; compare
+            # only the expert's next physical state against model rollouts.
+            boid_trajectory_true.append(x_next[:, 4:8])
 
         # Convert to numpy for complexity analysis
         traj_true = np.array(boid_trajectory_true)
