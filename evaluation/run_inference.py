@@ -400,7 +400,7 @@ def _run_online_goal_inference(args, model):
             center_quadrants.append(quadrant)
     np.save(os.path.join(args.output_dir, "online_test_centers.npy"), centers)
 
-    boids = Boids(n_boids=args.n_boids)
+    boids = Boids(n_boids=args.n_boids, perception=args.perception)
     individual_dir = os.path.join(args.output_dir, "individual")
     os.makedirs(individual_dir, exist_ok=True)
     results = []
@@ -597,7 +597,7 @@ def _write_success_rate_2d(trajs, goals, centers, center_q_map, output_path, rad
 
 
 def _run_comparison(args):
-    boids = Boids(n_boids=args.n_boids)
+    boids = Boids(n_boids=args.n_boids, perception=args.perception)
     goals = boids.goal_positions
     weights = args.models if args.models else _find_weight_prefixes(args.weights_dir)
     if not weights:
@@ -687,6 +687,12 @@ def _parse_args(argv=None):
         ),
     )
     parser.add_argument("--n_boids", type=int, default=100)
+    parser.add_argument(
+        "--perception",
+        type=float,
+        default=0.1,
+        help="Neighbor radius used to construct the inference graph.",
+    )
     parser.add_argument("--exclusion", type=float, default=0.5)
     parser.add_argument(
         "--viz_mode",
@@ -739,7 +745,7 @@ def main(argv=None):
         return
 
     # ── Build boids + exclusion zone ─────────────────────────────────────────
-    boids = Boids(n_boids=args.n_boids)
+    boids = Boids(n_boids=args.n_boids, perception=args.perception)
     goals = boids.goal_positions
     excl  = Polygon(goals.tolist()).buffer(args.exclusion)
 
@@ -861,7 +867,10 @@ def main(argv=None):
         for k, center in enumerate(test_centers):
             q_idx = center_q_map[k]
             print(f"  GT {k+1}/{len(test_centers)} | {q_labels[q_idx]} | center=({center[0]:.2f}, {center[1]:.2f})")
-            gt_boids = Boids(n_boids=args.n_boids)
+            gt_boids = Boids(
+                n_boids=args.n_boids,
+                perception=args.perception,
+            )
             history = gt_boids.generate_trajectory(save_config=False, random_init=center)
             pos_arr = history["positions"]
             vel_arr = history["velocities"]

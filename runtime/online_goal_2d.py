@@ -310,6 +310,8 @@ def validate_online_cloud_args(args):
         raise ValueError("Goal and start bounds must have positive width and height.")
     if args.goal_min_distance < 0 or args.goal_arrival_radius <= 0:
         raise ValueError("Goal distance must be nonnegative and arrival radius positive.")
+    if args.perception <= 0:
+        raise ValueError("--perception must be positive.")
     if args.expert_max_steps < 1 or args.steps_per_execution < 1:
         raise ValueError("Step limits must be positive.")
     if args.eval_online_goal_count < 1 or args.eval_max_steps < 1:
@@ -396,6 +398,7 @@ def train_online_goal_cloud(args):
         "start_bounds": list(args.start_bounds),
         "goal_min_distance": args.goal_min_distance,
         "goal_arrival_radius": args.goal_arrival_radius,
+        "perception": args.perception,
         "chunks": all_results,
     }
     with open(
@@ -442,6 +445,8 @@ def train_online_goal_cloud(args):
             str(args.eval_max_steps),
             "--n_boids",
             str(args.n_boids),
+            "--perception",
+            str(args.perception),
             "--seed",
             str(args.eval_seed),
         ]
