@@ -56,6 +56,7 @@ from runtime.timing import (
     deadline_reached,
     write_timing_report,
 )
+from runtime.subprocess_utils import run_with_filtered_stderr
 import h5py
 import psutil
 
@@ -593,8 +594,11 @@ def run_cloud_chunked_3d(
                 timing_events_file=events_path,
                 wall_deadline=wall_deadline,
             )
-            result = subprocess.run(cmd)
-            if result.returncode == TIMEOUT_EXIT_CODE:
+            returncode = run_with_filtered_stderr(
+                cmd,
+                ignored_fragments=(("ptx85", "not a recognized feature"),),
+            )
+            if returncode == TIMEOUT_EXIT_CODE:
                 write_timing_report(
                     events_path,
                     report_path,
@@ -602,7 +606,7 @@ def run_cloud_chunked_3d(
                     "timed_out",
                 )
                 raise SystemExit(TIMEOUT_EXIT_CODE)
-            if result.returncode != 0:
+            if returncode != 0:
                 if report_path:
                     write_timing_report(
                         events_path,
@@ -613,7 +617,7 @@ def run_cloud_chunked_3d(
                 raise RuntimeError(
                     f"Cloud RAM chunk worker {chunk_idx + 1}/"
                     f"{len(allocations)} failed with exit code "
-                    f"{result.returncode}"
+                    f"{returncode}"
                 )
             with np.load(centers_file) as center_data:
                 all_centers.append(center_data["centers"].copy())
