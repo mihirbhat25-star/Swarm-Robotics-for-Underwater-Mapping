@@ -50,6 +50,12 @@ from runtime.local_3d import (
     save_validation_dataset,
     write_batch_shards as write_local_batch_shards,
 )
+from runtime.timing import (
+    TIMEOUT_EXIT_CODE,
+    append_timing_event,
+    deadline_reached,
+    write_timing_report,
+)
 import h5py
 import psutil
 
@@ -325,6 +331,8 @@ def _build_chunk_worker_command_3d(
     chunk_patience,
     ram_chunk_mix_file=None,
     ram_centers_output_file=None,
+    timing_events_file=None,
+    wall_deadline=0.0,
 ):
     """Build the isolated worker command shared by cached and generated chunks."""
     cmd = [
@@ -384,6 +392,10 @@ def _build_chunk_worker_command_3d(
         cmd.extend(["--chunk_epochs", str(args.chunk_epochs)])
     if args.init_weights:
         cmd.extend(["--init_weights", args.init_weights])
+    if timing_events_file:
+        cmd.extend(["--_timing_events_file", timing_events_file])
+    if wall_deadline:
+        cmd.extend(["--_wall_deadline", str(wall_deadline)])
     return cmd
 
 
@@ -499,6 +511,33 @@ def run_cloud_chunked_3d(
     run_tag, requested_counts, chunk_size, chunk_patience
 ):
     """Run generated chunks entirely in each worker's host RAM."""
+    run_started = time.time()
+    report_path = args.timing_report
+    if args.wall_time_limit_hours and not report_path:
+        report_path = f"results/timing_3d_{run_tag}.json"
+    report_path = os.path.abspath(report_path) if report_path else ""
+    events_path = f"{report_path}.events.jsonl" if report_path else ""
+    if events_path and os.path.exists(events_path):
+        os.remove(events_path)
+    wall_deadline = (
+        run_started + args.wall_time_limit_hours * 3600.0
+        if args.wall_time_limit_hours
+        else 0.0
+    )
+    if wall_deadline:
+        print(
+            f">>> Wall-clock limit: {args.wall_time_limit_hours:g} hours. "
+            "The current worker will stop at a compiled-step boundary.",
+            flush=True,
+        )
+    if report_path:
+        print(
+            ">>> Pipeline timing enabled before training: expert trajectory "
+            "generation, graph/batch packing, training (including validation "
+            "and checkpointing), and pipeline orchestration.",
+            flush=True,
+        )
+        print(f">>> Timing report: {report_path}", flush=True)
     checkpoint_path = f"saved_models/best_weights_3d_{run_tag}"
     os.makedirs("saved_models", exist_ok=True)
     allocations = proportional_chunk_allocations(
@@ -516,6 +555,14 @@ def run_cloud_chunked_3d(
     with tempfile.TemporaryDirectory(prefix="gnca_3d_ram_control_") as tmpdir:
         training_state_dir = os.path.join(tmpdir, "training_state")
         for chunk_idx, chunk_mix in enumerate(allocations):
+            if deadline_reached(wall_deadline):
+                write_timing_report(
+                    events_path,
+                    report_path,
+                    time.time() - run_started,
+                    "timed_out",
+                )
+                raise SystemExit(TIMEOUT_EXIT_CODE)
             print(f"\n{'='*60}")
             print(
                 f"  Chunk {chunk_idx + 1}/{len(allocations)} | "
@@ -543,9 +590,26 @@ def run_cloud_chunked_3d(
                 chunk_patience,
                 ram_chunk_mix_file=mix_file,
                 ram_centers_output_file=centers_file,
+                timing_events_file=events_path,
+                wall_deadline=wall_deadline,
             )
             result = subprocess.run(cmd)
+            if result.returncode == TIMEOUT_EXIT_CODE:
+                write_timing_report(
+                    events_path,
+                    report_path,
+                    time.time() - run_started,
+                    "timed_out",
+                )
+                raise SystemExit(TIMEOUT_EXIT_CODE)
             if result.returncode != 0:
+                if report_path:
+                    write_timing_report(
+                        events_path,
+                        report_path,
+                        time.time() - run_started,
+                        "failed",
+                    )
                 raise RuntimeError(
                     f"Cloud RAM chunk worker {chunk_idx + 1}/"
                     f"{len(allocations)} failed with exit code "
@@ -574,6 +638,13 @@ def run_cloud_chunked_3d(
     final_model.load_weights(checkpoint_path).expect_partial()
     final_model.save_weights(checkpoint_path)
     print(f"Saved final weights to {checkpoint_path}")
+    if report_path:
+        write_timing_report(
+            events_path,
+            report_path,
+            time.time() - run_started,
+            "completed",
+        )
     manifest = {
         "mode": "cloud_ram",
         "generation_seed": args.generation_seed,
@@ -660,6 +731,8 @@ if args._chunk_worker:
     loader_va = None
     val_data = None
     val_steps = 0
+    worker_training_started = None
+    worker_timed_out = False
 
     if is_cloud:
         if args._ram_chunk_mix_file is None:
@@ -669,6 +742,7 @@ if args._chunk_worker:
                 int(octant): int(count)
                 for octant, count in json.load(file_handle).items()
             }
+        phase_started = time.perf_counter()
         (
             compact_trajectories,
             chunk_centers,
@@ -677,6 +751,17 @@ if args._chunk_worker:
         ) = generate_cloud_chunk(
             args, args._chunk_idx, chunk_mix, _expert_waypoint_policy_3d(args)
         )
+        append_timing_event(
+            args._timing_events_file,
+            "expert_trajectory_generation",
+            time.perf_counter() - phase_started,
+            chunk=args._chunk_idx,
+            split="train",
+            trajectories=sum(chunk_mix.values()),
+        )
+        if deadline_reached(args._wall_deadline):
+            print(">>> Wall-clock limit reached after expert generation.")
+            sys.exit(TIMEOUT_EXIT_CODE)
         if args._ram_centers_output_file is None:
             raise RuntimeError("Cloud RAM worker requires a centers output file.")
         np.savez(
@@ -684,6 +769,7 @@ if args._chunk_worker:
             centers=chunk_centers,
             center_octants=chunk_center_octants,
         )
+        phase_started = time.perf_counter()
         train_data, train_steps = cloud_dataset_from_trajectories(
             compact_trajectories,
             per_replica_batch_size,
@@ -693,8 +779,19 @@ if args._chunk_worker:
             seed=args.generation_seed + args._chunk_idx,
             shuffle_batches=True,
         )
+        append_timing_event(
+            args._timing_events_file,
+            "graph_and_batch_packing",
+            time.perf_counter() - phase_started,
+            chunk=args._chunk_idx,
+            split="train",
+            batches=train_steps,
+        )
         del compact_trajectories
         gc.collect()
+        if deadline_reached(args._wall_deadline):
+            print(">>> Wall-clock limit reached after training-data packing.")
+            sys.exit(TIMEOUT_EXIT_CODE)
 
         use_val = args.chunk_epochs is None
         if use_val:
@@ -711,12 +808,25 @@ if args._chunk_worker:
                 if count > 0
             }
             validation_seed_chunk = args._chunk_idx + 10_000
+            phase_started = time.perf_counter()
             validation_trajectories, _, _, _ = generate_cloud_chunk(
                 args,
                 validation_seed_chunk,
                 validation_mix,
                 _expert_waypoint_policy_3d(args),
             )
+            append_timing_event(
+                args._timing_events_file,
+                "expert_trajectory_generation",
+                time.perf_counter() - phase_started,
+                chunk=args._chunk_idx,
+                split="validation",
+                trajectories=sum(validation_mix.values()),
+            )
+            if deadline_reached(args._wall_deadline):
+                print(">>> Wall-clock limit reached after validation generation.")
+                sys.exit(TIMEOUT_EXIT_CODE)
+            phase_started = time.perf_counter()
             val_data, val_steps = cloud_dataset_from_trajectories(
                 validation_trajectories,
                 per_replica_batch_size,
@@ -729,6 +839,14 @@ if args._chunk_worker:
                     + args._chunk_idx
                 ),
                 shuffle_batches=False,
+            )
+            append_timing_event(
+                args._timing_events_file,
+                "graph_and_batch_packing",
+                time.perf_counter() - phase_started,
+                chunk=args._chunk_idx,
+                split="validation",
+                batches=val_steps,
             )
             del validation_trajectories
             gc.collect()
@@ -804,6 +922,7 @@ if args._chunk_worker:
     if args._training_state_dir is None:
         raise RuntimeError("Chunk worker requires --_training_state_dir")
 
+    worker_training_started = time.perf_counter()
     strategy = None
     if is_cloud:
         strategy = tf.distribute.MirroredStrategy(
@@ -903,7 +1022,7 @@ if args._chunk_worker:
         val_kwargs = {}
 
     if is_cloud:
-        fit_cloud_distributed(
+        fit_result = fit_cloud_distributed(
             model,
             strategy,
             train_data,
@@ -915,12 +1034,37 @@ if args._chunk_worker:
             loss_fn=custom_weighted_mse_3d,
             val_data=val_data,
             val_local_steps=(val_steps if use_val else 0),
+            wall_deadline=args._wall_deadline,
         )
+        worker_timed_out = fit_result["timed_out"]
     else:
         model.fit(
             train_data, steps_per_epoch=train_steps,
             epochs=n_epochs, callbacks=cbs, **val_kwargs,
         )
+
+    if worker_timed_out:
+        if training_state_manager.latest_checkpoint is not None:
+            training_checkpoint.restore(
+                training_state_manager.latest_checkpoint
+            ).expect_partial()
+        else:
+            training_state_manager.save()
+        model.save_weights(args._checkpoint_path)
+        append_timing_event(
+            args._timing_events_file,
+            "training",
+            time.perf_counter() - worker_training_started,
+            chunk=args._chunk_idx,
+            status="timed_out",
+            epochs_completed=fit_result["epochs_completed"],
+        )
+        print(
+            ">>> Five-hour profiling limit reached; saved the latest stable "
+            "training state and stopped cleanly.",
+            flush=True,
+        )
+        sys.exit(TIMEOUT_EXIT_CODE)
 
     if args.chunk_epochs is not None:
         training_state_manager.save()
@@ -936,6 +1080,15 @@ if args._chunk_worker:
         )
 
     model.save_weights(args._checkpoint_path)
+    if is_cloud:
+        append_timing_event(
+            args._timing_events_file,
+            "training",
+            time.perf_counter() - worker_training_started,
+            chunk=args._chunk_idx,
+            status="completed",
+            epochs_completed=fit_result["epochs_completed"],
+        )
     final_lr = float(tf.keras.backend.get_value(model.optimizer.learning_rate))
     final_step = int(tf.keras.backend.get_value(model.optimizer.iterations))
     print(

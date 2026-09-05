@@ -69,6 +69,26 @@ def build_parser():
     chunks.add_argument("--generation_seed", default=0, type=int)
     chunks.add_argument("--init_weights", default="", type=str)
 
+    profiling = parser.add_argument_group("profiling")
+    profiling.add_argument(
+        "--timing_report",
+        default="",
+        type=str,
+        help=(
+            "Write a pipeline timing allocation report as JSON. Cloud workers "
+            "record expert generation, graph/batch packing, and training."
+        ),
+    )
+    profiling.add_argument(
+        "--wall_time_limit_hours",
+        default=0.0,
+        type=float,
+        help=(
+            "Stop cloud chunked training cleanly after this many wall-clock "
+            "hours; 0 disables the limit."
+        ),
+    )
+
     evaluation = parser.add_argument_group("evaluation")
     evaluation.add_argument(
         "--viz_mode",
@@ -105,6 +125,8 @@ def build_parser():
     parser.add_argument("--_training_state_dir", default=None, help=internal)
     parser.add_argument("--_ram_chunk_mix_file", default=None, help=internal)
     parser.add_argument("--_ram_centers_output_file", default=None, help=internal)
+    parser.add_argument("--_timing_events_file", default=None, help=internal)
+    parser.add_argument("--_wall_deadline", default=0.0, type=float, help=internal)
     return parser
 
 
@@ -131,6 +153,8 @@ def validate_args(args, visible_gpu_count):
         raise ValueError("--run_tag_unique must be at least 1.")
     if args.generation_workers < 0:
         raise ValueError("--generation_workers must be nonnegative.")
+    if args.wall_time_limit_hours < 0:
+        raise ValueError("--wall_time_limit_hours must be nonnegative.")
     if args.train_octants is not None:
         if len(set(args.train_octants)) != len(args.train_octants):
             raise ValueError("--train_octants must not contain duplicates.")

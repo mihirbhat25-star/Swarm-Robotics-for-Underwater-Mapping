@@ -8,6 +8,7 @@ import numpy as np
 import tensorflow as tf
 
 from runtime.cloud_data_3d import simulate_compact_task
+from runtime.timing import deadline_reached
 from modules.boids_3d import BOIDS_GOAL_POSITIONS_3D
 
 
@@ -272,6 +273,7 @@ def fit_distributed(
     loss_fn,
     val_data=None,
     val_local_steps=0,
+    wall_deadline=0.0,
 ):
     """Train complete graph batches synchronously on all visible GPUs."""
     replicas = strategy.num_replicas_in_sync
@@ -373,9 +375,12 @@ def fit_distributed(
     model.stop_training = False
     callback_list.on_train_begin()
     train_iterator = iter(distributed_train)
+    timed_out = False
+    epochs_completed = 0
     try:
         for epoch in range(n_epochs):
-            if model.stop_training:
+            if model.stop_training or deadline_reached(wall_deadline):
+                timed_out = deadline_reached(wall_deadline)
                 break
             epoch_t0 = time.time()
             callback_list.on_epoch_begin(epoch)
@@ -388,6 +393,12 @@ def fit_distributed(
                 )
                 epoch_loss_sum += float(loss_sum.numpy())
                 epoch_node_count += float(node_count.numpy())
+                if deadline_reached(wall_deadline):
+                    timed_out = True
+                    break
+
+            if timed_out:
+                break
 
             logs = {"loss": epoch_loss_sum / max(epoch_node_count, 1.0)}
             if distributed_val is not None:
@@ -404,6 +415,11 @@ def fit_distributed(
                     )
                     val_loss_sum += float(loss_sum.numpy())
                     val_node_count += float(node_count.numpy())
+                    if deadline_reached(wall_deadline):
+                        timed_out = True
+                        break
+                if timed_out:
+                    break
                 logs["val_loss"] = val_loss_sum / max(val_node_count, 1.0)
 
             callback_list.on_epoch_end(epoch, logs)
@@ -417,7 +433,12 @@ def fit_distributed(
             if "val_loss" in logs:
                 summary += f" - val_loss: {logs['val_loss']:.6g}"
             print(f"{summary} - lr: {learning_rate:.6g}", flush=True)
+            epochs_completed += 1
     finally:
         callback_list.on_train_end()
 
-    return train_steps
+    return {
+        "steps_per_epoch": train_steps,
+        "epochs_completed": epochs_completed,
+        "timed_out": timed_out,
+    }
