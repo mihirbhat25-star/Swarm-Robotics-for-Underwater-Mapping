@@ -14,3 +14,5 @@ tqdm>=4.0,<5.0
 matplotlib>=3.7,<4.0
 shapely
 psutil
+# Compiled, GIL-free cloud expert trajectory generation.
+numba>=0.60,<1.0

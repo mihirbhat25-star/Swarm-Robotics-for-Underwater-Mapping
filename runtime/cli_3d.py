@@ -10,6 +10,15 @@ def build_parser():
         description="Train the 3D GNCA with a local or cloud data backend."
     )
     parser.add_argument(
+        "--task",
+        choices=("fixed_waypoints", "online_goals"),
+        default="fixed_waypoints",
+        help=(
+            "Experiment semantics. fixed_waypoints preserves the established "
+            "3D experiment; online_goals trains a goal-conditioned 3D GNCA."
+        ),
+    )
+    parser.add_argument(
         "--backend",
         choices=SUPPORTED_BACKENDS,
         default=LOCAL_BACKEND,
@@ -54,6 +63,29 @@ def build_parser():
     data.add_argument("--goal_exclusion_size", default=0.5, type=float)
     data.add_argument("--expert_pos_noise", default=0.0, type=float)
     data.add_argument("--expert_vel_noise", default=0.0, type=float)
+    data.add_argument(
+        "--goal_waypoints_per_episode",
+        default=2,
+        type=int,
+        help="Online-goal training uses exactly two waypoint terminations.",
+    )
+    data.add_argument(
+        "--goal_bounds",
+        nargs=6,
+        type=float,
+        default=[-4.5, 4.5, -4.5, 4.5, -4.5, 4.5],
+        metavar=("X_MIN", "X_MAX", "Y_MIN", "Y_MAX", "Z_MIN", "Z_MAX"),
+    )
+    data.add_argument(
+        "--start_bounds",
+        nargs=6,
+        type=float,
+        default=[-5.0, 5.0, -5.0, 5.0, -5.0, 5.0],
+        metavar=("X_MIN", "X_MAX", "Y_MIN", "Y_MAX", "Z_MIN", "Z_MAX"),
+    )
+    data.add_argument("--goal_min_distance", default=2.5, type=float)
+    data.add_argument("--goal_arrival_radius", default=0.5, type=float)
+    data.add_argument("--expert_max_steps", default=10_000, type=int)
 
     loss = parser.add_argument_group("loss")
     loss.add_argument("--loss_type", default="oldl", choices=["oldl", "newl"])
@@ -77,6 +109,16 @@ def build_parser():
         help=(
             "Write a pipeline timing allocation report as JSON. Cloud workers "
             "record expert generation, graph/batch packing, and training."
+        ),
+    )
+    parser.add_argument(
+        "--cloud_data_mode",
+        choices=("legacy", "compiled"),
+        default="legacy",
+        help=(
+            "Cloud-only expert/data implementation. legacy preserves the "
+            "existing SciPy/COO path; compiled uses Numba rollouts and "
+            "bit-packed adjacency without changing the GNCA architecture."
         ),
     )
     profiling.add_argument(
@@ -109,6 +151,8 @@ def build_parser():
     evaluation.add_argument("--eval_max_steps", default=3000, type=int)
     evaluation.add_argument("--eval_success_threshold", default=0.5, type=float)
     evaluation.add_argument("--eval_max_success_r", default=2.0, type=float)
+    evaluation.add_argument("--eval_online_goal_count", default=5, type=int)
+    evaluation.add_argument("--eval_max_tube_radius", default=1.0, type=float)
     evaluation.add_argument("--eval_seed", default=None, type=int)
     evaluation.add_argument("--noise_tag", default="", type=str)
 
@@ -179,6 +223,8 @@ def validate_args(args, visible_gpu_count):
         raise ValueError("--early_stopping_min_delta must be nonnegative.")
     if args.steps_per_execution < 1:
         raise ValueError("--steps_per_execution must be at least 1.")
+    if args.cloud_data_mode == "compiled" and args.backend != CLOUD_BACKEND:
+        raise ValueError("--cloud_data_mode compiled requires --backend cloud.")
     if (
         not args._chunk_worker
         and args.chunk_size > 0
@@ -209,5 +255,39 @@ def validate_args(args, visible_gpu_count):
                 "Cloud --batch_size is global and must be divisible by the "
                 f"{visible_gpu_count} visible GPUs."
             )
+
+    if args.task == "online_goals":
+        if args.backend != CLOUD_BACKEND:
+            raise ValueError("The online_goals task requires --backend cloud.")
+        if args.cloud_data_mode != "compiled":
+            raise ValueError(
+                "The 3D online_goals task requires --cloud_data_mode compiled."
+            )
+        if args.goal_waypoints_per_episode != 2:
+            raise ValueError(
+                "The online-goal experiment requires exactly two waypoint "
+                "terminations per training episode."
+            )
+        for name, bounds in (
+            ("goal_bounds", args.goal_bounds),
+            ("start_bounds", args.start_bounds),
+        ):
+            if len(bounds) != 6 or any(
+                bounds[index] >= bounds[index + 1]
+                for index in (0, 2, 4)
+            ):
+                raise ValueError(
+                    f"--{name} must contain three increasing min/max pairs."
+                )
+        if args.goal_min_distance < 0:
+            raise ValueError("--goal_min_distance cannot be negative.")
+        if args.goal_arrival_radius <= 0:
+            raise ValueError("--goal_arrival_radius must be positive.")
+        if args.expert_max_steps < 1:
+            raise ValueError("--expert_max_steps must be positive.")
+        if args.eval_online_goal_count < 1:
+            raise ValueError("--eval_online_goal_count must be positive.")
+        if args.eval_max_tube_radius <= 0:
+            raise ValueError("--eval_max_tube_radius must be positive.")
 
     return args

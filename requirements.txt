@@ -20,3 +20,5 @@ tqdm>=4.0,<5.0
 matplotlib==3.3.4
 shapely
 psutil
+# Optional compiled cloud expert support for the pinned Python 3.8 stack.
+numba==0.53.1

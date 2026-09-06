@@ -118,6 +118,7 @@ def print_run_parameters_3d(args, upweight, critical_distance, distance_weight, 
     print(f"Training backend:     {args.backend}")
     if args.backend == CLOUD_BACKEND:
         print(f"Visible GPUs:         {len(physical_devices)}")
+        print(f"Cloud data mode:      {args.cloud_data_mode}")
     print(
         f"Execution:            "
         f"{'eager (debug)' if args.eager_training else 'compiled graph'}; "
@@ -367,6 +368,7 @@ def _build_chunk_worker_command_3d(
         "--packed_shard_batches", str(args.packed_shard_batches),
         "--steps_per_execution", str(args.steps_per_execution),
         "--backend", args.backend,
+        "--cloud_data_mode", args.cloud_data_mode,
         "--expert_goal_order", args.expert_goal_order,
         "--goal_exclusion_size", str(args.goal_exclusion_size),
         "--expert_pos_noise", str(args.expert_pos_noise),
@@ -652,6 +654,7 @@ def run_cloud_chunked_3d(
         )
     manifest = {
         "mode": "cloud_ram",
+        "cloud_data_mode": args.cloud_data_mode,
         "generation_seed": args.generation_seed,
         "generation_workers": args.generation_workers,
         "goal_order": args.expert_goal_order,
@@ -725,6 +728,12 @@ def run(data_tr, data_va, run_tag=""):
 ####################################################################################
 args = validate_args(build_parser().parse_args(), len(physical_devices))
 
+if args.task == "online_goals":
+    from runtime.online_goal_3d import train_online_goal_cloud_3d
+
+    train_online_goal_cloud_3d(args)
+    sys.exit(0)
+
 
 if args._chunk_worker:
     UPWEIGHT_NEAR_GOAL = (args.loss_type == "newl")
@@ -775,7 +784,14 @@ if args._chunk_worker:
             center_octants=chunk_center_octants,
         )
         phase_started = time.perf_counter()
-        train_data, train_steps = cloud_dataset_from_trajectories(
+        cloud_dataset_builder = cloud_dataset_from_trajectories
+        if args.cloud_data_mode == "compiled":
+            from runtime.cloud_bitpacked_3d import (
+                dataset_from_bitpacked_trajectories,
+            )
+
+            cloud_dataset_builder = dataset_from_bitpacked_trajectories
+        train_data, train_steps = cloud_dataset_builder(
             compact_trajectories,
             per_replica_batch_size,
             args._n_boids_cache,
@@ -832,7 +848,7 @@ if args._chunk_worker:
                 print(">>> Wall-clock limit reached after validation generation.")
                 sys.exit(TIMEOUT_EXIT_CODE)
             phase_started = time.perf_counter()
-            val_data, val_steps = cloud_dataset_from_trajectories(
+            val_data, val_steps = cloud_dataset_builder(
                 validation_trajectories,
                 per_replica_batch_size,
                 args._n_boids_cache,

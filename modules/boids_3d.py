@@ -7,6 +7,8 @@ from spektral.data import Dataset, Graph
 from tqdm import tqdm
 import h5py
 
+from modules.waypoints import OnlineWaypointManager
+
 
 BOIDS_GOAL_POSITIONS_3D = np.array(
     [[-4.0, -4.0, -4.0], [4.0, 4.0, 4.0]],
@@ -224,6 +226,83 @@ class Boids3D:
         if return_accel:
             history["accelerations"] = np.array(history["accelerations"])
 
+        return history
+
+    def generate_online_goal_trajectory(
+        self,
+        *,
+        save_config,
+        random_init,
+        rng=None,
+        n_waypoints=2,
+        goal_bounds=(-4.5, 4.5, -4.5, 4.5, -4.5, 4.5),
+        start_bounds=(-5.0, 5.0, -5.0, 5.0, -5.0, 5.0),
+        goal_min_distance=2.5,
+        goal_arrival_radius=0.5,
+        max_steps=10_000,
+    ):
+        """Generate a reference episode with externally changing 3D goals.
+
+        The optimized cloud path compiles these same dynamics with Numba. This
+        method remains the readable reference implementation and supports
+        evaluation without changing the fixed-waypoint generator.
+        """
+        rng = np.random.default_rng() if rng is None else rng
+        if random_init is False:
+            positions, velocities, neighbors = self.get_fixed_init(self.n_boids)
+        elif random_init is True:
+            positions, velocities, neighbors, _ = self.get_random_init(
+                self.n_boids, save_config, bounds=tuple(start_bounds)
+            )
+        elif isinstance(random_init, np.ndarray) and random_init.shape == (3,):
+            positions, velocities, neighbors, _ = self.get_random_init(
+                self.n_boids,
+                save_config,
+                center=random_init,
+            )
+        else:
+            positions, velocities = random_init
+            neighbors = self.get_neighbors(positions)
+
+        manager = OnlineWaypointManager(
+            rng=rng,
+            n_waypoints=n_waypoints,
+            bounds=tuple(goal_bounds),
+            min_distance=goal_min_distance,
+            arrival_radius=goal_arrival_radius,
+        )
+        active_goal = manager.start(positions.mean(axis=0))
+        self.goal_positions = active_goal[None, :]
+        self.current_goal = 0
+
+        history = {
+            "positions": [positions],
+            "velocities": [velocities],
+            "neighbors": [neighbors],
+            "goal_positions": [active_goal.copy()],
+        }
+        for _ in range(int(max_steps)):
+            positions, velocities, _ = self.update_boids(positions, velocities)
+            neighbors = self.get_neighbors(positions)
+            active_goal, switched, finished = manager.update(positions)
+            if switched:
+                self.goal_positions = active_goal[None, :]
+            history["positions"].append(positions)
+            history["velocities"].append(velocities)
+            history["neighbors"].append(neighbors)
+            history["goal_positions"].append(active_goal.copy())
+            if finished:
+                break
+        else:
+            raise RuntimeError(
+                f"Online 3D expert did not reach {n_waypoints} waypoints "
+                f"within {max_steps} steps."
+            )
+
+        history["positions"] = np.asarray(history["positions"])
+        history["velocities"] = np.asarray(history["velocities"])
+        history["goal_positions"] = np.asarray(history["goal_positions"])
+        history["waypoints"] = np.asarray(manager.waypoints)
         return history
 
     def _set_goal_order_from_positions(self, positions):

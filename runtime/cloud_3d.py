@@ -14,6 +14,17 @@ from modules.boids_3d import BOIDS_GOAL_POSITIONS_3D
 
 def generate_compact_chunk(args, chunk_idx, octant_counts, waypoint_policy):
     """Generate one expert chunk across CPU workers and retain it in RAM."""
+    if args.cloud_data_mode == "compiled":
+        from runtime.cloud_compiled_3d import generate_compiled_chunk
+
+        return generate_compiled_chunk(
+            args,
+            chunk_idx,
+            octant_counts,
+            task="fixed_waypoints",
+            waypoint_policy=waypoint_policy,
+        )
+
     total = sum(octant_counts.values())
     workers = args.generation_workers
     if workers <= 0:

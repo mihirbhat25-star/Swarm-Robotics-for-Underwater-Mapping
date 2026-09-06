@@ -13,19 +13,35 @@ def sample_separated_waypoint(
     min_distance=2.5,
     max_attempts=10_000,
 ):
-    """Sample a 2D waypoint at least ``min_distance`` from ``reference``."""
+    """Sample a 2D or 3D waypoint separated from ``reference``.
+
+    ``bounds`` is a flat sequence of lower/upper pairs, one pair per spatial
+    dimension.  The existing 2D API therefore remains ``(x_min, x_max,
+    y_min, y_max)``, while 3D callers append ``(z_min, z_max)``.
+    """
     reference = np.asarray(reference, dtype=np.float32)
-    if reference.shape != (2,):
-        raise ValueError(f"reference must have shape (2,), got {reference.shape}")
-    x_min, x_max, y_min, y_max = map(float, bounds)
-    if x_min >= x_max or y_min >= y_max:
-        raise ValueError("waypoint bounds must have positive width and height")
+    if reference.ndim != 1 or reference.shape[0] not in (2, 3):
+        raise ValueError(
+            "reference must have shape (2,) or (3,), "
+            f"got {reference.shape}"
+        )
+
+    bounds = tuple(map(float, bounds))
+    expected_bounds = 2 * reference.shape[0]
+    if len(bounds) != expected_bounds:
+        raise ValueError(
+            f"bounds must contain {expected_bounds} values for a "
+            f"{reference.shape[0]}D reference, got {len(bounds)}"
+        )
+    bound_pairs = np.asarray(bounds, dtype=np.float64).reshape(-1, 2)
+    if np.any(bound_pairs[:, 0] >= bound_pairs[:, 1]):
+        raise ValueError("waypoint bounds must have positive width")
     if min_distance < 0:
         raise ValueError("min_distance cannot be negative")
 
     for _ in range(int(max_attempts)):
         waypoint = np.array(
-            [rng.uniform(x_min, x_max), rng.uniform(y_min, y_max)],
+            [rng.uniform(lower, upper) for lower, upper in bound_pairs],
             dtype=np.float32,
         )
         if np.linalg.norm(waypoint - reference) >= min_distance:
@@ -109,16 +125,28 @@ class OnlineWaypointManager:
 
 
 def goal_conditioned_state(physical_state, goal):
-    """Return per-agent ``[position, velocity, goal - position]`` features."""
+    """Return per-agent ``[position, velocity, goal - position]`` features.
+
+    The spatial dimension is inferred from ``goal``.  A 2D physical state has
+    four columns and produces six conditioned features; a 3D physical state
+    has six columns and produces nine.
+    """
     physical_state = np.asarray(physical_state, dtype=np.float32)
     goal = np.asarray(goal, dtype=np.float32)
-    if physical_state.ndim != 2 or physical_state.shape[-1] != 4:
+    if goal.ndim != 1 or goal.shape[0] not in (2, 3):
+        raise ValueError(f"goal must have shape (2,) or (3,), got {goal.shape}")
+    spatial_dims = goal.shape[0]
+    expected_features = 2 * spatial_dims
+    if (
+        physical_state.ndim != 2
+        or physical_state.shape[-1] != expected_features
+    ):
         raise ValueError(
-            f"physical_state must have shape (agents, 4), got {physical_state.shape}"
+            "physical_state must have shape "
+            f"(agents, {expected_features}) for a {spatial_dims}D goal, "
+            f"got {physical_state.shape}"
         )
-    if goal.shape != (2,):
-        raise ValueError(f"goal must have shape (2,), got {goal.shape}")
-    relative_goal = goal[None, :] - physical_state[:, :2]
+    relative_goal = goal[None, :] - physical_state[:, :spatial_dims]
     return np.concatenate((physical_state, relative_goal), axis=-1).astype(
         np.float32, copy=False
     )
