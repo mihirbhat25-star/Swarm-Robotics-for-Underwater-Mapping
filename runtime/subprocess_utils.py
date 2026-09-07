@@ -10,7 +10,8 @@ import sys
 def run_with_filtered_stderr(command, ignored_fragments):
     """Run a command and hide stderr lines matching every fragment in a rule."""
     environment = os.environ.copy()
-    environment.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+    # Override NVIDIA image defaults rather than inheriting a noisier value.
+    environment["TF_CPP_MIN_LOG_LEVEL"] = "3"
     process = subprocess.Popen(
         command,
         env=environment,

@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 import joblib
 
@@ -38,4 +38,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -9,10 +9,13 @@ import os
 
 # Configure native libraries before TensorFlow/ABSL are imported.  These
 # settings affect only log verbosity, not numerical execution.
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
-os.environ.setdefault("GLOG_minloglevel", "3")
-os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
+# NVIDIA containers may predefine these at a noisier level, so assigning is
+# intentional: setdefault() would leave the container's value unchanged and
+# allow benign CUDA/NUMA initialization messages through before ABSL starts.
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["GRPC_VERBOSITY"] = "ERROR"
+os.environ["GLOG_minloglevel"] = "3"
+os.environ["ABSL_MIN_LOG_LEVEL"] = "3"
 
 import sys
 import json
